@@ -35,9 +35,6 @@ import numpy
 import torch
 from tqdm import tqdm
 
-from kuavo_train.wrapper.policy.diffusion.DiffusionPolicyWrapper import CustomDiffusionPolicyWrapper
-from kuavo_train.wrapper.policy.act.ACTPolicyWrapper import CustomACTPolicyWrapper
-from lerobot.policies.act.modeling_act import ACTPolicy
 from lerobot.utils.random_utils import set_seed
 import datetime
 import time
@@ -51,8 +48,6 @@ import threading
 from kuavo_deploy.config import KuavoConfig
 from kuavo_deploy.utils.logging_utils import setup_logger
 from kuavo_deploy.kuavo_service.client import PolicyClient
-from lerobot.processor import PolicyAction, PolicyProcessorPipeline
-from lerobot.policies.factory import make_pre_post_processors
 
 log_model = setup_logger("model")
 log_robot = setup_logger("robot")
@@ -73,7 +68,20 @@ stop_flag = threading.Event()
 pause_flag = threading.Event()
 
 
-def setup_policy(pretrained_path, policy_type, device=torch.device("cuda")):
+def resolve_pretrained_path(cfg) -> Path:
+    if getattr(cfg, "pretrained_path", ""):
+        return Path(cfg.pretrained_path)
+    return Path(f"outputs/train/{cfg.task}/{cfg.method}/{cfg.timestamp}/epoch{cfg.epoch}")
+
+
+def build_pre_post_processors(pretrained_path: Path, policy_type: str):
+    if policy_type == "lingbot":
+        return (lambda obs: obs), (lambda act: act)
+    from lerobot.policies.factory import make_pre_post_processors
+    return make_pre_post_processors(None, Path(str(pretrained_path).split("/epoch", 1)[0]))
+
+
+def setup_policy(pretrained_path, policy_type, cfg, device=torch.device("cuda")):
     """
     Set up and load the policy model.
     
@@ -90,11 +98,26 @@ def setup_policy(pretrained_path, policy_type, device=torch.device("cuda")):
         time.sleep(3)  
     
     if policy_type == 'diffusion':
-        policy = CustomDiffusionPolicyWrapper.from_pretrained(Path(pretrained_path),strict=True)
+        from kuavo_train.wrapper.policy.diffusion.DiffusionPolicyWrapper import CustomDiffusionPolicyWrapper
+        policy = CustomDiffusionPolicyWrapper.from_pretrained(Path(pretrained_path), strict=True)
     elif policy_type == 'act':
-        policy = CustomACTPolicyWrapper.from_pretrained(Path(pretrained_path),strict=True)
+        from kuavo_train.wrapper.policy.act.ACTPolicyWrapper import CustomACTPolicyWrapper
+        policy = CustomACTPolicyWrapper.from_pretrained(Path(pretrained_path), strict=True)
     elif policy_type == 'client':
         policy = PolicyClient()
+    elif policy_type == 'lingbot':
+        from kuavo_deploy.utils.lingbot_adapter import LingbotDeployPolicy
+        policy = LingbotDeployPolicy(
+            model_path=Path(pretrained_path),
+            lingbot_root=getattr(cfg, "lingbot_root", ""),
+            qwen25_path=getattr(cfg, "qwen25_path", ""),
+            task_prompt=getattr(cfg, "task_prompt", "") or getattr(cfg, "task", ""),
+            use_length=getattr(cfg, "lingbot_use_length", 1),
+            chunk_ret=getattr(cfg, "lingbot_chunk_ret", True),
+            norm_stats_file=getattr(cfg, "lingbot_norm_stats_file", ""),
+            data_type=getattr(cfg, "lingbot_data_type", "robotwin"),
+            execute_raw_action=getattr(cfg, "lingbot_execute_raw_action", False),
+        )
     else:
         raise ValueError(f"Unsupported policy type: {policy_type}")
     
@@ -103,7 +126,8 @@ def setup_policy(pretrained_path, policy_type, device=torch.device("cuda")):
     policy.reset()
     # Log model info
     log_model.info(f"Model loaded from {pretrained_path}")
-    log_model.info(f"Model n_obs_steps: {policy.config.n_obs_steps}")
+    if hasattr(policy, "config") and hasattr(policy.config, "n_obs_steps"):
+        log_model.info(f"Model n_obs_steps: {policy.config.n_obs_steps}")
     log_model.info(f"Model device: {device}")
     
     return policy
@@ -122,7 +146,7 @@ def main(config: KuavoConfig, env: gym.Env):
     epoch = cfg.epoch
     env_name = cfg.env_name
 
-    pretrained_path = Path(f"outputs/train/{task}/{method}/{timestamp}/epoch{epoch}")
+    pretrained_path = resolve_pretrained_path(cfg)
     output_directory = Path(f"outputs/eval/{task}/{method}/{timestamp}/epoch{epoch}")
     # Create a directory to store the video of the evaluation
     output_directory.mkdir(parents=True, exist_ok=True)
@@ -133,10 +157,8 @@ def main(config: KuavoConfig, env: gym.Env):
     # Select your device
     device = torch.device(cfg.device)
 
-    policy = setup_policy(pretrained_path, policy_type, device)
-    # preprocessor = PolicyProcessorPipeline.from_pretrained(pretrained_path, config_filename="policy_preprocessor.json")
-    # postprocessor = PolicyProcessorPipeline.from_pretrained(pretrained_path, config_filename="policy_postprocessor.json")
-    preprocessor, postprocessor = make_pre_post_processors(None, Path(str(pretrained_path).split("/epoch", 1)[0]))
+    policy = setup_policy(pretrained_path, policy_type, cfg, device)
+    preprocessor, postprocessor = build_pre_post_processors(pretrained_path, policy_type)
 
     # Initialize evaluation environment to render two observation types:
     # an image of the scene and state/position of the agent.
@@ -145,13 +167,13 @@ def main(config: KuavoConfig, env: gym.Env):
 
     # We can verify that the shapes of the features expected by the policy match the ones from the observations
     # produced by the environment
-    if policy_type != 'client':
+    if policy_type not in ['client', 'lingbot'] and hasattr(policy, "config"):
         log_model.info(f"policy.config.input_features: {policy.config.input_features}")
         log_robot.info(f"env.observation_space: {env.observation_space}")
 
     # Similarly, we can check that the actions produced by the policy will match the actions expected by the
     # environment
-    if policy_type != 'client':
+    if policy_type not in ['client', 'lingbot'] and hasattr(policy, "config"):
         log_model.info(f"policy.config.output_features: {policy.config.output_features}")
         log_robot.info(f"env.action_space: {env.action_space}")
 
@@ -202,9 +224,9 @@ def main(config: KuavoConfig, env: gym.Env):
                 average_action_infer_time += action_infer_time - start_time
 
                 numpy_action = action.squeeze(0).cpu().numpy()
-                log_model.debug(f"numpy_action: {numpy_action}")
+                log_model.info(f"[model output] step={step} action={numpy_action}")
 
-                # 执行动作 Execute action
+                # 执行动作
                 observation, reward, terminated, truncated, info = env.step(numpy_action)
                 observation = preprocessor(observation)
                 exec_time = time.time()
@@ -214,7 +236,6 @@ def main(config: KuavoConfig, env: gym.Env):
                 rewards.append(reward)
 
                 # 相机帧记录，真机请取消，否则会一直堆叠卡死
-                # Camera frame record, must be commented out during real-device testing
 
                 # for k in cam_keys:
                 #     frame_map[k].append(observation[k].squeeze(0).cpu().numpy().transpose(1, 2, 0))

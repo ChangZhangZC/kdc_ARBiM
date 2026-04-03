@@ -37,9 +37,6 @@ import numpy
 import torch
 from tqdm import tqdm
 
-from kuavo_train.wrapper.policy.diffusion.DiffusionPolicyWrapper import CustomDiffusionPolicyWrapper
-from kuavo_train.wrapper.policy.act.ACTPolicyWrapper import CustomACTPolicyWrapper
-from lerobot.policies.act.modeling_act import ACTPolicy
 from lerobot.utils.random_utils import set_seed
 import datetime
 import time
@@ -124,7 +121,19 @@ def check_control_signals():
 
 
     
-def setup_policy(pretrained_path, policy_type, device=torch.device("cuda")):
+def resolve_pretrained_path(cfg) -> Path:
+    if getattr(cfg, "pretrained_path", ""):
+        return Path(cfg.pretrained_path)
+    return Path(f"outputs/train/{cfg.task}/{cfg.method}/{cfg.timestamp}/epoch{cfg.epoch}")
+
+
+def build_pre_post_processors(pretrained_path: Path, policy_type: str):
+    if policy_type == "lingbot":
+        return (lambda obs: obs), (lambda act: act)
+    return make_pre_post_processors(None, Path(str(pretrained_path).split("/epoch", 1)[0]))
+
+
+def setup_policy(pretrained_path, policy_type, cfg, device=torch.device("cuda")):
     """
     Set up and load the policy model.
     
@@ -141,11 +150,26 @@ def setup_policy(pretrained_path, policy_type, device=torch.device("cuda")):
         time.sleep(3)  
     
     if policy_type == 'diffusion':
-        policy = CustomDiffusionPolicyWrapper.from_pretrained(Path(pretrained_path),strict=True)
+        from kuavo_train.wrapper.policy.diffusion.DiffusionPolicyWrapper import CustomDiffusionPolicyWrapper
+        policy = CustomDiffusionPolicyWrapper.from_pretrained(Path(pretrained_path), strict=True)
     elif policy_type == 'act':
-        policy = CustomACTPolicyWrapper.from_pretrained(Path(pretrained_path),strict=True)
+        from kuavo_train.wrapper.policy.act.ACTPolicyWrapper import CustomACTPolicyWrapper
+        policy = CustomACTPolicyWrapper.from_pretrained(Path(pretrained_path), strict=True)
     elif policy_type == 'client':
         policy = PolicyClient()
+    elif policy_type == 'lingbot':
+        from kuavo_deploy.utils.lingbot_adapter import LingbotDeployPolicy
+        policy = LingbotDeployPolicy(
+            model_path=Path(pretrained_path),
+            lingbot_root=getattr(cfg, "lingbot_root", ""),
+            qwen25_path=getattr(cfg, "qwen25_path", ""),
+            task_prompt=getattr(cfg, "task_prompt", "") or getattr(cfg, "task", ""),
+            use_length=getattr(cfg, "lingbot_use_length", 1),
+            chunk_ret=getattr(cfg, "lingbot_chunk_ret", True),
+            norm_stats_file=getattr(cfg, "lingbot_norm_stats_file", ""),
+            data_type=getattr(cfg, "lingbot_data_type", "robotwin"),
+            execute_raw_action=getattr(cfg, "lingbot_execute_raw_action", False),
+        )
     else:
         raise ValueError(f"Unsupported policy type: {policy_type}")
     
@@ -154,7 +178,8 @@ def setup_policy(pretrained_path, policy_type, device=torch.device("cuda")):
     policy.reset()
     # Log model info
     log_model.info(f"Model loaded from {pretrained_path}")
-    log_model.info(f"Model n_obs_steps: {policy.config.n_obs_steps}")
+    if hasattr(policy, "config") and hasattr(policy.config, "n_obs_steps"):
+        log_model.info(f"Model n_obs_steps: {policy.config.n_obs_steps}")
     log_model.info(f"Model device: {device}")
     
     return policy
@@ -180,7 +205,7 @@ def run_single_episode(config, policy, preprocessor, postprocessor, episode, out
     start_service = rospy.ServiceProxy('/simulator/start', Trigger)
 
 
-    if cfg.policy_type != 'client':
+    if cfg.policy_type not in ['client', 'lingbot'] and hasattr(policy, "config"):
         log_model.info(f"policy.config.input_features: {policy.config.input_features}")
         log_robot.info(f"env.observation_space: {env.observation_space}")
         log_model.info(f"policy.config.output_features: {policy.config.output_features}")
@@ -310,7 +335,7 @@ def kuavo_eval_autotest(config: KuavoConfig):
     policy_type = cfg.policy_type
 
     # Setup paths
-    pretrained_path = Path(f"outputs/train/{task}/{method}/{timestamp}/epoch{epoch}")
+    pretrained_path = resolve_pretrained_path(cfg)
     output_directory = Path(f"outputs/eval/{task}/{method}/{timestamp}/epoch{epoch}")
     output_directory.mkdir(parents=True, exist_ok=True)
 
@@ -325,8 +350,8 @@ def kuavo_eval_autotest(config: KuavoConfig):
     # Setup policy and environment (只加载一次)
     set_seed(seed)
     device = torch.device(cfg.device)
-    policy = setup_policy(pretrained_path, policy_type, device)
-    preprocessor, postprocessor = make_pre_post_processors(None, Path(str(pretrained_path).split("/epoch", 1)[0]))
+    policy = setup_policy(pretrained_path, policy_type, cfg, device)
+    preprocessor, postprocessor = build_pre_post_processors(pretrained_path, policy_type)
     
     # first reset
     reset_service = rospy.ServiceProxy('/simulator/reset', Trigger)
@@ -410,4 +435,3 @@ def kuavo_eval_autotest(config: KuavoConfig):
     init_service.shutdown()
     pause_sub.unregister()
     stop_sub.unregister()
-

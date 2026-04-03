@@ -30,7 +30,7 @@ from kuavo_train.utils.augmenter import crop_image, resize_image, DeterministicA
 from kuavo_train.utils.utils import save_rng_state, load_rng_state
 from lerobot.policies.act.modeling_act import ACTPolicy
 from diffusers.optimization import get_scheduler
-from utils.transforms import ImageTransforms, ImageTransformsConfig, ImageTransformConfig
+from kuavo_train.utils.transforms import ImageTransforms, ImageTransformsConfig, ImageTransformConfig
 
 from functools import partial
 from contextlib import nullcontext

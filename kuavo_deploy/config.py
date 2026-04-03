@@ -47,7 +47,9 @@ class ConfigEnv:
     real: bool = False
     only_arm: bool = True
     eef_type: str = "rq2f85"
+    platform_type: Optional[str] = None
     control_mode: str = "joint"
+    direct_to_wbc: bool = False
     which_arm: str = "both"
     head_init: Optional[List[float]] = field(default_factory=lambda: [0.0, 0.0])
     use_delta: bool = False
@@ -151,6 +153,7 @@ class ConfigEnv:
 class ConfigInference:
     go_bag_path: str = ""
     policy_type: str = "diffusion"  # 支持 diffusion, act 等
+    pretrained_path: str = ""  # optional absolute/local path override
     eval_episodes: int = 1
     seed: int = 42
     start_seed: int = 42
@@ -161,9 +164,17 @@ class ConfigInference:
     epoch: int = 1
     max_episode_steps: int = 1000
     env_name: str = "Kuavo-Sim"
+    lingbot_root: str = ""
+    qwen25_path: str = ""
+    task_prompt: str = ""
+    lingbot_use_length: int = 1
+    lingbot_chunk_ret: bool = True
+    lingbot_norm_stats_file: str = ""
+    lingbot_data_type: str = "robotwin"
+    lingbot_execute_raw_action: bool = False
 
     def validate(self):
-        if self.policy_type not in ["diffusion", "act"]:
+        if self.policy_type not in ["diffusion", "act", "lingbot"]:
             # 若将来支持更多策略，请在此扩展
             # Expansion room for future support for other policies
             raise ValueError(f"Unsupported policy_type '{self.policy_type}'")
@@ -232,6 +243,12 @@ def load_kuavo_config(config_path: Optional[str] = None) -> KuavoConfig:
                 )
             else:
                 env_cfg[k] = v
+    # Ignore unknown keys so deploy YAML can evolve without breaking startup.
+    env_fields = set(ConfigEnv.__dataclass_fields__.keys())
+    inf_fields = set(ConfigInference.__dataclass_fields__.keys())
+    env_cfg = {k: v for k, v in env_cfg.items() if k in env_fields}
+    inf_cfg = {k: v for k, v in inf_cfg.items() if k in inf_fields}
+
     # Merge defaults with provided config
     default_env = ConfigEnv()
     default_inf = ConfigInference()

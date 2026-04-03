@@ -34,8 +34,8 @@ import traceback
 from std_msgs.msg import Bool
 
 # 配置日志
-log_model = setup_logger("model", "DEBUG")  # 网络日志 Web logs
-log_robot = setup_logger("robot", "DEBUG")  # 机器人日志 Robot logs
+log_model = setup_logger("model", "DEBUG")  # 网络日志
+log_robot = setup_logger("robot", "DEBUG")  # 机器人日志
 
 # 控制变量
 class ArmMoveController:
@@ -47,17 +47,17 @@ class ArmMoveController:
     def pause(self):
         with self.lock:
             self.paused = True
-            log_robot.info("🔄 Robot arm motion stopped")
+            log_robot.info("🔄 机械臂运动已暂停")
     
     def resume(self):
         with self.lock:
             self.paused = False
-            log_robot.info("▶️ Robot arm motion resumed")
+            log_robot.info("▶️ 机械臂运动已恢复")
     
     def stop(self):
         with self.lock:
             self.should_stop = True
-            log_robot.info("⏹️ Robot arm motion stopped")
+            log_robot.info("⏹️ 机械臂运动已停止")
     
     def is_paused(self):
         with self.lock:
@@ -70,35 +70,35 @@ class ArmMoveController:
 # 控制器实例
 arm_controller = ArmMoveController()
 
-# Ros发布暂停/停止信号 ROS pause and stop publishers
+# Ros发布暂停/停止信号
 pause_pub = rospy.Publisher('/kuavo/pause_state', Bool, queue_size=1)
 stop_pub = rospy.Publisher('/kuavo/stop_state', Bool, queue_size=1)
 
 def signal_handler(signum, frame):
-    """信号处理器 Signal handler"""
-    log_robot.info(f"🔔 Received signal: {signum}")
+    """信号处理器"""
+    log_robot.info(f"🔔 收到信号: {signum}")
     if signum == signal.SIGUSR1:  # 暂停/恢复
         if arm_controller.is_paused():
-            log_robot.info("🔔 Current status: Paused. Resuming")
+            log_robot.info("🔔 当前状态：已暂停，执行恢复")
             arm_controller.resume()
             pause_pub.publish(False)
         else:
-            log_robot.info("🔔 Current status: Operating. Pausing")
+            log_robot.info("🔔 当前状态：运行中，执行暂停")
             arm_controller.pause()
             pause_pub.publish(True)
     elif signum == signal.SIGUSR2:  # 停止
-        log_robot.info("�� Stopping")
+        log_robot.info("�� 执行停止")
         arm_controller.stop()
         stop_pub.publish(True)
-    log_robot.info(f"🔔 Signal successfully processed. Current state - Pause: {arm_controller.is_paused()}, Stop: {arm_controller.should_exit()}")
+    log_robot.info(f"🔔 信号处理完成，当前状态 - 暂停: {arm_controller.is_paused()}, 停止: {arm_controller.should_exit()}")
 
 def setup_signal_handlers():
-    """设置信号处理器 Setting up signal handler"""
+    """设置信号处理器"""
     signal.signal(signal.SIGUSR1, signal_handler)  # 暂停/恢复
     signal.signal(signal.SIGUSR2, signal_handler)  # 停止
-    log_robot.info("📡 Signal handler successfully set up:")
-    log_robot.info("  SIGUSR1 (kill -USR1): Pause/resume arm motion")
-    log_robot.info("  SIGUSR2 (kill -USR2): Stop arm motion")
+    log_robot.info("📡 信号处理器已设置:")
+    log_robot.info("  SIGUSR1 (kill -USR1): 暂停/恢复机械臂运动")
+    log_robot.info("  SIGUSR2 (kill -USR2): 停止机械臂运动")
 
 def unwrap_env(env):
     while hasattr(env, "env"):
@@ -106,11 +106,11 @@ def unwrap_env(env):
     return env
 
 class ArmMove:
-    """机械臂运动控制类 Robot arm motion class"""
+    """机械臂运动控制类"""
     
     def __init__(self, config: KuavoConfig):
         """
-        初始化机械臂控制 Initialise arm motion control
+        初始化机械臂控制
         
         Args:
             bag_path: 轨迹文件路径
@@ -123,18 +123,14 @@ class ArmMove:
         
         # 输出当前进程ID，方便外部控制
         pid = os.getpid()
-        log_robot.info(f"🆔 Current process ID: {pid}")
-        log_robot.info(f"💡 Use the following commands to control arm motion:")
-        log_robot.info(f"   Pause/Resume: kill -USR1 {pid}")
-        log_robot.info(f"   Stop: kill -USR2 {pid}")
+        log_robot.info(f"🆔 当前进程ID: {pid}")
+        log_robot.info(f"💡 使用以下命令控制机械臂运动:")
+        log_robot.info(f"   暂停/恢复: kill -USR1 {pid}")
+        log_robot.info(f"   停止运动: kill -USR2 {pid}")
 
         self.inference_config = config.inference
         self.bag_path = self.inference_config.go_bag_path
-
-        self.msg_dict_of_list = self._read_topic_messages(
-            bag_path = self.bag_path,
-            topic_names = ["/control_robot_hand_position","/leju_claw_command","/kuavo_arm_traj"]
-        )
+        self.msg_dict_of_list = {}
 
         rospy.init_node('kuavo_deploy', anonymous=True)
         self.env = gym.make(
@@ -149,15 +145,15 @@ class ArmMove:
         """检查控制信号"""
         # 检查暂停状态
         while arm_controller.is_paused():
-            log_robot.info("🔄 Robot arm motion paused")
+            log_robot.info("🔄 机械臂运动已暂停")
             time.sleep(0.1)
             if arm_controller.should_exit():
-                log_robot.info("🛑 Robot arm motion stopped")
+                log_robot.info("🛑 机械臂运动被停止")
                 return False
         
         # 检查是否需要停止
         if arm_controller.should_exit():
-            log_robot.info("🛑 Stop signal detected, exiting arm motion")
+            log_robot.info("🛑 收到停止信号，退出机械臂运动")
             return False
             
         return True  # 正常继续
@@ -181,6 +177,19 @@ class ArmMove:
         except Exception as e:
             rospy.logerr(f"Failed to read messages from bag: {e}")
             return {}
+
+    def _ensure_bag_loaded(self) -> None:
+        """按需加载 bag，仅在需要轨迹回放类任务时调用。"""
+        if self.msg_dict_of_list:
+            return
+        if not self.bag_path or not Path(self.bag_path).exists():
+            raise FileNotFoundError(f"Bag file not found: {self.bag_path}")
+        self.msg_dict_of_list = self._read_topic_messages(
+            bag_path=self.bag_path,
+            topic_names=["/control_robot_hand_position", "/leju_claw_command", "/kuavo_arm_traj"],
+        )
+        if "/kuavo_arm_traj" not in self.msg_dict_of_list or not self.msg_dict_of_list["/kuavo_arm_traj"]:
+            raise ValueError(f"No '/kuavo_arm_traj' messages found in bag: {self.bag_path}")
 
     def _pub_arm_traj(self, msg) -> None:
         """发布机械臂轨迹"""
@@ -264,19 +273,19 @@ class ArmMove:
             }
                 
         if not msg_lists:
-            log_robot.warning("No valid messages playable")
+            log_robot.warning("没有找到任何有效的消息数据可以播放")
             return
         
         # 计算总步数为最长的消息列表的长度
         max_steps = max(info["total"] for info in msg_lists.values())
-        log_robot.info(f"Now evenly playing {max_steps} steps of message data")
+        log_robot.info(f"开始均匀播放 {max_steps} 步消息数据")
         
         # 均匀发布剩余数据
         rate = rospy.Rate(100)  # 100Hz，可根据需要调整
         for step in range(1, max_steps):
             # 检查控制信号
             if not self._check_control_signals():
-                log_robot.info("🛑 Track playback stopped")
+                log_robot.info("🛑 轨迹播放被停止")
                 return
 
             for topic, info in msg_lists.items():
@@ -294,7 +303,7 @@ class ArmMove:
                         self._pub_qiangnao(info["msgs"][target_index])
                     elif topic=="/gripper_command":
                         self._pub_rq2f85(info["msgs"][target_index])
-                log_robot.info(f"Publishing {topic} message: {target_index+1}/{info['total']}")
+                log_robot.info(f"发布 {topic} 消息 {target_index+1}/{info['total']}")
             # 控制发布频率
             rate.sleep()
         
@@ -310,9 +319,9 @@ class ArmMove:
                     self._pub_qiangnao(info["msgs"][target_index])
                 elif topic=="/gripper_command":
                     self._pub_rq2f85(info["msgs"][target_index])
-                log_robot.info(f"Publishing {topic}'s last message")
+                log_robot.info(f"发布 {topic} 最终消息")
         
-        log_robot.info("Sequential message playback completed")
+        log_robot.info("消息序列播放完成")
 
     def _get_current_joint_angles(self) -> List[float]:
         """获取当前关节角度(rad)"""
@@ -354,22 +363,23 @@ class ArmMove:
             steps: 插值步数
         """
         current_angles = self._get_current_joint_angles()
-        log_robot.info(f"Current joint angle: {current_angles}")
+        log_robot.info(f"当前关节角度: {current_angles}")
         arm_inter = self._arm_interpolate_joint(
             current_angles, target_angles, steps=steps
         )
         
         for joint_angles in arm_inter:
             if not self._check_control_signals():
-                log_robot.info("🛑 Joint angle movement stopped")
+                log_robot.info("🛑 关节角度插值被停止")
                 return
-            log_robot.info(f"Robot joint angle: {joint_angles}")
+            log_robot.info(f"机械臂关节角度: {joint_angles}")
             self._pub_arm_traj(joint_angles)
             time.sleep(0.1)
 
     def go(self) -> None:
         """先插值到bag第一帧的位置，再回放bag包前往工作位置"""
         time.sleep(1)
+        self._ensure_bag_loaded()
         # 移动到轨迹起始位置
         start_angles = [float(j) for j in self.msg_dict_of_list.get("/kuavo_arm_traj", [])[0].position]
         start_angles = np.array(start_angles)/180*np.pi
@@ -380,6 +390,7 @@ class ArmMove:
     def here_run(self) -> None:
         """直接插值到bag最后一帧位置运行"""
         time.sleep(1)
+        self._ensure_bag_loaded()
         # 移动到轨迹结束位置
         end_angles = [float(j) for j in self.msg_dict_of_list.get("/kuavo_arm_traj", [])[-1].position]
         end_angles = np.array(end_angles)/180*np.pi
@@ -390,6 +401,7 @@ class ArmMove:
     def back_to_zero(self) -> None:
         """回到零位"""
         time.sleep(1)
+        self._ensure_bag_loaded()
         # 移动到轨迹结束位置
         end_angles = [float(j) for j in self.msg_dict_of_list.get("/kuavo_arm_traj", [])[-1].position]
         end_angles = np.array(end_angles)/180*np.pi
@@ -477,23 +489,23 @@ def main():
     # 确定配置文件路径
     config_path = Path(args.config)
     
-    log_robot.info(f"Use configuration file: {config_path}")
-    log_robot.info(f"Executing task: {args.task}")
+    log_robot.info(f"使用配置文件: {config_path}")
+    log_robot.info(f"执行任务: {args.task}")
     
     config = load_kuavo_config(config_path)
     # 初始化机械臂
     try:
         arm = ArmMove(config)
-        log_robot.info("Arm initialisation successful")
+        log_robot.info("机械臂初始化成功")
     except Exception as e:
-        log_robot.error(f"Arm initialisation failed: {e}")
+        log_robot.error(f"机械臂初始化失败: {e}")
         return
     
     # 干运行模式
     if args.dry_run:
-        log_robot.info("=== Dry Run Mode ===")
-        log_robot.info(f"Task to be executed: {args.task}")
-        log_robot.info("Dry run successfully completed. No actual tasks executed")
+        log_robot.info("=== 干运行模式 ===")
+        log_robot.info(f"将要执行的任务: {args.task}")
+        log_robot.info("干运行模式结束，未实际执行任何操作")
         return
     
     # 任务映射
@@ -507,14 +519,14 @@ def main():
     
     # 执行任务
     try:
-        log_robot.info(f"Now running task: {args.task}")
+        log_robot.info(f"开始执行任务: {args.task}")
         task_map[args.task]()
-        log_robot.info(f"Task {args.task} successfully completed")
+        log_robot.info(f"任务 {args.task} 执行完成")
     except KeyboardInterrupt:
-        log_robot.info("User interrupt detected!")
+        log_robot.info("用户中断操作")
     except Exception as e:
         traceback.print_exc()
-        log_robot.error(f"Task {args.task} encountered error: {e}")
+        log_robot.error(f"执行任务 {args.task} 时发生错误: {e}")
 
 if __name__ == "__main__":
     main()

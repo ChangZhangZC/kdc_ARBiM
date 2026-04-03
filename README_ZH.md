@@ -1,46 +1,18 @@
-
 # 🚀 **Kuavo Data Challenge**
+
 <p align="right">
   <a href="README_ZH.md"><b>中文</b></a> |
   <a href="README.md">English</a>
 </p>
 
-> 具身智能操作任务挑战赛 | 乐聚机器人·北京通用人工智能研究院 | [2025/09 2026/03]
-
-![项目徽章](https://img.shields.io/badge/比赛-天池竞赛-blue) 
-![构建状态](https://img.shields.io/badge/build-passing-brightgreen)
+[![leju](https://img.shields.io/badge/乐聚智能-blue)](https://www.lejurobot.com/zh)
+[![tong](https://img.shields.io/badge/北京通用人工智能研究院-red)](https://www.bigai.ai/)
 
 ---
-
-
-## ✨ 新特性！
-
-### 本分支为持续开发中的分支！目前支持了：
-
-- ACT / Diffusion policy的深度图像，分别提供了一种RGB、depth的融合方式，详见[ACT](kuavo_train/wrapper/policy/act/ACTModelWrapper.py), [Diffusion](kuavo_train/wrapper/policy/diffusion/DiffusionModelWrapper.py)
-- Accelerate 多卡并行加速！详见[多卡并行加速](#multigpu)
-- lerobot latest! version 0.4.2 ! [lerobot](https://github.com/huggingface/lerobot)
-- 帧对齐功能！详见[帧对齐](kuavo_deploy/utils/obs_buffer.py)
-- 目录文件结构重整！
-- ···
-
-### 敬请期待：
-- 末端增量式控制支持
-- 更多模仿学习模型！
-
 
 ## 🌟 项目简介
 本仓库基于 [Lerobot](https://github.com/huggingface/lerobot) 开发，结合乐聚 Kuavo（夸父）机器人，提供 **数据格式转换**（rosbag → parquet）、**模仿学习（IL）训练**、**仿真器测试**以及**真机部署验证**的完整示例代码。
-
-**关键词**：具身智能 · 工业制造 · 阿里云天池竞赛
-
----
-
-## 🎯 比赛目标
-  
-- 使用本仓库代码熟悉 Kuavo 机器人数据格式，完成模仿学习模型的训练与测试。 
-- 围绕主办方设定的机器人操作任务，开发具备感知与决策能力的模型。 
-- 最终目标及评价标准以赛事官方说明文档为准。  
+ 
 
 ---
 
@@ -84,14 +56,16 @@ nvidia-smi
 
 #### b. 安装 NVIDIA Container Toolkit
 
+在docker镜像中使用nvidia-smi加速时，需要加载nvidia runtime 库，因此需要安装NVIDIA Container Toolkit
+
 ```bash
 sudo apt install curl
-curl -fsSL https://nvidia.github.io/libnvidia-container/gpgkey | sudo gpg --dearmor -o /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg
-curl -s -L https://nvidia.github.io/libnvidia-container/stable/deb/nvidia-container-toolkit.list | sed 's#deb https://#deb [signed-by=/usr/share/keyrings/nvidia-container-toolkit-keyring.gpg] https://#g' | sudo tee /etc/apt/sources.list.d/nvidia-container-toolkit.list
+curl -fsSL https://nvidia.github.io/libnvidia-container/gpgkey | sudo gpg --dearmor -o /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg && curl -s -L https://nvidia.github.io/libnvidia-container/stable/deb/nvidia-container-toolkit.list | sed 's#deb https://#deb [signed-by=/usr/share/keyrings/nvidia-container-toolkit-keyring.gpg] https://#g' | sudo tee /etc/apt/sources.list.d/nvidia-container-toolkit.list
 sudo apt-get update
 export NVIDIA_CONTAINER_TOOLKIT_VERSION=1.17.8-1
-sudo apt-get install -y nvidia-container-toolkit=${NVIDIA_CONTAINER_TOOLKIT_VERSION} nvidia-container-toolkit-base=${NVIDIA_CONTAINER_TOOLKIT_VERSION} libnvidia-container-tools=${NVIDIA_CONTAINER_TOOLKIT_VERSION} libnvidia-container1=${NVIDIA_CONTAINER_TOOLKIT_VERSION}
+export NVIDIA_CONTAINER_TOOLKIT_VERSION=1.17.8-1 && sudo apt-get install -y nvidia-container-toolkit=${NVIDIA_CONTAINER_TOOLKIT_VERSION} nvidia-container-toolkit-base=${NVIDIA_CONTAINER_TOOLKIT_VERSION} libnvidia-container-tools=${NVIDIA_CONTAINER_TOOLKIT_VERSION} libnvidia-container1=${NVIDIA_CONTAINER_TOOLKIT_VERSION}
 ```
+
 
 #### c. 安装 Docker
 
@@ -99,7 +73,7 @@ sudo apt-get install -y nvidia-container-toolkit=${NVIDIA_CONTAINER_TOOLKIT_VERS
 sudo apt update
 sudo apt install git
 sudo apt install docker.io
-# 配置 NVIDIA Runtime
+# 配置docker中的 NVIDIA Runtime
 nvidia-ctk
 sudo nvidia-ctk runtime configure --runtime=docker
 sudo systemctl restart docker
@@ -116,7 +90,7 @@ sudo docker info | grep -i runtime
 kuavo mujoco 仿真与真机运行均基于 **ROS Noetic**环境，由于真机kuavo机器人是ubuntu20.04 + ROS Noetic（非docker），因此推荐直接安装 ROS Noetic，若因ubuntu版本较高无法安装 ROS Noetic，可使用docker。
 
 <details>
-<summary>a. 系统直接安装 ROS Noetic（<b>推荐</b>）（展开查看），仅供参考</summary>
+<summary>a. 系统直接安装 ROS Noetic（<b>推荐</b>）</summary>
 
 * 官方指南：[ROS Noetic 安装](http://wiki.ros.org/noetic/Installation/Ubuntu)
 * 国内加速源推荐：[小鱼ROS](https://fishros.org.cn/forum/topic/20/)
@@ -141,7 +115,7 @@ rosrun turtlesim turtle_teleop_key  # 新建终端
 </details>
 
 <details>
-<summary>b. 使用 Docker 安装 ROS Noetic（展开查看），仅供参考</summary>
+<summary>b. 使用 Docker 安装 ROS Noetic</summary>
 
 - 首先最好是换个源：
 
@@ -212,15 +186,13 @@ RUN apt-get update && \
 # 初始化rosdep
 RUN rosdep init
 ```
-写入完毕后保存退出。
-
-- 执行ubuntu20.04 + ROS Noetic镜像的构建：
+写入完毕后保存退出。执行ubuntu20.04 + ROS Noetic镜像的构建：
 
 ```shell
 sudo docker build -t ubt2004_ros_noetic .
 ```
 
-- 构建完成后进入镜像即可，初次启动容器加载镜像：
+构建完成后进入镜像即可，初次启动容器加载镜像：
 
 ```shell
 sudo docker run -it --name ubuntu_ros_container ubt2004_ros_noetic /bin/bash
@@ -236,36 +208,7 @@ sudo docker start ubuntu_ros_container
 sudo docker exec -it ubuntu_ros_container /bin/bash
 ```
 
-- 或者：自定义启动加载文件，launch_docker.sh, 注意，由于涉及挂载python环境，请在第4步完成后再使用这种sh方式！
-```shell
-#!/bin/bash
-
-# Paths
-CODE_DIR=/path/to/code
-PYTHON_DIR=/path/to/python_env
-DATA_DIR=/path/to/data
-IMAGE=ros:noetic
-CONTAINER=ros_noetic
-
-# Create container if it doesn't exist
-if ! docker ps | grep -q "$CONTAINER"; then
-    echo "🛠  Creating container $CONTAINER ..."
-    docker create --name=$CONTAINER $IMAGE
-fi
-
-# Run container with mounts and environment
-echo "🚀 Starting container $CONTAINER ..."
-docker run \
-    -i -t \
-    -v $CODE_DIR:/code \
-    -v $DATA_DIR:/data \
-    -v $PYTHON_DIR:$PYTHON_DIR \
-    --env PATH=/path/to/python_venv/kdc_dev/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
-    $CONTAINER /bin/bash
-```
-
-
-- 进入镜像后，初始化ros环境变量，然后启动roscore
+进入镜像后，初始化ros环境变量，然后启动roscore
 
 ```shell
 source /opt/ros/noetic/setup.bash
@@ -285,26 +228,19 @@ roscore
 
 ```bash
 # SSH
-git clone git@github.com:LejuRobotics/kuavo_data_challenge.git
+git clone --depth=1 git@github.com:LejuRobotics/kuavo_data_challenge.git
 # 或者
 # HTTPS
-git clone https://github.com/LejuRobotics/kuavo_data_challenge.git
-
-cd kuavo-data-challenge
-# 切换分支
-git checkout origin/dev
-
-# 更新third_party下的lerobot子模块：
-git submodule init
-git submodule update --recursive --progress
-
-# 如果这一步骤由于网络原因下载失败或很慢：请
-# cd third_party
-# git clone https://githubproxy.cc/https://github.com/huggingface/lerobot.git
-# cd ../ # 回到上一级目录
-
+git clone --depth=1 https://github.com/LejuRobotics/kuavo_data_challenge.git
 ```
 
+更新third_party下的lerobot子模块：
+
+```bash
+cd kuavo_data_challenge
+git submodule init
+git submodule update --recursive
+```
 
 ---
 
@@ -312,18 +248,12 @@ git submodule update --recursive --progress
 
 使用 conda （推荐）或 python venv 创建虚拟环境（推荐 python 3.10）：
 
-⚠️ 注意，本分支请新建一个独立于master分支的环境！例如: kdc_dev
-
-- ananconda配置：
-
 ```bash
-conda create -n kdc_dev python=3.10
-conda activate kdc_dev
+conda create -n kdc python=3.10
+conda activate kdc
 ```
 
-- 或，源码安装Python3.10.18，再用venv创建虚拟环境
-
-⚠️ 注意：```ppa:deadsnakes``` 在2025年6月后不能在ubuntu20.04上提供了，下述安装方式不一定成功：
+或：先安装python3.10，再使用venv创建虚拟环境
 
 ```bash
 sudo apt update
@@ -331,28 +261,12 @@ sudo apt install -y software-properties-common
 sudo add-apt-repository ppa:deadsnakes/ppa
 sudo apt update
 sudo apt install -y python3.10 python3.10-venv python3.10-dev
-```
-可以尝试下，不行请使用源码安装：
-```bash
-sudo apt update
-sudo apt install -y build-essential libssl-dev zlib1g-dev libncurses5-dev libncursesw5-devlibreadline-dev libsqlite3-dev libgdbm-dev libdb5.3-dev libbz2-dev libexpat1-dev liblzma-dev tk-dev libffi-dev uuid-dev wget
 
-wget https://www.python.org/ftp/python/3.10.18/Python-3.10.18.tgz
-tar -xzf Python-3.10.18.tgz
-cd Python-3.10.18
-./configure --prefix=$HOME/python3.10 --enable-optimizations
-make -j$(nproc)
-sudo make install
+python3.10 -m venv kdc
+source kdc/bin/activate
 ```
 
-然后创建venv环境：
-
-```bash
-python3.10 -m venv kdc_dev
-source kdc_dev/bin/activate
-```
-
-- 查看和确保安装正确：
+查看和确保安装正确：
 ```shell
 python  # 查看python版本，看到确认输出为3.10.xxx（通常是3.10.18）
 # 输出示例：
@@ -365,11 +279,9 @@ pip --version # 查看pip对应的版本，看到确认输出为3.10的pip
 ```
 
 
-### 5. 安装依赖：
+安装依赖：
 
 ```bash
-source /opt/ros/noetic/setup.bash  # 进入python环境先source好ros自带的python库，建议这行写入~/.bashrc
-
 pip config set global.index-url https://pypi.tuna.tsinghua.edu.cn/simple  # 建议首先换源，能加快下载安装速度
 
 pip install -r requirements_ilcode.txt   # 无需ROS Noetic，但只能使用kuavo_train模仿学习训练代码，kuavo_data（数转）及 kuavo_deploy（部署代码）均依赖ROS
@@ -377,53 +289,14 @@ pip install -r requirements_ilcode.txt   # 无需ROS Noetic，但只能使用kua
 pip install -r requirements_total.txt    # 需确保 ROS Noetic 已安装 (推荐)
 ```
 
-安装完打印下检查下lerobot版本：2025年11月20日为0.4.2版本
-```bash
-pip show | grep lerobot
-```
-
-若不是最新版 (0.4.2)：
-```bash
-cd third_party/lerobot
-git fetch
-git reset --hard origin/main
-cd ../../
-```
-
-重新pip install -r requirement即可。
-
-如果pip安装完毕但运行训练代码时报ffmpeg或torchcodec的错：
+如果运行时报ffmpeg或torchcodec的错：
 
 ```bash
 conda install ffmpeg==6.1.1
 
 # 或
 
-# pip uninstall torchcodec
-```
-
-如果想使用torchcodec，又没有conda，环境是用python venv创建的：
-- 源码构建：参考[ffmpeg官方库](https://trac.ffmpeg.org/wiki/CompilationGuide/Ubuntu#GettheDependencies)
-
-&nbsp;&nbsp;&nbsp;&nbsp; (a). 提前把osm那些包装好，仿照官方文档
-
-&nbsp;&nbsp;&nbsp;&nbsp; (b). openh264:
-```bash
-cd ~/python-pkg/ffmpeg_source
-git clone https://github.com/cisco/openh264.git
-cd openh264
-git checkout v2.4.1   # 对应 FFmpeg 官方支持版本
-make -j$(nproc)
-sudo make install PREFIX=$HOME/ffmpeg_build
-```
-
-&nbsp;&nbsp;&nbsp;&nbsp; (c). 编译安装ffmpeg，这种安装和conda安装一模一样的功能，验证不会有问题
-```bash
-PATH="$HOME/bin:$PATH" PKG_CONFIG_PATH="$HOME/ffmpeg_build/lib/pkgconfig:/usr/lib/x86_64-linux-gnu/pkgconfig" ./configure   --prefix=/usr/local   --disable-doc --extra-cflags=-I$HOME/ffmpeg_build/include --extra-ldflags=-L$HOME/ffmpeg_build/lib  --enable-swresample   --enable-swscale   --enable-openssl   --enable-libxml2   --enable-libtheora   --enable-demuxer=dash   --enable-postproc   --enable-hardcoded-tables   --enable-libfreetype   --enable-libharfbuzz   --enable-libfontconfig   --enable-libdav1d   --enable-zlib   --enable-libaom   --enable-pic   --enable-shared   --disable-static   --disable-gpl   --enable-version3   --disable-sdl2   --enable-libopenh264   --enable-libopus   --enable-libmp3lame   --enable-libopenjpeg   --enable-libvorbis   --enable-pthreads   --enable-libtesseract   --enable-libvpx
-sudo make -j$(nproc)
-sudo make install
-sudo ldconfig
-# ffmpeg -version验证
+pip uninstall torchcodec
 ```
 
 ---
@@ -476,24 +349,6 @@ python kuavo_train/train_policy.py \
 
 ---
 
-<a id="multigpu"></a>
-### 2.1 模仿学习训练：单机多卡模式
-
-安装accelerate库： pip install accelerate (一般安装lerobot时已经安装)
-
-```bash
-# 配置好accelerate yaml文件，根据你自己的机器配置
-vim configs/accelerate/accelerate_config.yaml
-# 配置好后运行示例：
-accelerate launch --config_file configs/accelerate/accelerate_config.yaml kuavo_train/train_policy_with_accelerate.py  --config-path=../configs/policy --config-name=diffusion_config.yaml
-```
-
-说明：
-
-* diffusion_config.yaml文件中配置参数设置参考上面《2.0 模仿学习训练》详细参数说明 
-
----
-
 ### 3. 仿真器测试
 
 完成训练后可启动mujoco仿真器并调用部署代码并进行评估：
@@ -503,63 +358,25 @@ a. 启动mujoco仿真器：详情请见[readme for simulator](https://github.com
 b. 调用部署代码
 
 - 配置文件位于 `./configs/deploy/`：
-  * `kuavo_env.yaml`：夸父机器人运行环境配置，`env_name`为`Kuavo-Sim`，其他如`obs_key_map`观测按需修改
+  * `kuavo_sim_env.yaml`：仿真器运行配置
+  * `kuavo_real_env.yaml`：真机运行配置
 
-- 请查看yaml文件说明，并修改其中的`# env`，`# inference`相关的参数（需要的信息、模型的加载）等。
 
-- 启动自动化推理部署：（注意与main分支不同）
+- 请查看yaml文件，并修改下面的`# inference configs`相关的参数（模型加载）等。
+
+- 启动自动化推理部署：
   ```bash
-  python kuavo_deploy/eval_kuavo.py
+  bash kuavo_deploy/eval_kuavo.sh
   ```
-- 按照指引操作，一般先选择`3`，然后给到`kuavo_env.yaml`的路径（`configs/deploy/kuavo_env.yaml`），最后仿真运行请选择`"8. auto_test       : 自动测试任务：仿真中自动测试模型，执行 eval_episodes 次`，这步操作详见[kuavo deploy](kuavo_deploy/readme/inference.md)
+- 按照指引操作，一般最后请选择`"8. 仿真中自动测试模型，执行eval_episodes次:`，这步操作详见[kuavo deploy](kuavo_deploy/readme/inference.md)
 ---
 
 
 
 ### 4. 真机测试
 
-- 步骤同3中b部分，修改配置文件 `kuavo_env.yaml`，`env_name`为`Kuavo-Real`，其他如`eef_type`，`obs_key_map`等按需修改，即可在真机上部署测试。
+步骤同3中a部分，更换指定配置文件为 `kuavo_real_env.yaml`，即可在真机上部署测试。
 
-- 边侧机推理请见（待更新），上位机orin推理请见：[README_AGX_ORIN.md](README_AGX_ORIN.md)
-
-- 推理运行时的日志在log/kuavo_deploy/kuavo_deploy.log，请查看。
-
-### 5. 关于 kuavo_humanoid_sdk：
-
-⚠️ 有时会出现版本不匹配的问题，无法通信什么的，会报错：机械臂初始化失败！解决方案，若出现相关问题：
-
-（a）进入机器人下位机，
-
-```bash
-  ssh lab@192.168.26.1 # 密码三个空格
-  cd ~/kuavo-ros-opensource
-  git describe --tag # 查看opensource版本
-  # 显示xxx
-```
-  - 返回边侧机，或上位机，
-```bash
-# 进入环境
-conda activate kdc_dev
-# 或
-source kdc_dev/bin/activate
-pip install kuavo-humanoid-sdk==xxx #安装对应版本的sdk
-```
-
-
-（b）（时间较久，较复杂，不推荐）可以拷贝机器人下位机的kuavo-ros-opensource的内容安装，[kuavo-ros-opensource](https://github.com/LejuRobotics/kuavo-ros-opensource)，例如，
-
-```bash
-scp -r lab@192.168.26.1:~/kuavo-ros-opensource /your/path/
-cd /your/path/kuavo-ros-opensource/src/kuavo_humanoid_sdk
-# 或
-# cd /your/path/to/kuavo-ros-opensource/src/kuavo_humanoid_sdk
-# 进入环境
-conda activate kdc_dev
-# 或
-source kdc_dev/bin/activate
-
-./install.sh
-```
 ---
 
 ## 📡 ROS 话题说明
@@ -615,7 +432,7 @@ outputs/
 ## 📂 核心代码结构
 
 ```
-KUAVO-DATA-CHALLENGE/
+KUAVO_DATA_CHALLENGE/
 ├── configs/                # 配置文件
 ├── kuavo_data/             # 数据处理转换模块
 ├── kuavo_deploy/           # 部署脚本（模拟器/真机）
