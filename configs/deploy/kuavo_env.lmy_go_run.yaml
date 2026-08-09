@@ -1,0 +1,69 @@
+# Local deploy config for go_run validation on lmy workspace.
+
+hydra:
+  run:
+    dir: ./outputs/kuavo_deploy_hydra_save/singlerun/${now:%Y%m%d_%H%M%S}
+  sweep:
+    dir: ./outputs/kuavo_deploy_hydra_save/multirun/${now:%Y%m%d_%H%M%S}
+    subdir: ${hydra:job.override_dirname}
+
+env:
+  env_name: Kuavo-Real
+  control_mode: joint
+  eef_type: leju_claw
+  platform_type: "4pro"
+  which_arm: right
+  head_init: null
+  ros_rate: 10
+  direct_to_wbc: false
+  only_arm: true
+  image_size: &IMGSIZE [848, 480]
+  depth_range: &DEPTHRANGE [0, 1500]
+  obs_key_map:
+    head_cam_h: ["/cam_h/color/image_raw/compressed", "CompressedImage", 30, *IMGSIZE]
+    wrist_cam_r: ["/cam_r/color/image_raw/compressed", "CompressedImage", 30, *IMGSIZE]
+    joint_q: ["/sensors_data_raw", "sensorsData", 500]
+    leju_claw: ["/leju_claw_state", "lejuClawState", 500]
+  arm_state_keys: ["joint_q", "gripper"]
+  frame_alignment: false
+  ratio: 1.0
+  limits:
+    joint_q:
+      min: [-3.14, -3.14, -3.14, -3.14, -3.14, -3.14, -3.14, -3.14, -3.14, -3.14, -3.14, -3.14, -3.14, -3.14]
+      max: [3.14, 3.14, 3.14, 3.14, 3.14, 3.14, 3.14, 3.14, 3.14, 3.14, 3.14, 3.14, 3.14, 3.14]
+    gripper:
+      min: [0, 0]
+      max: [1, 1]
+    eef:
+      min: [-1, -1, -1, -3.14, -3.14, -3.14, -1, -1, -1, -3.14, -3.14, -3.14]
+      max: [1, 1, 1, 3.14, 3.14, 3.14, 1, 1, 1, 3.14, 3.14, 3.14]
+    eef_relative:
+      min: [-0.005, -0.0075, -0.004, -0.03, -0.03, -0.05, -0.005, -0.0075, -0.004, -0.03, -0.03, -0.05]
+      max: [0.005, 0.0075, 0.004, 0.03, 0.03, 0.05, 0.005, 0.0075, 0.004, 0.03, 0.03, 0.05]
+    base:
+      min: [-2.0, -2.0, -3.14, 0]
+      max: [2.0, 2.0, 3.14, 1]
+  qiangnao_dof_needed: 1
+  is_binary: false
+
+inference:
+  go_bag_path: /home/lmy/lmy_ws/Leju/kuavo_data_challenge_dev/raw_data/A01-A02-A02-A02-A02-A03-P4_000-leju_claw-20260309165457-v002.bag
+  policy_type: "lingbot"
+  pretrained_path: "/home/lmy/lmy_ws/Leju/kuavo_data_challenge_master/models/run_20260323_060215_7005/run_20260323_060215/checkpoints/global_step_7005/hf_ckpt"
+  lingbot_root: "/home/lmy/lmy_ws/Leju/lingbot-vla"
+  qwen25_path: "/home/lmy/lmy_ws/Leju/Qwen2.5-VL-3B-Instruct"
+  eval_episodes: 1
+  seed: 42
+  start_seed: 42
+  device: "cuda"
+  task: "pick_and_place"
+  method: "lingbot_post_train"
+  timestamp: "run_20260318_075416_15300"
+  epoch: "global_step_15300"
+  max_episode_steps: 500
+  task_prompt: "Pick and Place"
+  lingbot_use_length: 5
+  lingbot_chunk_ret: false
+  lingbot_norm_stats_file: "/home/lmy/lmy_ws/Leju/kuavo_data_challenge_master/assets/norm_stats/pick_and_place0_4_2.json"
+  lingbot_data_type: "customized"
+  lingbot_execute_raw_action: false
