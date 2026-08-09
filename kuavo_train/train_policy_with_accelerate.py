@@ -18,14 +18,18 @@ from hydra.utils import instantiate
 # from diffusers.optimization import get_scheduler
 
 from lerobot.configs.types import FeatureType, NormalizationMode
-from lerobot.datasets.lerobot_dataset import LeRobotDatasetMetadata, LeRobotDataset
+from lerobot.datasets.lerobot_dataset import LeRobotDatasetMetadata
 from lerobot.datasets.sampler import EpisodeAwareSampler
 from lerobot.datasets.utils import dataset_to_policy_features
 from lerobot.utils.random_utils import set_seed
 from lerobot.policies.factory import make_pre_post_processors
 from kuavo_train.wrapper.policy.diffusion.DiffusionPolicyWrapper import CustomDiffusionPolicyWrapper
 from kuavo_train.wrapper.policy.act.ACTPolicyWrapper import CustomACTPolicyWrapper
-from kuavo_train.wrapper.dataset.LeRobotDatasetWrapper import CustomLeRobotDataset
+from kuavo_train.wrapper.dataset.LeRobotDatasetWrapper import (
+    CustomLeRobotDataset,
+    filter_depth_policy_features,
+    policy_uses_depth,
+)
 from kuavo_train.utils.augmenter import crop_image, resize_image, DeterministicAugmenterColor
 from kuavo_train.utils.utils import save_rng_state, load_rng_state
 from lerobot.policies.act.modeling_act import ACTPolicy
@@ -63,18 +67,30 @@ def build_augmenter(cfg):
     return ImageTransforms(img_tf_cfg)
 
 
-def build_delta_timestamps(dataset_metadata, policy_cfg):
-    """Build delta timestamps for observations and actions."""
+def build_delta_timestamps(
+    dataset_metadata,
+    policy_cfg,
+    input_features: dict | None = None,
+    output_features: dict | None = None,
+):
+    """Build delta timestamps for active policy observations and actions."""
     obs_indices = getattr(policy_cfg, "observation_delta_indices", None)
     act_indices = getattr(policy_cfg, "action_delta_indices", None)
     if obs_indices is None and act_indices is None:
         return None
 
+    if input_features is None:
+        input_features = getattr(policy_cfg, "input_features", {})
+    if output_features is None:
+        output_features = getattr(policy_cfg, "output_features", {})
+    active_input_keys = set(input_features)
+    active_output_keys = set(output_features)
+
     delta_timestamps = {}
     for key in dataset_metadata.info["features"]:
-        if "observation" in key and obs_indices is not None:
+        if key in active_input_keys and "observation" in key and obs_indices is not None:
             delta_timestamps[key] = [i / dataset_metadata.fps for i in obs_indices]
-        elif "action" in key and act_indices is not None:
+        elif key in active_output_keys and "action" in key and act_indices is not None:
             delta_timestamps[key] = [i / dataset_metadata.fps for i in act_indices]
 
     return delta_timestamps if delta_timestamps else None
@@ -240,6 +256,10 @@ def main(cfg: DictConfig):
     dataset_metadata = LeRobotDatasetMetadata(cfg.repoid, root=cfg.root)
     features = dataset_to_policy_features(dataset_metadata.features)
     input_features = {k: ft for k, ft in features.items() if ft.type is not FeatureType.ACTION}
+    input_features, excluded_depth_keys = filter_depth_policy_features(
+        input_features,
+        use_depth=policy_uses_depth(cfg.policy),
+    )
     output_features = {k: ft for k, ft in features.items() if ft.type is FeatureType.ACTION}
 
     # instantiate the policy
@@ -267,18 +287,24 @@ def main(cfg: DictConfig):
 
 
     # Build dataset and dataloader
-    delta_timestamps = build_delta_timestamps(dataset_metadata, policy_cfg)
+    delta_timestamps = build_delta_timestamps(
+        dataset_metadata,
+        policy_cfg,
+        input_features=input_features,
+        output_features=output_features,
+    )
 
     image_transforms = build_augmenter(cfg.training.RGB_Augmenter)
-    dataset = LeRobotDataset(
+    dataset = CustomLeRobotDataset(
         cfg.repoid,
         delta_timestamps=delta_timestamps,
         root=cfg.root,
         image_transforms=None,
+        excluded_keys=excluded_depth_keys,
     )
     accelerator.wait_for_everyone()
     # Training loop
-    aug_step = insert_before_normalizer(preprocessor, AugmentationProcessorStep(image_transforms, dataset.meta.camera_keys))  # just for training
+    aug_step = insert_before_normalizer(preprocessor, AugmentationProcessorStep(image_transforms, dataset.active_camera_keys))  # just for training
     
     if hasattr(cfg.policy, "drop_n_last_frames"):
         shuffle = False
