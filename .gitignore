@@ -223,3 +223,9 @@ ana.py
 *.tar
 error.txt
 obs.png
+
+.claude/
+CLAUDE.md
+AGENTS.md
+.gitnexus/
+
