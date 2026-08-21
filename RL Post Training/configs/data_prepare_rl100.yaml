@@ -1,0 +1,52 @@
+# Default config for data_prepare.py
+#
+# mode:
+#   raw_to_npy   - raw teleop demo_*.npy -> processed .npy at processed_npy_output
+#   build_zarr   - teleop_sources (.npy) + rollout_sources (.h5 dirs) -> new zarr
+#   extend_zarr  - base_zarr_path + rollout_sources -> new zarr (base zarr is read-only)
+
+mode: build_zarr
+overwrite: true
+
+num_points: 1024
+max_episode_len: 2000
+lambda_penalty: 0.05
+smooth_penalty: 0.01
+only_success: false
+min_episode_len: 30
+include_rollouts: false
+
+# Replace these placeholders with local paths for your machine/run.
+raw_teleop_dir: /path/to/raw_teleop_demo_dir
+processed_npy_output: /path/to/processed/data_flipping_task.npy
+
+base_zarr_path: null
+zarr_output_path: /path/to/output/data_flipping.zarr
+
+teleop_sources:
+  - name: teleop_main
+    path: /path/to/processed/data_flipping_task.npy
+  - name: teleop_extra
+    path: /path/to/processed/data_flipping_extra.npy
+
+rollout_sources:
+  - name: off2off_001
+    round: "001"
+    enabled: true
+    type: h5_rollout_dir
+    path: /path/to/policy_rollouts/001/online_ft
+  - name: off2off_002
+    round: "002"
+    enabled: true
+    type: h5_rollout_dir
+    path: /path/to/policy_rollouts/002/online_ft
+  - name: off2off_003
+    round: "003"
+    enabled: true
+    type: h5_rollout_dir
+    path: /path/to/policy_rollouts/003/online_ft
+  - name: off2off_004
+    round: "004"
+    enabled: true
+    type: h5_rollout_dir
+    path: /path/to/policy_rollouts/004/online_ft
