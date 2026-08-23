@@ -557,7 +557,7 @@ def main(cfg: DictConfig):
             else:
                 scaled_loss.backward()
 
-            if steps % cfg.training.accumulation_steps == 0:
+            if (steps + 1) % cfg.training.accumulation_steps == 0:
                 if amp_enabled:
                     # Optionally unscale and clip gradients here if you use clipping
                     scaler.step(optimizer)
@@ -567,7 +567,7 @@ def main(cfg: DictConfig):
                 optimizer.zero_grad()
                 lr_scheduler.step()
 
-            if steps % cfg.training.log_freq == 0:
+            if (steps + 1) % cfg.training.log_freq == 0:
                 writer.add_scalar("train/loss", scaled_loss.item(), steps)
                 writer.add_scalar("train/lr", lr_scheduler.get_last_lr()[0], steps)
                 epoch_bar.set_postfix(loss=f"{scaled_loss.item():.3f}", step=steps, lr=lr_scheduler.get_last_lr()[0])
