@@ -248,6 +248,37 @@ class OfflineBuffer:
     def size(self) -> int:
         return self._size
 
+    def keys(self):
+        return [
+            "state", "action", "reward", "next_state", "next_action",
+            "done", "timeout", "not_done", "return",
+            *self._extra_data.keys(),
+        ]
+
+    def __getitem__(self, key: str) -> np.ndarray:
+        core_data = {
+            "state": self._state,
+            "action": self._action,
+            "reward": self._reward,
+            "next_state": self._next_state,
+            "next_action": self._next_action,
+            "done": self._done,
+            "timeout": self._timeout,
+            "not_done": self._not_done,
+            "return": self._return,
+        }
+
+        if key in core_data:
+            return core_data[key]
+
+        if key in self._extra_data:
+            return self._extra_data[key]
+
+        raise KeyError(key)
+
+    def __contains__(self, key: str) -> bool:
+        return key in self.keys()
+
     @property
     def episode_ends(self) -> np.ndarray:
         if self._size == 0:
@@ -300,3 +331,5 @@ class OfflineBuffer:
                 f"Last episode_end must equal dataset size {size}, "
                 f"got {episode_ends[-1]}."
             )
+            
+            
