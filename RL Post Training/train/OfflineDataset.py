@@ -140,7 +140,7 @@ class OfflineDataset(Dataset):
     def _to_tensor(data: Any) -> Any:
         if isinstance(data, dict):
             return {
-                key: OfflineRLDataset._to_tensor(value)
+                key: OfflineDataset._to_tensor(value)
                 for key, value in data.items()
             }
         if isinstance(data, np.ndarray):
