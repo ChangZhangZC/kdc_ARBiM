@@ -1,6 +1,6 @@
 import torch
 import torch.nn as nn
-from rl_100.model.diffusion.conv1d_components import Conv1dBlock, Downsample1d
+from .conv1d_components import Conv1dBlock, Downsample1d
 
 
 class ActionChunkEncoder(nn.Module):

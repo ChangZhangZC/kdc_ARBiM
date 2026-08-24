@@ -97,6 +97,10 @@ class ACTCriticEncoder(nn.Module):
         state_feature = self.state_proj(obs[OBS_STATE])
         return torch.cat([*visual_features, state_feature], dim=-1)
 
+    def output_shape(self) -> int:
+        return self.output_dim
+    
+    
 class ValueMLP(nn.Module):
     def __init__(
         self,

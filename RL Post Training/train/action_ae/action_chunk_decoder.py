@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from rl_100.model.diffusion.conv1d_components import Conv1dBlock, Upsample1d
+from .conv1d_components import Conv1dBlock, Upsample1d
 
 
 class ActionChunkDecoder(nn.Module):

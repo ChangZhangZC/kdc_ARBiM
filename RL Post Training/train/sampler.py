@@ -54,7 +54,7 @@ def create_indices(
         if len(indices) == 0:
             return np.zeros((0, 4), dtype=np.int64)
 
-        return np.asarray(indices, dtype=np.int64)
+    return np.asarray(indices, dtype=np.int64)
 
 
 def get_val_mask(n_episodes, val_ratio, seed=0):
