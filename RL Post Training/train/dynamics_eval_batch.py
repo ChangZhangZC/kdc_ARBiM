@@ -4,7 +4,7 @@ from typing import Dict, Tuple
 import hydra
 import torch
 
-from transition_model.models.dynamics_model import EnsembleDynamicsModel
+from transition_model.dynamics.ensemble_dynamics_for_batch import EnsembleDynamics_batch
 from transition_model.dynamics import EnsembleDynamics_batch
 from transition_model.utils.termination_fns import get_termination_fn
 from transition_model.utils.logger import Logger, make_log_dirs
