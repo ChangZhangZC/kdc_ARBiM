@@ -1,4 +1,5 @@
 import torch
+import torch.distributed as dist
 
 from lerobot.utils.constants import OBS_STATE
 from ...critic.networks import ACTCriticEncoder
@@ -30,6 +31,10 @@ class ACTObservationAdapter:
     ) -> None:
         if n_obs_steps < 1:
             raise ValueError("n_obs_steps must be >= 1")
+        if dist.is_available() and dist.is_initialized() and not fix_encoder:
+            raise RuntimeError(
+                "DDP dynamics training currently requires dynamics.fix_encoder=true."
+            )
 
         self.encoder = encoder
         self.stats = stats
