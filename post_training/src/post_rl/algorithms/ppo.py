@@ -1,6 +1,7 @@
 from copy import deepcopy
 
 import torch
+import torch.distributed as dist
 
 from ..policy.stochastic_act_policy import StochasticACTPolicyWrapper
 
@@ -31,20 +32,18 @@ class ProximalPolicyOptimization:
         self._batch_size = batch_size
         self._is_iql = is_iql
         self._ratio_strategy = ratio_strategy
-        
+
         if ratio_strategy not in {"per_step", "scalar"}:
             raise ValueError(
                 f"Unsupported ratio_strategy={ratio_strategy}. "
                 "Expected 'per_step' or 'scalar'."
             )
-        
+
         self._policy.eval()
         self.set_old_policy()
         self._build_optimizer()
         self._build_scheduler()
 
-
-        
     def _configure_trainable_params(self) -> None:
         for param in self._policy.parameters():
             param.requires_grad = True
@@ -67,14 +66,25 @@ class ProximalPolicyOptimization:
             if module is not None:
                 module.requires_grad_(False)
                 module.eval()
-                
+
     def _build_optimizer(self) -> None:
         self._configure_trainable_params()
         params = [p for p in self._policy.parameters() if p.requires_grad]
         if not params:
             raise RuntimeError("PPO policy has no trainable parameters.")
         self._optimizer = torch.optim.Adam(params, lr=self._policy_lr)
-        
+
+    @staticmethod
+    def _sync_gradients(params: list[torch.nn.Parameter]) -> None:
+        if not dist.is_available() or not dist.is_initialized():
+            return
+        world_size = dist.get_world_size()
+        for param in params:
+            if param.grad is None:
+                continue
+            dist.all_reduce(param.grad, op=dist.ReduceOp.SUM)
+            param.grad.div_(world_size)
+
     def weighted_advantage(self, advantage: torch.Tensor) -> torch.Tensor:
         if self._omega == 0.5:
             return advantage
@@ -106,7 +116,7 @@ class ProximalPolicyOptimization:
             f"Unsupported ratio_strategy={self._ratio_strategy}. "
             "Expected 'per_step' or 'scalar'."
         )
-        
+
     def _align_advantage(
         self,
         advantage: torch.Tensor,
@@ -175,7 +185,7 @@ class ProximalPolicyOptimization:
         ) * advantage
         entropy_bonus = entropy * self._entropy_weight
         return -(torch.min(loss1, loss2) + entropy_bonus).mean()
-    
+
     def update(
         self,
         obs: dict,
@@ -202,6 +212,7 @@ class ProximalPolicyOptimization:
             p for p in self._policy.parameters()
             if p.requires_grad and p.grad is not None
         ]
+        self._sync_gradients(trainable_params)
         torch.nn.utils.clip_grad_norm_(trainable_params, 0.5)
         self._optimizer.step()
 
@@ -235,14 +246,14 @@ class ProximalPolicyOptimization:
 
     def save(self, path: str) -> None:
         self._policy.save_pretrained(path)
-        
+
     def load(self, path: str) -> None:
         self._policy = StochasticACTPolicyWrapper.from_pretrained(path).to(self._device)
         self._policy.eval()
         self.set_old_policy()
         self._build_optimizer()
         self._build_scheduler()
-        
+
     def set_policy(
         self,
         policy: StochasticACTPolicyWrapper,
@@ -256,7 +267,7 @@ class ProximalPolicyOptimization:
         self._old_policy.eval()
         self._build_optimizer()
         self._build_scheduler()
-        
+
     def set_old_policy(self) -> None:
         self._old_policy = deepcopy(self._policy).to(self._device)
         self._old_policy.eval()
