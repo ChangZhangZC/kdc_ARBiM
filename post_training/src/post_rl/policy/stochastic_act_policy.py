@@ -9,7 +9,7 @@ from huggingface_hub import hf_hub_download
 from huggingface_hub.constants import SAFETENSORS_SINGLE_FILE
 from huggingface_hub.errors import HfHubHTTPError
 
-from kuavo_train.wrapper.policy.act.StochasticACTConfigWrapper import StochasticACTConfigWrapper
+from .stochastic_act_config import StochasticACTConfigWrapper
 from kuavo_train.wrapper.policy.act.ACTPolicyWrapper import CustomACTPolicyWrapper, OBS_DEPTH
 from lerobot.utils.constants import ACTION, OBS_IMAGES
 

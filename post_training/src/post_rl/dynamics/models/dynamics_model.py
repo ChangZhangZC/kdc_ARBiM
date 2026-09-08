@@ -5,7 +5,7 @@ import torch.nn.functional as F
 from typing import List, Optional, Tuple, Union
 
 from .nets import EnsembleLinear
-from action_ae import ActionChunkEncoder, ActionChunkDecoder
+from ...critic.action_embedding import ActionChunkEncoder, ActionChunkDecoder
 
 
 class Swish(nn.Module):

@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 
-from action_ae import ActionChunkEncoder, ActionChunkDecoder
+from .action_embedding import ActionChunkEncoder, ActionChunkDecoder
 from kuavo_train.wrapper.policy.act.ACTModelWrapper import CustomACTModelWrapper
 from copy import deepcopy
 from lerobot.utils.constants import OBS_STATE

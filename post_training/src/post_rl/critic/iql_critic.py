@@ -3,7 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from copy import deepcopy
 
-from net import ACTCriticEncoder, ValueMLP, QMLP, DoubleQMLP
+from .networks import ACTCriticEncoder, ValueMLP, QMLP, DoubleQMLP
 from lerobot.utils.constants import OBS_STATE
 
 RGB_BUFFER_TO_FEATURE = {
@@ -557,7 +557,6 @@ class IQLCritic(nn.Module):
         target_q = (reward + not_done * (self._gamma ** self.n_action_steps) * next_v)
 
         action_recon_loss = None
-
         if self._is_double_q:
             if self.use_conv_action_embed:
                 q1, q2, action_recon_loss = self._Q(q_input,action,return_action_recon_loss=True,)

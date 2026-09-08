@@ -1,7 +1,7 @@
 from typing import Optional
 import numpy as np
 import numba
-from OfflineBuffer import OfflineBuffer
+from .offline_buffer import OfflineBuffer
 
 
 @numba.jit(nopython=True)

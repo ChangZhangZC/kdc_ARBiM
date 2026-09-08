@@ -1,7 +1,7 @@
 import torch
 
 from lerobot.utils.constants import OBS_STATE
-from net import ACTCriticEncoder
+from ...critic.networks import ACTCriticEncoder
 
 
 RGB_BUFFER_TO_FEATURE = {

@@ -5,8 +5,8 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset
 
-from OfflineBuffer import OfflineBuffer
-from sampler import SequenceSampler, get_val_mask, downsample_mask
+from .offline_buffer import OfflineBuffer
+from .sampler import SequenceSampler, get_val_mask, downsample_mask
 
 
 class OfflineDataset(Dataset):

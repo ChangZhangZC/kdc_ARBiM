@@ -2,13 +2,12 @@ import torch
 import csv
 import os
 
-
-from ppo import ProximalPolicyOptimization
-from OfflineCritic import IQLCritic
-from StochasticACTPolicyWrapper import StochasticACTPolicyWrapper
-from utils import CONST_EPS
-from transition_model.dynamics.ensemble_dynamics_for_batch import EnsembleDynamics_batch
-from transition_model.utils.act_obs_adapter import ACTObservationAdapter
+from .ppo import ProximalPolicyOptimization
+from ..critic.iql_critic import IQLCritic
+from ..policy.stochastic_act_policy import StochasticACTPolicyWrapper
+from ..utils.common import CONST_EPS
+from ..dynamics.core.ensemble_dynamics_for_batch import EnsembleDynamics_batch
+from ..dynamics.utils.act_obs_adapter import ACTObservationAdapter
 
 
 class BehaviorProximalPolicyOptimization(ProximalPolicyOptimization):

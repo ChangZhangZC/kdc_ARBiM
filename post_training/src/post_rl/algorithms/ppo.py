@@ -2,7 +2,7 @@ from copy import deepcopy
 
 import torch
 
-from StochasticACTPolicyWrapper import StochasticACTPolicyWrapper
+from ..policy.stochastic_act_policy import StochasticACTPolicyWrapper
 
 
 class ProximalPolicyOptimization:

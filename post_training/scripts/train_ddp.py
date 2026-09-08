@@ -1,18 +1,32 @@
-if __name__ == "__main__":
-    import os
-    import pathlib
-    import sys
-
-    ROOT_DIR = str(pathlib.Path(__file__).parent.parent.parent)
-    sys.path.append(ROOT_DIR)
-    os.chdir(ROOT_DIR)
-
-import copy
-import fcntl
-import inspect
 import os
 import pathlib
+import sys
+
+REPO_ROOT = pathlib.Path(__file__).resolve().parents[2]
+POST_TRAINING_SRC = REPO_ROOT / "post_training" / "src"
+LEROBOT_SRC = REPO_ROOT / "third_party" / "lerobot" / "src"
+
+if not LEROBOT_SRC.is_dir():
+    raise RuntimeError(
+        "LeRobot submodule is not initialized. "
+        "Run `git submodule update --init --recursive`."
+    )
+
+for path in (REPO_ROOT, POST_TRAINING_SRC, LEROBOT_SRC):
+    path_str = str(path)
+    if path_str not in sys.path:
+        sys.path.insert(0, path_str)
+
+os.chdir(REPO_ROOT)
+
+import lerobot_patches.custom_patches
+
+import copy
+import csv
+import fcntl
+import inspect
 import random
+import time
 import warnings
 from copy import deepcopy
 
@@ -22,8 +36,6 @@ import torch
 import torch.distributed as dist
 import tqdm
 import wandb
-import time
-import csv
 from hydra.core.hydra_config import HydraConfig
 from omegaconf import OmegaConf
 from termcolor import cprint
@@ -31,21 +43,21 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
 
-from OfflineBuffer import OfflineBuffer
-from OfflineCritic import IQLCritic
-from OfflineDataset import OfflineDataset
-from StochasticACTPolicyWrapper import StochasticACTPolicyWrapper
-from dynamics_eval_batch import train_dynamics
-from net import ACTCriticEncoder
-from transition_model.utils.act_obs_adapter import ACTObservationAdapter
-from uni_ppo import BehaviorProximalPolicyOptimization
-from utils import dict_apply
-from StochasticACTConfigWrapper import StochasticACTConfigWrapper
 from lerobot.processor import NormalizerProcessorStep, PolicyProcessorPipeline
-from transition_model.dynamics.ensemble_dynamics_for_batch import EnsembleDynamics_batch
-from transition_model.models.dynamics_model import EnsembleDynamicsModel
-from transition_model.utils.termination_fns import get_termination_fn
-from ema_model import EMAModel
+from post_rl.algorithms.offline_ppo import BehaviorProximalPolicyOptimization
+from post_rl.critic.iql_critic import IQLCritic
+from post_rl.critic.networks import ACTCriticEncoder
+from post_rl.data.offline_buffer import OfflineBuffer
+from post_rl.data.offline_dataset import OfflineDataset
+from post_rl.dynamics.core.ensemble_dynamics_for_batch import EnsembleDynamics_batch
+from post_rl.dynamics.models.dynamics_model import EnsembleDynamicsModel
+from post_rl.dynamics.trainer import train_dynamics
+from post_rl.dynamics.utils.act_obs_adapter import ACTObservationAdapter
+from post_rl.dynamics.utils.termination_fns import get_termination_fn
+from post_rl.policy.stochastic_act_config import StochasticACTConfigWrapper
+from post_rl.policy.stochastic_act_policy import StochasticACTPolicyWrapper
+from post_rl.utils.common import dict_apply
+from post_rl.utils.ema import EMAModel
 
 OmegaConf.register_new_resolver("eval", eval, replace=True)
 warnings.filterwarnings("ignore")
@@ -83,14 +95,17 @@ def init_wandb_run(cfg: OmegaConf, output_dir: str):
         )
         return _wandb_init(retry_init_timeout)
 
+
 class _NoOpWandb:
     def log(self, *args, **kwargs):
         pass
+
 
 def setup_ddp() -> None:
     dist.init_process_group(backend="nccl")
     local_rank = int(os.environ["LOCAL_RANK"])
     torch.cuda.set_device(local_rank)
+
 
 def cleanup_ddp() -> None:
     if dist.is_available() and dist.is_initialized():
@@ -147,6 +162,7 @@ class TrainACTWorkspace:
         self.critic = None
         self.dynamics = None
         self.obs_adapter = None
+        self.env_runner = None
 
         self.global_step = 0
         self.epoch = 0
@@ -184,7 +200,7 @@ class TrainACTWorkspace:
             self.get_stage1_artifact_dir(),
             "critic",
         )
-        
+
     def get_dynamics_artifact_dir(self) -> str:
         explicit_dir = self.cfg.dynamics.get(
             "artifact_dir",
@@ -197,7 +213,7 @@ class TrainACTWorkspace:
             self.get_stage1_artifact_dir(),
             "dynamics",
         )
-        
+
     def get_ppo_artifact_dir(self) -> str:
         explicit_dir = self.cfg.unio4.get(
             "artifact_dir",
@@ -296,7 +312,6 @@ class TrainACTWorkspace:
             eval_name="EMA Policy Eval",
         )
 
-
     @property
     def output_dir(self) -> str:
         if self._output_dir is not None:
@@ -357,14 +372,12 @@ class TrainACTWorkspace:
 
         self.action_dim = self.model.config.action_feature.shape[0]
         self.obs_feature_dim = self.critic_encoder.output_dim
-
         if self.rank == 0:
             print(
                 f"ACT observation frontend ready: "
                 f"feature_dim={self.obs_feature_dim}, "
                 f"action_dim={self.action_dim}"
             )
-
 
     def run(self) -> None:
         cfg = copy.deepcopy(self.cfg)
@@ -596,13 +609,19 @@ class TrainACTWorkspace:
             print(f"Dataset transitions: {len(buffer)}")
             print(f"Train sequences: {len(dataset)}")
             print(f"Validation sequences: {len(self.val_dataset)}")
-            
+
         self._build_act_observation_frontends(cfg)
 
         if self.is_ddp:
             dist.barrier()
 
-        self.env_runner = hydra.utils.instantiate(cfg.task.env_runner,output_dir=self.output_dir,)
+        task_cfg = cfg.get("task")
+        env_runner_cfg = None if task_cfg is None else task_cfg.get("env_runner")
+        if env_runner_cfg is not None:
+            self.env_runner = hydra.utils.instantiate(
+                env_runner_cfg,
+                output_dir=self.output_dir,
+            )
 
         self.wandb_run = None
         if cfg.get("use_wandb", False) and self.rank == 0:
@@ -634,7 +653,7 @@ class TrainACTWorkspace:
             )
 
         self.q_eval = self.critic.minQ
-        
+
         self._build_dynamics(cfg)
 
         dynamics_loaded = self._load_dynamics_if_needed(cfg)
@@ -646,7 +665,7 @@ class TrainACTWorkspace:
             )
         else:
             self.dynamics.model.eval()
-            
+
         bppo_steps = int(
             cfg.unio4.get(
                 "bppo_steps",
@@ -659,6 +678,8 @@ class TrainACTWorkspace:
             self._build_ema(cfg)
 
         if cfg.get("eval", False):
+            if self.env_runner is None:
+                raise RuntimeError("Evaluation requires task.env_runner.")
             if cfg.unio4.idql_eval:
                 log_data = self.unio4_eval(
                     idql_eval=True,
@@ -678,7 +699,7 @@ class TrainACTWorkspace:
         if bppo_steps > 0:
             self._build_finetune_dataloader(cfg)
             self._train_offline_ppo(cfg)
-            
+
     def _build_critic_dataset(self, cfg):
         if not cfg.chunk_as_single_action:
             return self.dataset, self.train_dataloader
@@ -1028,7 +1049,7 @@ class TrainACTWorkspace:
 
         self._unwrap_critic_ddp()
         self.critic.eval()
-        
+
     def _load_critic_if_needed(self, cfg) -> bool:
         if not cfg.critic.get("load_pretrain", False):
             return False
@@ -1070,13 +1091,13 @@ class TrainACTWorkspace:
             print(f"Loaded Critic from {final_dir}")
 
         return True
-    
+
     def _unwrap_critic_ddp(self) -> None:
         if hasattr(self.critic._Q, "module"):
             self.critic._Q = self.critic._Q.module
         if hasattr(self.critic._value, "module"):
             self.critic._value = self.critic._value.module
-            
+
     def _build_dynamics(self, cfg) -> None:
         prediction_mode = cfg.dynamics.get(
             "prediction_mode",
@@ -1164,7 +1185,7 @@ class TrainACTWorkspace:
 
         if self.is_ddp:
             dist.barrier()
-        
+
     def _load_dynamics_if_needed(self, cfg) -> bool:
         if not cfg.dynamics.get("load_pretrain", False):
             return False
@@ -1190,7 +1211,7 @@ class TrainACTWorkspace:
             print(f"Loaded Dynamics from {final_dir}")
 
         return True
-    
+
     def _wrap_dynamics_ddp(self, cfg) -> None:
         if not self.is_ddp:
             return
@@ -1216,7 +1237,7 @@ class TrainACTWorkspace:
     def _unwrap_dynamics_ddp(self) -> None:
         if hasattr(self.dynamics.model, "module"):
             self.dynamics.model = self.dynamics.model.module
-            
+
     def _save_dynamics_checkpoint(
         self,
         checkpoint_name: str,
@@ -1231,7 +1252,7 @@ class TrainACTWorkspace:
         )
         os.makedirs(save_dir, exist_ok=True)
         self.dynamics.save(save_dir)
-        
+
     def _train_dynamics(
         self,
         cfg,
@@ -1547,7 +1568,7 @@ class TrainACTWorkspace:
         )
         self.dynamics.load(final_dir)
         self.dynamics.model.eval()
-            
+
     def _build_ppo(self, cfg) -> None:
         self.unio4 = BehaviorProximalPolicyOptimization(
             policy=self.model,
@@ -1599,7 +1620,7 @@ class TrainACTWorkspace:
                 f"trainable={trainable_params:,}, "
                 f"total={total_params:,}"
             )
-            
+
     def _build_finetune_dataloader(self, cfg) -> None:
         if cfg.chunk_as_single_action:
             sequence_stride = cfg.dataset.get(
@@ -1690,7 +1711,7 @@ class TrainACTWorkspace:
                 )
 
         self.unio4.set_old_policy()
-        
+
     def sample_finetune_batch(self):
         if self._finetune_iter is None:
             if self.finetune_sampler is not None:
@@ -1710,7 +1731,7 @@ class TrainACTWorkspace:
             batch,
             lambda x: x.to(self.device, non_blocking=True),
         )
-        
+
     @torch.no_grad()
     def eval(
         self,
@@ -1728,6 +1749,9 @@ class TrainACTWorkspace:
                 "test_mean_score": 0.0,
                 "mean_returns": 0.0,
             }
+
+        if self.env_runner is None:
+            raise RuntimeError("Evaluation requires task.env_runner.")
 
         if policy_override is not None:
             policy = policy_override
@@ -1779,8 +1803,8 @@ class TrainACTWorkspace:
         if self.is_ddp:
             dist.barrier()
 
-        return log_data   
-        
+        return log_data
+
     @torch.no_grad()
     def unio4_eval(
         self,
@@ -1801,6 +1825,9 @@ class TrainACTWorkspace:
             if self.is_ddp:
                 dist.barrier()
             return {"test_mean_score": 0.0, "mean_returns": 0.0}
+
+        if self.env_runner is None:
+            raise RuntimeError("IDQL evaluation requires task.env_runner.")
 
         policy = self.unio4._policy
         if self.cfg.training.use_ema and self.cfg.unio4.use_ema_eval:
@@ -1863,7 +1890,7 @@ class TrainACTWorkspace:
         if self.is_ddp:
             dist.barrier()
         return log_data
-        
+
     def _train_offline_ppo(self, cfg) -> None:
         bppo_steps = int(cfg.unio4.bppo_steps)
         if bppo_steps <= 0:
@@ -1877,8 +1904,7 @@ class TrainACTWorkspace:
         ppo_dir = self.get_ppo_artifact_dir()
         os.makedirs(ppo_dir, exist_ok=True)
 
-        eval_step = int(cfg.unio4.get("eval_step",100,))
-
+        eval_step = int(cfg.unio4.get("eval_step", 100))
         if eval_step < 1:
             raise ValueError("unio4.eval_step must be >= 1.")
 
@@ -1887,46 +1913,55 @@ class TrainACTWorkspace:
             raise ValueError("unio4.eval_freq must be >= 1.")
 
         update_old_policy = bool(cfg.unio4.get("is_update_old_policy", True))
+        run_env_eval = self.env_runner is not None
+        run_idql_eval = bool(cfg.unio4.get("idql_eval", False))
 
-        run_idql_eval = bool(
-            cfg.unio4.get("idql_eval", False)
-        )
+        if run_idql_eval and not run_env_eval:
+            raise RuntimeError("unio4.idql_eval=True requires task.env_runner.")
 
-        if run_idql_eval:
-            idql_log_data = self.unio4_eval(
-                idql_eval=True,
-                dynamics=self.dynamics,
-                first_action=cfg.unio4.first_action,
-                get_np=True,
-                use_gae=cfg.unio4.use_gae,
-                iql=self.critic,
-                Q=self.q_eval,
-                repeat_num=128,
+        if run_env_eval:
+            if run_idql_eval:
+                idql_log_data = self.unio4_eval(
+                    idql_eval=True,
+                    dynamics=self.dynamics,
+                    first_action=cfg.unio4.first_action,
+                    get_np=True,
+                    use_gae=cfg.unio4.use_gae,
+                    iql=self.critic,
+                    Q=self.q_eval,
+                    repeat_num=128,
+                    eval_times=cfg.unio4.eval_times,
+                )
+            else:
+                idql_log_data = None
+
+            normal_log_data = self.eval(
                 eval_times=cfg.unio4.eval_times,
             )
+
+            if run_idql_eval:
+                best_bppo_score = idql_log_data["test_mean_score"]
+            else:
+                best_bppo_score = normal_log_data["test_mean_score"]
+
+            scores = [best_bppo_score]
+            normal_scores = [normal_log_data["test_mean_score"]]
+            idql_scores = []
+            if run_idql_eval:
+                idql_scores.append(idql_log_data["test_mean_score"])
+
+            if self.rank == 0:
+                _, is_updated = self.maybe_update_global_best(
+                    best_bppo_score
+                )
+                if is_updated:
+                    print("------------saved best model----------------")
         else:
             idql_log_data = None
-
-        normal_log_data = self.eval(
-            eval_times=cfg.unio4.eval_times,
-        )
-
-        if run_idql_eval:
-            best_bppo_score = idql_log_data["test_mean_score"]
-        else:
-            best_bppo_score = normal_log_data["test_mean_score"]
-        scores = [best_bppo_score]
-        normal_scores = [normal_log_data["test_mean_score"]]
-        idql_scores = []
-        if run_idql_eval:
-            idql_scores.append(idql_log_data["test_mean_score"])
-
-        if self.rank == 0:
-            _, is_updated = self.maybe_update_global_best(
-                best_bppo_score
-            )
-            if is_updated:
-                print("------------saved best model----------------")
+            normal_log_data = None
+            scores = []
+            normal_scores = []
+            idql_scores = []
 
         best_mean_q, initial_reward = self._evaluate_dynamics_ope(cfg)
 
@@ -1936,17 +1971,20 @@ class TrainACTWorkspace:
             f"mean_reward={initial_reward:.6f}"
         )
         opes = [best_mean_q]
-        
+
         if self.rank == 0 and self.wandb_run is not None:
-            init_log_data = {
-                "current_bppo_scores": best_bppo_score,
-                "current_mean_qs": best_mean_q,
-                "normal_eval_scores": normal_log_data["test_mean_score"],
-            }
+            init_log_data = {"current_mean_qs": best_mean_q}
+            if run_env_eval:
+                init_log_data["current_bppo_scores"] = best_bppo_score
+                init_log_data["normal_eval_scores"] = normal_log_data[
+                    "test_mean_score"
+                ]
             if run_idql_eval:
-                init_log_data["idql_eval_scores"] = idql_log_data["test_mean_score"]
+                init_log_data["idql_eval_scores"] = idql_log_data[
+                    "test_mean_score"
+                ]
             self.wandb_run.log(init_log_data)
-        
+
         if self.rank == 0:
             iterator = tqdm.tqdm(
                 range(bppo_steps),
@@ -2002,9 +2040,9 @@ class TrainACTWorkspace:
             self.global_step += 1
 
             if self.wandb_run is not None:
-                self.wandb_run.log({"dpg_loss": policy_loss})            
-    
-            if self.global_step % env_eval_freq == 0:
+                self.wandb_run.log({"dpg_loss": policy_loss})
+
+            if run_env_eval and self.global_step % env_eval_freq == 0:
                 if run_idql_eval:
                     idql_log_data = self.unio4_eval(
                         idql_eval=True,
@@ -2055,23 +2093,20 @@ class TrainACTWorkspace:
                         if run_idql_eval:
                             eval_log_data["idql_eval_scores"] = idql_current_score
                         self.wandb_run.log(eval_log_data)
-    
-            if (self.global_step % eval_step== 0):
-                current_mean_q, mean_reward = (self._evaluate_dynamics_ope(cfg))
+
+            if self.global_step % eval_step == 0:
+                current_mean_q, mean_reward = self._evaluate_dynamics_ope(cfg)
                 if self.rank == 0 and self.wandb_run is not None:
                     self.wandb_run.log(
                         {"current_mean_qs": current_mean_q}
                     )
-                updated_old_policy = False
 
                 if (
                     update_old_policy
-                    and current_mean_q
-                    > best_mean_q
+                    and current_mean_q > best_mean_q
                 ):
-                    best_mean_q = (current_mean_q)
+                    best_mean_q = current_mean_q
                     self.unio4.set_old_policy()
-                    updated_old_policy = True
 
                     if self.rank == 0:
                         print(
@@ -2097,14 +2132,14 @@ class TrainACTWorkspace:
                         delimiter=",",
                     )
 
-            if self.rank == 0:
+            if self.rank == 0 and scores:
                 np.savetxt(
                     os.path.join(ppo_dir, "each_scores.csv"),
                     scores,
                     fmt="%f",
                     delimiter=",",
                 )
-            
+
         if self.rank == 0:
             np.savetxt(
                 os.path.join(ppo_dir, "last_ope_score.csv"),
@@ -2128,11 +2163,10 @@ class TrainACTWorkspace:
                 )
 
         self._save_ppo_final_artifacts()
-        
+
         if self.is_ddp:
             dist.barrier()
-         
-                
+
     @torch.no_grad()
     def _evaluate_dynamics_ope(
         self,
@@ -2179,8 +2213,7 @@ class TrainACTWorkspace:
         mean_reward = float(mean_reward)
 
         return mean_q, mean_reward
-    
-            
+
     def _build_ema(self, cfg) -> None:
         self.ema = None
         self.ema_model = None
@@ -2196,7 +2229,7 @@ class TrainACTWorkspace:
             min_value=cfg.ema.get("min_value", 0.0),
             max_value=cfg.ema.get("max_value", 0.9999),
         )
-        
+
     def _save_policy_bundle(self, policy, save_dir: str) -> None:
         os.makedirs(save_dir, exist_ok=True)
         policy.save_pretrained(save_dir)
@@ -2208,18 +2241,23 @@ class TrainACTWorkspace:
             save_dir,
             config_filename="policy_postprocessor.json",
         )
-            
+
     def _save_ppo_final_artifacts(self) -> None:
         if self.rank != 0:
             return
         ppo_dir = self.get_ppo_artifact_dir()
-        self._save_policy_bundle(self.unio4._policy, os.path.join(ppo_dir, "last"))
+        self._save_policy_bundle(
+            self.unio4._policy,
+            os.path.join(ppo_dir, "last"),
+        )
         self.unio4.flush_ratio_logs(force=True)
         print(f"Saved final PPO actor to {os.path.join(ppo_dir, 'last')}")
-            
-    
+
     def get_global_best_ema_dir(self) -> str:
-        return self.cfg.unio4.get("global_best_ema_dir", None) or os.path.join(self.output_dir, "best_ema")
+        return self.cfg.unio4.get(
+            "global_best_ema_dir",
+            None,
+        ) or os.path.join(self.output_dir, "best_ema")
 
     def get_global_best_ema_score_path(self) -> str:
         return os.path.join(self.get_global_best_ema_dir(), "best_score.csv")
@@ -2227,8 +2265,7 @@ class TrainACTWorkspace:
     def get_global_best_ema_lock_path(self) -> str:
         best_dir = self.get_global_best_ema_dir()
         return os.path.join(os.path.dirname(best_dir), ".global_best_ema.lock")
-    
-                
+
     def cleanup_shared_memory(self) -> None:
         if self.shm_manager is None:
             return
@@ -2236,12 +2273,16 @@ class TrainACTWorkspace:
             self.shm_manager.cleanup()
             self.shm_manager = None
             if self.rank == 0:
-                info_file = os.path.join(self.output_dir, "shared_memory_info_path.txt")
+                info_file = os.path.join(
+                    self.output_dir,
+                    "shared_memory_info_path.txt",
+                )
                 if os.path.exists(info_file):
                     os.remove(info_file)
-        except Exception as e:
-            print(f"[Rank {self.rank}] Shared memory cleanup warning: {e}")
-            
+        except Exception as exc:
+            print(f"[Rank {self.rank}] Shared memory cleanup warning: {exc}")
+
+
 @hydra.main(version_base=None, config_path="../configs/rl", config_name="offline_rl")
 def main(cfg):
     if "RANK" in os.environ and "WORLD_SIZE" in os.environ:
@@ -2253,13 +2294,14 @@ def main(cfg):
         workspace.run()
     finally:
         if workspace is not None:
-            if workspace is not None and getattr(workspace, "wandb_run", None) is not None:
+            if getattr(workspace, "wandb_run", None) is not None:
                 try:
                     workspace.wandb_run.finish()
                 except Exception:
                     pass
             workspace.cleanup_shared_memory()
         cleanup_ddp()
+
 
 if __name__ == "__main__":
     main()

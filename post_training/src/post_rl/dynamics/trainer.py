@@ -1,13 +1,13 @@
 import os
-from typing import Dict, Tuple
+from typing import Dict
 
 import hydra
 import torch
 
-from transition_model.dynamics.ensemble_dynamics_for_batch import EnsembleDynamics_batch
-from transition_model.dynamics import EnsembleDynamics_batch
-from transition_model.utils.termination_fns import get_termination_fn
-from transition_model.utils.logger import Logger, make_log_dirs
+from .core.ensemble_dynamics_for_batch import EnsembleDynamics_batch
+from .models.dynamics_model import EnsembleDynamicsModel
+from .utils.termination_fns import get_termination_fn
+from .utils.logger import Logger, make_log_dirs
 
 
 def train_dynamics(
@@ -22,7 +22,6 @@ def train_dynamics(
     n_obs_steps=1,
     device="cuda",
 ):
-    
     if obs_adapter.fix_encoder != cfg.dynamics.fix_encoder:
         raise ValueError(
             "obs_adapter.fix_encoder must match cfg.dynamics.fix_encoder"
@@ -71,7 +70,7 @@ def train_dynamics(
         cfg=cfg,
         with_reward=cfg.predict_r,
     )
-    
+
     if not cfg.dynamics.fix_encoder:
         dynamics_optim = hydra.utils.instantiate(
             cfg.optimizer,
@@ -101,7 +100,7 @@ def train_dynamics(
         n_action_steps=n_action_steps,
         prediction_mode=prediction_mode,
     )
-    
+
     os.makedirs(dynamics_save_path, exist_ok=True)
 
     log_dirs = make_log_dirs(
@@ -123,6 +122,7 @@ def train_dynamics(
     dynamics.set_logger(logger)
 
     return dynamics
+
 
 @torch.no_grad()
 def rollout(
@@ -164,33 +164,6 @@ def dynamics_eval(
         args.rollout_length,
         args,
     )
-    
-def get_args():
-    from transition_model.configs import loaded_args
-    import argparse
-
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--algo-name", type=str, default="mobile")
-    parser.add_argument("--env", type=str, default="walker2d-medium-expert-v2")
-    parser.add_argument("--seed", type=int, default=1)
-    parser.add_argument("--gpu", type=int, default=1)
-    parser.add_argument(
-        "--device",
-        type=str,
-        default="cuda" if torch.cuda.is_available() else "cpu",
-    )
-    parser.add_argument("--is_state_norm", default=False, type=bool)
-    parser.add_argument("--is_eval_state_norm", default=False, type=bool)
-
-    known_args, _ = parser.parse_known_args()
-    default_args = loaded_args[known_args.env]
-    for arg_key, default_value in default_args.items():
-        parser.add_argument(
-            f"--{arg_key}",
-            default=default_value,
-            type=type(default_value),
-        )
-    return parser.parse_args()
 
 
 if __name__ == "__main__":
