@@ -32,6 +32,9 @@ class ProximalPolicyOptimization:
         self._batch_size = batch_size
         self._is_iql = is_iql
         self._ratio_strategy = ratio_strategy
+        self._grad_hook_handles = []
+        self._old_sync_hook = None
+        self._old_policy_version = 0
 
         if ratio_strategy not in {"per_step", "scalar"}:
             raise ValueError(
@@ -67,23 +70,58 @@ class ProximalPolicyOptimization:
                 module.requires_grad_(False)
                 module.eval()
 
+    def _register_gradient_sync_hooks(self, params) -> None:
+        for handle in self._grad_hook_handles:
+            handle.remove()
+        self._grad_hook_handles = []
+
+        if not dist.is_available() or not dist.is_initialized():
+            return
+
+        world_size = dist.get_world_size()
+
+        def sync_grad(grad):
+            dist.all_reduce(grad, op=dist.ReduceOp.SUM)
+            return grad / world_size
+
+        for param in params:
+            self._grad_hook_handles.append(param.register_hook(sync_grad))
+
     def _build_optimizer(self) -> None:
         self._configure_trainable_params()
         params = [p for p in self._policy.parameters() if p.requires_grad]
         if not params:
             raise RuntimeError("PPO policy has no trainable parameters.")
+        self._register_gradient_sync_hooks(params)
         self._optimizer = torch.optim.Adam(params, lr=self._policy_lr)
 
-    @staticmethod
-    def _sync_gradients(params: list[torch.nn.Parameter]) -> None:
+    def _sync_old_policy_before_forward(self, module, inputs) -> None:
         if not dist.is_available() or not dist.is_initialized():
             return
-        world_size = dist.get_world_size()
-        for param in params:
-            if param.grad is None:
-                continue
-            dist.all_reduce(param.grad, op=dist.ReduceOp.SUM)
-            param.grad.div_(world_size)
+
+        version = torch.tensor(
+            [self._old_policy_version],
+            device=self._device,
+            dtype=torch.long,
+        )
+        dist.broadcast(version, src=0)
+        target_version = int(version.item())
+
+        needs_sync = torch.tensor(
+            [int(self._old_policy_version != target_version)],
+            device=self._device,
+            dtype=torch.long,
+        )
+        dist.all_reduce(needs_sync, op=dist.ReduceOp.MAX)
+
+        if int(needs_sync.item()) == 0:
+            return
+
+        for param in self._old_policy.parameters():
+            dist.broadcast(param.data, src=0)
+        for buffer in self._old_policy.buffers():
+            dist.broadcast(buffer.data, src=0)
+        self._old_policy_version = target_version
 
     def weighted_advantage(self, advantage: torch.Tensor) -> torch.Tensor:
         if self._omega == 0.5:
@@ -212,7 +250,6 @@ class ProximalPolicyOptimization:
             p for p in self._policy.parameters()
             if p.requires_grad and p.grad is not None
         ]
-        self._sync_gradients(trainable_params)
         torch.nn.utils.clip_grad_norm_(trainable_params, 0.5)
         self._optimizer.step()
 
@@ -269,7 +306,15 @@ class ProximalPolicyOptimization:
         self._build_scheduler()
 
     def set_old_policy(self) -> None:
+        if self._old_sync_hook is not None:
+            self._old_sync_hook.remove()
         self._old_policy = deepcopy(self._policy).to(self._device)
         self._old_policy.eval()
         for param in self._old_policy.parameters():
             param.requires_grad = False
+        self._old_policy_version += 1
+        model = getattr(self._old_policy, "model", None)
+        if model is not None:
+            self._old_sync_hook = model.register_forward_pre_hook(
+                self._sync_old_policy_before_forward
+            )
