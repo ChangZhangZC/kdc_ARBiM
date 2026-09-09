@@ -221,6 +221,9 @@ class ACTStateEncoder(nn.Module):
             self.cross_modal_fusion = source.cross_modal_fusion
             self.cross_modal_fusion_proj = source.cross_modal_fusion_proj
         self.output_dim = self.config.dim_model
+        self.eval()
+        for param in self.parameters():
+            param.requires_grad = False
 
     def forward(self, batch: dict[str, Tensor]) -> Tensor:
         model_batch = prepare_act_model_batch(self.config, batch)
