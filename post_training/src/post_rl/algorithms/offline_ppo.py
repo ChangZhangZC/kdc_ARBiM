@@ -24,6 +24,7 @@ class BehaviorProximalPolicyOptimization(ProximalPolicyOptimization):
         decay: float,
         fix_encoder: bool,
         cfg,
+        dynamics=None,
         temperature: float | None = None,
     ) -> None:
         super().__init__(
@@ -37,14 +38,13 @@ class BehaviorProximalPolicyOptimization(ProximalPolicyOptimization):
             lr_scheduler_cfg=cfg.unio4.lr_scheduler,
             fix_encoder=fix_encoder,
         )
-        if not cfg.chunk_as_single_action:
-            raise ValueError("Offline PPO V1 requires chunk_as_single_action=true.")
         if not cfg.critic.is_iql:
             raise ValueError("Offline PPO V1 requires critic.is_iql=true.")
         if cfg.unio4.use_gae:
-            raise ValueError("Offline PPO V1 does not use GAE.")
+            raise ValueError("Offline PPO V1 does not use online-style GAE.")
 
         self.obs_adapter = obs_adapter
+        self.dynamics = dynamics
         self.temperature = temperature
         self.cfg = cfg
         self.iteration = 0
@@ -76,7 +76,12 @@ class BehaviorProximalPolicyOptimization(ProximalPolicyOptimization):
             "dataset_pad_before": int(self.cfg.dataset.pad_before),
             "dataset_pad_after": int(self.cfg.dataset.pad_after),
             "max_train_episodes": self.cfg.dataset.max_train_episodes,
+            "act_chunk_size": int(self.cfg.act_chunk_size),
+            "rl_chunk_size": int(self.cfg.rl_chunk_size),
             "n_action_steps": int(self.cfg.n_action_steps),
+            "chunk_as_single_action": bool(self.cfg.chunk_as_single_action),
+            "offline_chunk_ratio_mode": str(self.cfg.offline_chunk_ratio_mode),
+            "offline_chunk_adv_mode": str(self.cfg.offline_chunk_adv_mode),
             "chunk_adv_clip": self.cfg.get("chunk_adv_clip", None),
             "bppo_steps": int(self.cfg.unio4.bppo_steps),
             "bppo_lr": float(self.cfg.unio4.bppo_lr),
@@ -134,6 +139,32 @@ class BehaviorProximalPolicyOptimization(ProximalPolicyOptimization):
             )
         super().load_training_state_dict(state)
 
+    def _get_offline_chunk_modes(self) -> tuple[str, str]:
+        ratio_mode = str(self.cfg.offline_chunk_ratio_mode)
+        adv_mode = str(self.cfg.offline_chunk_adv_mode)
+        valid_ratio_modes = {"scalar", "per_step"}
+        valid_adv_modes = {
+            "scalar_iql",
+            "per_step_vdelta",
+            "chunk_vdelta_scalar",
+            "chunk_vdelta_gae",
+        }
+        if ratio_mode not in valid_ratio_modes:
+            raise ValueError(f"Unsupported offline_chunk_ratio_mode={ratio_mode}")
+        if adv_mode not in valid_adv_modes:
+            raise ValueError(f"Unsupported offline_chunk_adv_mode={adv_mode}")
+        if ratio_mode == "scalar" and adv_mode == "per_step_vdelta":
+            raise ValueError(
+                "offline_chunk_ratio_mode=scalar is incompatible with "
+                "offline_chunk_adv_mode=per_step_vdelta"
+            )
+        if adv_mode == "chunk_vdelta_gae" and ratio_mode != "scalar":
+            raise ValueError(
+                "offline_chunk_adv_mode=chunk_vdelta_gae requires "
+                "offline_chunk_ratio_mode=scalar"
+            )
+        return ratio_mode, adv_mode
+
     def _normalize_advantage(self, advantage: torch.Tensor) -> torch.Tensor:
         flat = advantage.detach().reshape(-1).to(dtype=torch.float64)
         local = torch.stack(
@@ -165,6 +196,39 @@ class BehaviorProximalPolicyOptimization(ProximalPolicyOptimization):
         std = std.to(dtype=advantage.dtype)
         return (advantage - mean) / (std + CONST_EPS)
 
+    def _normalize_advantage_by_step(self, advantage: torch.Tensor) -> torch.Tensor:
+        if advantage.ndim != 2:
+            raise ValueError(
+                f"Expected per-step advantage [B,H], got {tuple(advantage.shape)}"
+            )
+        values = advantage.detach().to(dtype=torch.float64)
+        local_sum = values.sum(dim=0)
+        local_sq_sum = values.square().sum(dim=0)
+        count = torch.tensor(
+            float(values.shape[0]),
+            device=values.device,
+            dtype=torch.float64,
+        )
+        if dist.is_available() and dist.is_initialized():
+            dist.all_reduce(local_sum, op=dist.ReduceOp.SUM)
+            dist.all_reduce(local_sq_sum, op=dist.ReduceOp.SUM)
+            dist.all_reduce(count, op=dist.ReduceOp.SUM)
+        if float(count.item()) <= 0:
+            raise RuntimeError("Cannot normalize an empty per-step advantage tensor.")
+        mean = local_sum / count
+        if float(count.item()) > 1:
+            centered_ss = local_sq_sum - local_sum.square() / count
+            variance = torch.clamp(centered_ss / (count - 1.0), min=0.0)
+            std = torch.sqrt(variance)
+        else:
+            std = torch.zeros_like(mean)
+        return (
+            advantage
+            - mean.to(dtype=advantage.dtype).unsqueeze(0)
+        ) / (
+            std.to(dtype=advantage.dtype).unsqueeze(0) + CONST_EPS
+        )
+
     @torch.no_grad()
     def advantage_computation(
         self,
@@ -187,6 +251,89 @@ class BehaviorProximalPolicyOptimization(ProximalPolicyOptimization):
                 float(clip_value),
             )
         return advantage
+
+    @torch.no_grad()
+    def _compute_per_step_iql_advantages(
+        self,
+        policy_obs: dict,
+        action_chunk: torch.Tensor,
+        critic: IQLCritic,
+    ) -> torch.Tensor:
+        if self.dynamics is None:
+            raise RuntimeError(
+                "chunk_as_single_action=false requires the trained transition model "
+                "to estimate sequential per-step IQL advantages."
+            )
+        state_tokens, _ = self._old_policy.encode_observation(policy_obs)
+        state_tokens = self.dynamics._as_tokens(state_tokens)
+        advantages = []
+
+        for step_idx in range(action_chunk.shape[1]):
+            action_step = action_chunk[:, step_idx]
+            critic_state = self.dynamics._critic_readout(state_tokens)
+            advantage = critic.get_advantage(critic_state, action_step).reshape(
+                action_chunk.shape[0]
+            )
+            advantages.append(advantage)
+            if step_idx + 1 < action_chunk.shape[1]:
+                next_state, _, _, _ = self.dynamics.step(
+                    state_tokens,
+                    action_step,
+                )
+                state_tokens = torch.as_tensor(
+                    next_state,
+                    device=self._device,
+                    dtype=state_tokens.dtype,
+                )
+
+        advantages = torch.stack(advantages, dim=1)
+        if self.temperature is not None:
+            advantages = torch.minimum(
+                torch.exp(advantages * self.temperature),
+                torch.ones_like(advantages) * 100.0,
+            )
+        advantages = self._normalize_advantage_by_step(advantages)
+        clip_value = self.cfg.get("chunk_adv_clip", None)
+        if clip_value is not None:
+            advantages = torch.clamp(
+                advantages,
+                -float(clip_value),
+                float(clip_value),
+            )
+        return advantages
+
+    def _compute_chunk_advantage(
+        self,
+        batch: dict,
+        action_chunk: torch.Tensor,
+        critic: IQLCritic,
+        adv_mode: str,
+    ) -> torch.Tensor:
+        if adv_mode == "scalar_iql":
+            advantage = self.advantage_computation(
+                batch["obs"],
+                action_chunk,
+                critic,
+            ).detach()
+            advantage = advantage.reshape(advantage.shape[0], -1)
+            if advantage.shape[1] != 1:
+                raise ValueError(
+                    "scalar_iql requires one scalar advantage per chunk, got "
+                    f"{tuple(advantage.shape)}"
+                )
+            return advantage[:, 0]
+
+        raise NotImplementedError(
+            f"offline_chunk_adv_mode={adv_mode} is a preserved RL-100 experiment "
+            "interface, but ARBiM transformer-token dynamics V1 keeps predict_r=false. "
+            "The vdelta modes require reward-predicting dynamics and are not wired yet."
+        )
+
+    @staticmethod
+    def _sum_step_event_dims(x: torch.Tensor) -> torch.Tensor:
+        if x.ndim != 3:
+            raise ValueError(f"Expected [B,H,D], got {tuple(x.shape)}")
+        return x.sum(dim=-1)
 
     def set_ratio_log_dir(self, log_dir: str | None) -> None:
         if not self._enable_ratio_logging:
@@ -338,30 +485,26 @@ class BehaviorProximalPolicyOptimization(ProximalPolicyOptimization):
                 f"n_action_steps={self.cfg.n_action_steps}."
             )
 
-        advantages = self.advantage_computation(
-            batch["obs"],
-            action_chunk,
-            critic,
-        ).detach()
-        advantages = advantages.reshape(advantages.shape[0], -1)
-        if advantages.shape[1] != 1:
-            raise ValueError(
-                f"Scheme C chunk PPO requires scalar IQL advantage, got {tuple(advantages.shape)}"
+        chunk_as_single_action = bool(self.cfg.chunk_as_single_action)
+        if chunk_as_single_action:
+            ratio_mode, adv_mode = self._get_offline_chunk_modes()
+            advantages = self._compute_chunk_advantage(
+                batch,
+                action_chunk,
+                critic,
+                adv_mode,
             )
-        advantages = advantages[:, 0]
+        else:
+            ratio_mode = "per_step"
+            advantages = self._compute_per_step_iql_advantages(
+                policy_obs,
+                action_chunk,
+                critic,
+            ).detach()
 
         new_log_prob_raw, entropy_raw = self._policy.evaluate_action_chunk(
             policy_obs,
             action_chunk,
-        )
-        old_logprob = self._sum_chunk_event_dims(old_log_prob_raw)
-        new_logprob = self._sum_chunk_event_dims(new_log_prob_raw)
-        ratio = torch.exp(new_logprob - old_logprob)
-        self._record_ratio_stats(
-            "offline_chunk",
-            ratio,
-            old_logprob,
-            new_logprob,
         )
 
         if is_clip_decay:
@@ -372,15 +515,50 @@ class BehaviorProximalPolicyOptimization(ProximalPolicyOptimization):
             else:
                 self._clip_ratio *= self._decay
 
-        loss1 = ratio * advantages
-        loss2 = torch.clamp(
-            ratio,
-            1.0 - self._clip_ratio,
-            1.0 + self._clip_ratio,
-        ) * advantages
-        policy_loss = -torch.min(loss1, loss2).mean()
+        if chunk_as_single_action and ratio_mode == "scalar":
+            old_logprob = self._sum_chunk_event_dims(old_log_prob_raw)
+            new_logprob = self._sum_chunk_event_dims(new_log_prob_raw)
+            ratio = torch.exp(new_logprob - old_logprob)
+            self._record_ratio_stats(
+                "offline_chunk_scalar",
+                ratio,
+                old_logprob,
+                new_logprob,
+            )
+            loss1 = ratio * advantages
+            loss2 = torch.clamp(
+                ratio,
+                1.0 - self._clip_ratio,
+                1.0 + self._clip_ratio,
+            ) * advantages
+            policy_loss = -torch.min(loss1, loss2).mean()
+            entropy = self._sum_chunk_event_dims(entropy_raw).mean()
+        else:
+            old_logprob = self._sum_step_event_dims(old_log_prob_raw)
+            new_logprob = self._sum_step_event_dims(new_log_prob_raw)
+            ratio = torch.exp(new_logprob - old_logprob)
+            self._record_ratio_stats(
+                "offline_chunk_per_step" if chunk_as_single_action else "offline_per_step",
+                ratio,
+                old_logprob,
+                new_logprob,
+            )
+            if chunk_as_single_action:
+                advantages = advantages.unsqueeze(-1).expand_as(ratio)
+            if advantages.shape != ratio.shape:
+                raise ValueError(
+                    f"Per-step PPO advantage shape {tuple(advantages.shape)} must match "
+                    f"ratio shape {tuple(ratio.shape)}"
+                )
+            loss1 = ratio * advantages
+            loss2 = torch.clamp(
+                ratio,
+                1.0 - self._clip_ratio,
+                1.0 + self._clip_ratio,
+            ) * advantages
+            policy_loss = -torch.min(loss1, loss2).mean()
+            entropy = self._sum_step_event_dims(entropy_raw).mean()
 
-        entropy = self._sum_chunk_event_dims(entropy_raw).mean()
         loss = policy_loss - self._entropy_weight * entropy
 
         self._optimizer.zero_grad()
