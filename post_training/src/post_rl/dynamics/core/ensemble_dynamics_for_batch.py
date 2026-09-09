@@ -59,9 +59,7 @@ class EnsembleDynamics_batch(BaseDynamics):
         self.dynamics_type = cfg.dynamics_type
         self.device = torch.device(device)
         self.cnt = 0
-        self.holdout_losses = [
-            1e10 for _ in range(self._model().num_ensemble)
-        ]
+        self.holdout_losses = [1e10 for _ in range(self._model().num_ensemble)]
 
     @staticmethod
     def _unwrap(model: nn.Module) -> nn.Module:
@@ -74,28 +72,14 @@ class EnsembleDynamics_batch(BaseDynamics):
         self.logger = logger
         self.logger.log("Training dynamics:")
 
-    def obs2latent(self, nobs) -> torch.Tensor:
-        latent = self.obs_adapter.encode(
-            nobs,
-            start=0,
-            track_grad=not self.obs_adapter.fix_encoder,
-        )
-        return latent[:, 0]
-
-    def next_obs2latent(self, nobs) -> torch.Tensor:
-        latent = self.obs_adapter.encode(
-            nobs,
-            start=self.n_action_steps - 1,
-            track_grad=not self.obs_adapter.fix_encoder,
-        )
-        return latent[:, 0]
-
     def _as_tokens(self, features: torch.Tensor) -> torch.Tensor:
         features = torch.as_tensor(
             features,
             device=self.device,
             dtype=torch.float32,
         )
+        if features.ndim == 4 and features.shape[1] == 1:
+            features = features[:, 0]
         if features.ndim == 3:
             return features
         if features.ndim == 2:
@@ -112,8 +96,23 @@ class EnsembleDynamics_batch(BaseDynamics):
         )
 
     def _critic_readout(self, state_tokens: torch.Tensor) -> torch.Tensor:
-        state_tokens = self._as_tokens(state_tokens)
-        return state_tokens.mean(dim=1)
+        return self._as_tokens(state_tokens).mean(dim=1)
+
+    def obs2latent(self, nobs) -> torch.Tensor:
+        latent = self.obs_adapter.encode(
+            nobs,
+            start=0,
+            track_grad=not self.obs_adapter.fix_encoder,
+        )
+        return latent[:, 0]
+
+    def next_obs2latent(self, nobs) -> torch.Tensor:
+        latent = self.obs_adapter.encode(
+            nobs,
+            start=self.n_action_steps - 1,
+            track_grad=not self.obs_adapter.fix_encoder,
+        )
+        return latent[:, 0]
 
     def _dataset_chunk_action(self, batch: Dict) -> torch.Tensor:
         actions = self.obs_adapter.normalize_action(batch["action"])
@@ -193,11 +192,10 @@ class EnsembleDynamics_batch(BaseDynamics):
 
     @torch.no_grad()
     def validate(self, inputs, targets) -> List[float]:
-        model = self._model()
-        model.eval()
+        self.model.eval()
         state_tokens, action = inputs
         targets = self._as_tokens(targets)
-        mean, _ = model(state_tokens, action)
+        mean, _ = self.model(state_tokens, action)
         reduce_dims = tuple(range(1, mean.ndim))
         loss = ((mean - targets) ** 2).mean(dim=reduce_dims)
         return list(loss.cpu().numpy())
@@ -232,12 +230,12 @@ class EnsembleDynamics_batch(BaseDynamics):
 
         reward = np.zeros((batch_size, 1), dtype=np.float32)
         state_np = state_tokens.detach().cpu().numpy().reshape(batch_size, -1)
-        next_np_flat = next_state.detach().cpu().numpy().reshape(batch_size, -1)
+        next_np = next_state.detach().cpu().numpy().reshape(batch_size, -1)
         action_np = action.detach().cpu().numpy().reshape(batch_size, -1)
         terminal = self.terminal_fn(
             state_np,
             action_np,
-            next_np_flat,
+            next_np,
             self.env,
         )
         info = {"raw_reward": reward}
@@ -276,18 +274,15 @@ class EnsembleDynamics_batch(BaseDynamics):
         state_dict: Dict = None,
         use_gae: bool = False,
     ):
+        critic_state = self._critic_readout(nobs_features)
         q_owner = getattr(Q, "__self__", None)
         if q_owner is not None and hasattr(q_owner, "get_advantage"):
-            return q_owner.get_advantage(self._as_tokens(nobs_features), nactions)
-        return Q(self._as_tokens(nobs_features), nactions)
+            return q_owner.get_advantage(critic_state, nactions)
+        return Q(critic_state, nactions)
 
     def _policy_obs(self, batch_obs: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
         normalized = self.obs_adapter.normalize_obs(batch_obs)
-        obs_idx = self.n_obs_steps - 1
-        return {
-            key: value[:, obs_idx]
-            for key, value in normalized.items()
-        }
+        return {key: value[:, 0] for key, value in normalized.items()}
 
     @torch.no_grad()
     def rollout(
@@ -329,7 +324,9 @@ class EnsembleDynamics_batch(BaseDynamics):
                 encoder_pos_embed,
             )
             action_chunk = actions[:, :self.n_action_steps]
-            rollout_qs.append(q_eval(policy_features, action_chunk))
+            critic_state = self._critic_readout(policy_features)
+            rollout_qs.append(q_eval(critic_state, action_chunk))
+
             next_obs, reward, _, _ = self.step(
                 policy_features,
                 action_chunk,
