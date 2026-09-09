@@ -2,6 +2,7 @@ import csv
 import os
 
 import torch
+import torch.distributed as dist
 
 from .ppo import ProximalPolicyOptimization
 from ..critic.iql_critic import IQLCritic
@@ -61,6 +62,37 @@ class BehaviorProximalPolicyOptimization(ProximalPolicyOptimization):
         self._ratio_log_flush_interval = 50
         self._ratio_log_written_until = 0
 
+    def _normalize_advantage(self, advantage: torch.Tensor) -> torch.Tensor:
+        flat = advantage.detach().reshape(-1).to(dtype=torch.float64)
+        local = torch.stack(
+            [
+                flat.sum(),
+                flat.square().sum(),
+                torch.tensor(
+                    float(flat.numel()),
+                    device=flat.device,
+                    dtype=torch.float64,
+                ),
+            ]
+        )
+        if dist.is_available() and dist.is_initialized():
+            dist.all_reduce(local, op=dist.ReduceOp.SUM)
+
+        count = float(local[2].item())
+        if count <= 0:
+            raise RuntimeError("Cannot normalize an empty advantage tensor.")
+        mean = local[0] / count
+        if count > 1:
+            centered_ss = local[1] - local[0].square() / count
+            variance = torch.clamp(centered_ss / (count - 1.0), min=0.0)
+            std = torch.sqrt(variance)
+        else:
+            std = torch.zeros((), device=flat.device, dtype=torch.float64)
+
+        mean = mean.to(dtype=advantage.dtype)
+        std = std.to(dtype=advantage.dtype)
+        return (advantage - mean) / (std + CONST_EPS)
+
     @torch.no_grad()
     def advantage_computation(
         self,
@@ -74,9 +106,7 @@ class BehaviorProximalPolicyOptimization(ProximalPolicyOptimization):
                 torch.exp(advantage * self.temperature),
                 torch.ones_like(advantage) * 100.0,
             )
-        advantage = (advantage - advantage.mean()) / (
-            advantage.std() + CONST_EPS
-        )
+        advantage = self._normalize_advantage(advantage)
         clip_value = self.cfg.get("chunk_adv_clip", None)
         if clip_value is not None:
             advantage = torch.clamp(
