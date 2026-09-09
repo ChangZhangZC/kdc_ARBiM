@@ -55,6 +55,9 @@ class TrainACTWorkspace(_ResumableTrainACTWorkspace):
                 digest.update(str(array.dtype).encode("utf-8"))
                 digest.update(array.tobytes())
                 return
+            if isinstance(value, np.generic):
+                update(value.item(), path)
+                return
             if isinstance(value, Mapping):
                 digest.update(b"mapping")
                 for key in sorted(value, key=lambda item: str(item)):
@@ -65,8 +68,13 @@ class TrainACTWorkspace(_ResumableTrainACTWorkspace):
                 for index, item in enumerate(value):
                     update(item, f"{path}/{index}")
                 return
-            digest.update(type(value).__name__.encode("utf-8"))
-            digest.update(repr(value).encode("utf-8"))
+            if value is None or isinstance(value, (bool, int, float, str)):
+                digest.update(type(value).__name__.encode("utf-8"))
+                digest.update(repr(value).encode("utf-8"))
+                return
+            raise TypeError(
+                f"Unsupported normalization-stat type at {path}: {type(value).__name__}"
+            )
 
         update(stats, "stats")
         return digest.hexdigest()
