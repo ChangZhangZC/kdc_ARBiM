@@ -64,13 +64,20 @@ class BehaviorProximalPolicyOptimization(ProximalPolicyOptimization):
         self._ratio_log_written_until = 0
 
     def _resume_hparams(self) -> dict:
+        dataset_path = os.path.realpath(
+            os.path.abspath(os.path.expanduser(str(self.cfg.input.dataset_path)))
+        )
         return {
             "training_seed": int(self.cfg.training.seed),
-            "n_action_steps": int(self.cfg.n_action_steps),
-            "chunk_adv_clip": self.cfg.get("chunk_adv_clip", None),
+            "training_use_ema": bool(self.cfg.training.use_ema),
+            "dataset_path": dataset_path,
+            "dataset_reward_scaling": str(self.cfg.dataset.reward_scaling),
+            "dataset_fixed_reward_scale": float(self.cfg.dataset.fixed_reward_scale),
             "dataset_pad_before": int(self.cfg.dataset.pad_before),
             "dataset_pad_after": int(self.cfg.dataset.pad_after),
             "max_train_episodes": self.cfg.dataset.max_train_episodes,
+            "n_action_steps": int(self.cfg.n_action_steps),
+            "chunk_adv_clip": self.cfg.get("chunk_adv_clip", None),
             "bppo_steps": int(self.cfg.unio4.bppo_steps),
             "bppo_lr": float(self.cfg.unio4.bppo_lr),
             "clip_ratio": float(self.cfg.unio4.clip_ratio),
@@ -89,6 +96,11 @@ class BehaviorProximalPolicyOptimization(ProximalPolicyOptimization):
                 self.cfg.dataset.finetune_sequence_stride
             ),
             "ope_rollout_length": int(self.cfg.dynamics.ope_rollout_length),
+            "ema_update_after_step": int(self.cfg.ema.update_after_step),
+            "ema_inv_gamma": float(self.cfg.ema.inv_gamma),
+            "ema_power": float(self.cfg.ema.power),
+            "ema_min_value": float(self.cfg.ema.min_value),
+            "ema_max_value": float(self.cfg.ema.max_value),
             "optimizer": OmegaConf.to_container(
                 self.cfg.unio4.optimizer,
                 resolve=True,
@@ -116,9 +128,9 @@ class BehaviorProximalPolicyOptimization(ProximalPolicyOptimization):
         }
         if mismatch:
             raise RuntimeError(
-                "Full PPO resume requires the original PPO/OPE hyperparameters. "
+                "Full PPO resume requires the original data/PPO/OPE/EMA contract. "
                 f"Mismatch: {mismatch}. Use input.policy_checkpoint_type=rl "
-                "for a new warm-start RL run with changed hyperparameters."
+                "for a new warm-start RL run with changed settings."
             )
         super().load_training_state_dict(state)
 
