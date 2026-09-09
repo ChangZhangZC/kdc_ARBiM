@@ -1,8 +1,8 @@
 import torch
 import torch.distributed as dist
+import torch.nn as nn
 
 from lerobot.utils.constants import OBS_STATE
-from ...policy.act_latent import ACTStateEncoder
 
 
 RGB_BUFFER_TO_FEATURE = {
@@ -23,7 +23,7 @@ ACTION_FEATURE = "action"
 class ACTObservationAdapter:
     def __init__(
         self,
-        encoder: ACTStateEncoder,
+        encoder: nn.Module,
         stats: dict,
         n_obs_steps: int = 1,
         device: torch.device | str = "cpu",
@@ -178,12 +178,13 @@ class ACTObservationAdapter:
         track_grad: bool = False,
     ) -> torch.Tensor:
         obs, batch_size = self.prepare_obs(obs, start=start)
+        encode_fn = getattr(self.encoder, "encode_tokens", self.encoder)
 
         if track_grad and not self.fix_encoder:
-            features = self.encoder(obs)
+            features = encode_fn(obs)
         else:
             with torch.no_grad():
-                features = self.encoder(obs)
+                features = encode_fn(obs)
 
         if features.ndim != 3:
             raise ValueError(
