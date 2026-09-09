@@ -55,7 +55,6 @@ dataloader:
 val_dataloader:
   batch_size: 128
   num_workers: 2
-  shuffle: false  # V1 fixed: validation is deterministic.
   pin_memory: false
   persistent_workers: false
 
@@ -121,6 +120,12 @@ dynamics:
 unio4:
   bppo_steps: 8000
   bppo_lr: 1.0e-5
+  optimizer:
+    _target_: torch.optim.Adam
+  lr_scheduler:
+    _target_: torch.optim.lr_scheduler.StepLR
+    step_size: 2
+    gamma: 0.98
   clip_ratio: 0.25
   entropy_weight: 0.0
   max_grad_norm: 0.5
