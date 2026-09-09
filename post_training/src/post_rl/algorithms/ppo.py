@@ -21,9 +21,14 @@ class ProximalPolicyOptimization:
         ratio_strategy: str,
         fix_encoder: bool,
     ) -> None:
+        if not fix_encoder:
+            raise ValueError(
+                "ACT Scheme C requires unio4.fix_encoder=true so the OPE latent space stays fixed."
+            )
+
         self._device = device
         self._policy = deepcopy(policy).to(device)
-        self._fix_encoder = fix_encoder
+        self._fix_encoder = True
         self._policy_lr = policy_lr
         self._clip_ratio = clip_ratio
         self._entropy_weight = entropy_weight
@@ -33,7 +38,6 @@ class ProximalPolicyOptimization:
         self._is_iql = is_iql
         self._ratio_strategy = ratio_strategy
         self._grad_hook_handles = []
-        self._old_sync_hook = None
         self._old_policy_version = 0
 
         if ratio_strategy not in {"per_step", "scalar"}:
@@ -50,8 +54,6 @@ class ProximalPolicyOptimization:
     def _configure_trainable_params(self) -> None:
         for param in self._policy.parameters():
             param.requires_grad = True
-        if not self._fix_encoder:
-            return
 
         model = self._policy.model
         model.requires_grad_(False)
@@ -114,16 +116,21 @@ class ProximalPolicyOptimization:
             dist.broadcast(buffer.data, src=0)
         self._old_policy_version = target_version
 
-    def _sync_old_policy_before_forward(self, module, inputs) -> None:
-        self._sync_old_policy()
-
     def weighted_advantage(self, advantage: torch.Tensor) -> torch.Tensor:
         if self._omega == 0.5:
             return advantage
         weight = torch.where(
             advantage > 0,
-            torch.as_tensor(self._omega, device=advantage.device, dtype=advantage.dtype),
-            torch.as_tensor(1.0 - self._omega, device=advantage.device, dtype=advantage.dtype),
+            torch.as_tensor(
+                self._omega,
+                device=advantage.device,
+                dtype=advantage.dtype,
+            ),
+            torch.as_tensor(
+                1.0 - self._omega,
+                device=advantage.device,
+                dtype=advantage.dtype,
+            ),
         )
         return weight * advantage
 
@@ -191,9 +198,15 @@ class ProximalPolicyOptimization:
         self._sync_old_policy()
 
         with torch.no_grad():
-            old_log_prob_raw, _ = self._old_policy.evaluate_action_chunk(obs, action)
+            old_log_prob_raw, _ = self._old_policy.evaluate_action_chunk(
+                obs,
+                action,
+            )
 
-        new_log_prob_raw, entropy_raw = self._policy.evaluate_action_chunk(obs, action)
+        new_log_prob_raw, entropy_raw = self._policy.evaluate_action_chunk(
+            obs,
+            action,
+        )
         old_log_prob = self._reduce_event_dims(old_log_prob_raw)
         new_log_prob = self._reduce_event_dims(new_log_prob_raw)
         entropy = self._reduce_event_dims(entropy_raw)
@@ -242,7 +255,8 @@ class ProximalPolicyOptimization:
         self._optimizer.zero_grad()
         policy_loss.backward()
         trainable_params = [
-            p for p in self._policy.parameters()
+            p
+            for p in self._policy.parameters()
             if p.requires_grad and p.grad is not None
         ]
         torch.nn.utils.clip_grad_norm_(trainable_params, 0.5)
@@ -280,7 +294,9 @@ class ProximalPolicyOptimization:
         self._policy.save_pretrained(path)
 
     def load(self, path: str) -> None:
-        self._policy = StochasticACTPolicyWrapper.from_pretrained(path).to(self._device)
+        self._policy = StochasticACTPolicyWrapper.from_pretrained(path).to(
+            self._device
+        )
         self._policy.eval()
         self.set_old_policy()
         self._build_optimizer()
@@ -301,15 +317,8 @@ class ProximalPolicyOptimization:
         self._build_scheduler()
 
     def set_old_policy(self) -> None:
-        if self._old_sync_hook is not None:
-            self._old_sync_hook.remove()
         self._old_policy = deepcopy(self._policy).to(self._device)
         self._old_policy.eval()
         for param in self._old_policy.parameters():
             param.requires_grad = False
         self._old_policy_version += 1
-        model = getattr(self._old_policy, "model", None)
-        if model is not None:
-            self._old_sync_hook = model.register_forward_pre_hook(
-                self._sync_old_policy_before_forward
-            )
