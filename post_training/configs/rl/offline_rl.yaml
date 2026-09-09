@@ -7,7 +7,11 @@ task_name: post_training
 
 input:
   policy_checkpoint: /path/to/act/checkpoint
+  policy_checkpoint_type: il  # il: start RL from IL; rl: start a new RL run from an existing stochastic RL policy.
   dataset_path: /path/to/offline_dataset.zarr
+
+resume:
+  checkpoint_dir: null  # Full PPO-state resume; overrides input.policy_checkpoint/type and restores stage-1 artifact paths.
 
 horizon: 50  # V1 fixed: training window equals ACT chunk_size, not deployment replan length.
 n_obs_steps: 1  # V1 fixed: Scheme C uses one observation state per macro-step.
@@ -118,7 +122,7 @@ dynamics:
   tqdm_interval_sec: 1.0
 
 unio4:
-  bppo_steps: 8000
+  bppo_steps: 8000  # Total PPO target step count; full resume continues from saved global_step to this value.
   bppo_lr: 1.0e-5
   optimizer:
     _target_: torch.optim.Adam
@@ -138,6 +142,7 @@ unio4:
   temperature: null
   eval_step: 50
   eval_freq: 1000
+  checkpoint_every_steps: 1000  # 0 disables periodic full-state PPO checkpoints.
   fix_encoder: true  # V1 fixed: PPO updates Decoder/action head/log_std only.
   use_gae: false  # V1 only supported value: false for transition-model OPE gating.
   use_ema_eval: false
