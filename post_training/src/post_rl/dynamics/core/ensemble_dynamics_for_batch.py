@@ -30,10 +30,6 @@ class EnsembleDynamics_batch(BaseDynamics):
         prediction_mode: str = "full",
     ) -> None:
         super().__init__(model, optim)
-        if not chunk_as_single_action:
-            raise ValueError(
-                "ACT transformer-latent dynamics requires chunk_as_single_action=true."
-            )
         if obs_adapter.n_obs_steps != 1:
             raise ValueError(
                 "ACT transformer-latent dynamics currently requires n_obs_steps=1."
@@ -49,8 +45,8 @@ class EnsembleDynamics_batch(BaseDynamics):
         self.cfg = cfg
         self.n_obs_steps = 1
         self.predict_delta = cfg.dynamics.predict_delta
-        self.chunk_as_single_action = True
-        self.n_action_steps = n_action_steps
+        self.chunk_as_single_action = bool(chunk_as_single_action)
+        self.n_action_steps = int(n_action_steps) if self.chunk_as_single_action else 1
         self.prediction_mode = "full"
         self.lamda = lamda
         self.gamma = gamma
@@ -119,9 +115,14 @@ class EnsembleDynamics_batch(BaseDynamics):
         )
         return latent[:, 0]
 
-    def _dataset_chunk_action(self, batch: Dict) -> torch.Tensor:
+    def _dataset_action(self, batch: Dict) -> torch.Tensor:
         actions = self.obs_adapter.normalize_action(batch["action"])
         start = self.n_obs_steps - 1
+        if not self.chunk_as_single_action:
+            if actions.shape[1] <= start:
+                raise ValueError("Dynamics action horizon is shorter than n_obs_steps.")
+            return actions[:, start]
+
         end = start + self.n_action_steps
         if actions.shape[1] < end:
             raise ValueError(
@@ -155,7 +156,7 @@ class EnsembleDynamics_batch(BaseDynamics):
     ):
         state_tokens = self._as_tokens(nobs_features)
         targets = self._targets(nobs_features, next_nobs_features)
-        action = self._dataset_chunk_action(data)
+        action = self._dataset_action(data)
         return (state_tokens, action), targets
 
     def learn(
@@ -331,13 +332,17 @@ class EnsembleDynamics_batch(BaseDynamics):
                 policy_features,
                 encoder_pos_embed,
             )
-            action_chunk = actions[:, :self.n_action_steps]
+            model_action = (
+                actions[:, :self.n_action_steps]
+                if self.chunk_as_single_action
+                else actions[:, 0]
+            )
             critic_state = self._critic_readout(policy_features)
-            rollout_qs.append(q_eval(critic_state, action_chunk))
+            rollout_qs.append(q_eval(critic_state, model_action))
 
             next_obs, reward, _, _ = self.step(
                 policy_features,
-                action_chunk,
+                model_action,
             )
             rewards_arr.append(np.asarray(reward).reshape(-1))
             policy_features = torch.as_tensor(

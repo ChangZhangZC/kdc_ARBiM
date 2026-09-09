@@ -7,18 +7,28 @@ task_name: post_training
 
 input:
   policy_checkpoint: /path/to/act/checkpoint
-  policy_checkpoint_type: il  # il: start RL from IL; rl: start a new RL run from an existing stochastic RL policy.
+  policy_checkpoint_type: il  # choices: il | rl. il starts from deterministic ACT; rl warm-starts from a stochastic RL policy.
   dataset_path: /path/to/offline_dataset.zarr
 
 resume:
   checkpoint_dir: null  # Full PPO-state resume; overrides input.policy_checkpoint/type and restores stage-1 artifact paths.
 
-horizon: 50  # V1 fixed: training window equals ACT chunk_size, not deployment replan length.
-n_obs_steps: 1  # V1 fixed: Scheme C uses one observation state per macro-step.
-n_action_steps: 50  # V1 fixed: RL macro-action length; must equal horizon and ACT chunk_size.
-chunk_as_single_action: true  # V1 fixed: one ACT chunk is one RL macro-action.
-chunk_adv_clip: null
+# -------------------- Hard alignment contract --------------------
+# These three values define one ACT/RL action chunk contract. They are configurable,
+# but must resolve to the same value. act_chunk_size must also match the loaded ACT checkpoint.
+act_chunk_size: 50
+rl_chunk_size: ${act_chunk_size}
+n_action_steps: ${rl_chunk_size}
 
+# -------------------- Experiment mode switches --------------------
+horizon: ${rl_chunk_size}  # Numeric experiment parameter; must be >= n_action_steps. Default uses one complete RL chunk.
+n_obs_steps: 1  # V1 fixed interface: only 1 is currently implemented for Scheme C.
+chunk_as_single_action: true  # choices: true | false. true uses one chunk-level transition; false uses single-step critic/dynamics transitions while ACT still predicts the aligned full chunk.
+offline_chunk_ratio_mode: scalar  # choices: scalar | per_step. Used when chunk_as_single_action=true; false always uses per-step ratios.
+offline_chunk_adv_mode: scalar_iql  # RL-100 choices: scalar_iql | per_step_vdelta | chunk_vdelta_scalar | chunk_vdelta_gae. Used for chunk mode; V1 executable chunk advantage is scalar_iql. false currently uses per-step IQL; vdelta modes require reward-predicting token dynamics and remain interface-only.
+chunk_adv_clip: null  # Numeric experiment parameter; null disables advantage clipping.
+
+# Action representation experiments.
 use_action_embed: true
 use_conv_action_embed: false
 conv_hidden_dims: [128, 256]
@@ -27,25 +37,27 @@ conv_kernel_size: 5
 conv_n_groups: 8
 action_recon_beta: 0.5
 
-dynamics_type: mlp  # V1 only supported value: mlp.
-predict_r: false  # V1 only supported value: false; OPE score comes from Critic Q.
+# -------------------- V1 implementation-fixed switches --------------------
+dynamics_type: mlp  # V1 fixed: only mlp token dynamics is implemented.
+predict_r: false  # V1 fixed: reward-predicting transformer-token dynamics is not implemented; OPE is Critic-Q based.
 use_shared_memory: false
 use_wandb: true
 eval: false
 
 policy:
+  # Numeric stochastic-policy experiment parameters.
   init_log_std: -3.5
   log_std_min: -5.0
   log_std_max: -2.3
 
 dataset:
-  use_depth: false
-  reward_scaling: none
-  fixed_reward_scale: 0.1
-  pad_before: 0  # V1 fixed: partial/padded macro-actions are not valid RL transitions.
-  pad_after: 0  # V1 fixed: each sample must contain a complete real 50-step chunk.
-  sequence_stride: 1
-  finetune_sequence_stride: ${n_action_steps}
+  use_depth: false  # Must match the loaded ACT checkpoint.
+  reward_scaling: none  # choices: none | dynamic | normal | number.
+  fixed_reward_scale: 0.1  # Used only when reward_scaling=number.
+  pad_before: 0  # V1 fixed: partial/padded RL transitions are not supported.
+  pad_after: 0  # V1 fixed: every sample must contain complete real action steps.
+  sequence_stride: 1  # Numeric sampling hyperparameter.
+  finetune_sequence_stride: ${rl_chunk_size}  # Numeric sampling hyperparameter; default advances one RL chunk per PPO sample.
   val_ratio: 0.1
   max_train_episodes: null
 
@@ -63,7 +75,7 @@ val_dataloader:
   persistent_workers: false
 
 optimizer:
-  _target_: torch.optim.AdamW
+  _target_: torch.optim.AdamW  # Experiment choice; optimizer must accept params and lr.
   lr: 1.0e-4
   betas: [0.95, 0.999]
   eps: 1.0e-8
@@ -78,33 +90,33 @@ training:
   tqdm_interval_sec: 1.0
 
 critic:
-  latent_readout: mean  # V1 only supported value: mean.
-  sequence_stride: ${n_action_steps}
+  latent_readout: mean  # V1 fixed: only mean token readout is implemented.
+  sequence_stride: ${rl_chunk_size}  # Numeric sampling hyperparameter; set 1 for denser single-step critic data if desired.
   q_hidden_dim: 512
   q_depth: 3
   q_lr: 1.0e-4
   target_update_freq: 2
   tau: 0.005
-  gamma: 0.99
+  gamma: 0.99  # Numeric RL hyperparameter.
   v_hidden_dim: 512
   v_depth: 3
   v_lr: 1.0e-4
-  omega: 0.7
+  omega: 0.7  # Numeric IQL expectile hyperparameter.
   q_layer_norm: false
   action_embed_layer_norm: false
   action_scale_norm: false
   is_double_q: true
-  is_iql: true  # V1 fixed: offline critic is IQL.
-  is_share_encoder: true  # V1 fixed: Actor/Critic/Dynamics share the same latent definition.
-  fix_encoder: true  # V1 fixed: ACT state encoder stays frozen during post-training.
+  is_iql: true  # V1 fixed: only IQL critic is wired into Offline PPO/OPE.
+  is_share_encoder: true  # V1 fixed: Actor/Critic/Dynamics use the same ACT latent definition.
+  fix_encoder: true  # V1 fixed: encoder finetuning is not implemented for this post-training path.
   load_pretrain: false
   artifact_dir: null
   save_every_epochs: 0
 
 dynamics:
-  latent_mode: transformer_encoder  # V1 only supported value: transformer_encoder.
-  prediction_mode: full  # V1 only supported value: full token state.
-  ope_rollout_length: 2
+  latent_mode: transformer_encoder  # V1 fixed: only transformer_encoder is implemented.
+  prediction_mode: full  # V1 fixed: only full token-state prediction is implemented.
+  ope_rollout_length: 2  # Numeric experiment parameter; counts RL transitions (chunk transitions when chunk_as_single_action=true, single steps otherwise).
   dynamics_hidden_dims: [400, 400, 400, 400]
   dynamics_weight_decay: [2.5e-5, 5.0e-5, 7.5e-5, 7.5e-5, 1.0e-4]
   n_ensemble: 7
@@ -112,8 +124,8 @@ dynamics:
   dynamics_max_epochs: 200
   max_epochs_since_update: 50
   logvar_loss_coef: 0.01
-  predict_delta: true  # V1 fixed: model predicts delta-z and rollout reconstructs z_next = z + delta-z.
-  fix_encoder: true  # V1 fixed: transition-model latent space must not drift.
+  predict_delta: true  # V1 fixed: z_next = z + delta_z.
+  fix_encoder: true  # V1 fixed: transition-model latent space must remain frozen.
   action_embed_layer_norm: false
   action_scale_norm: false
   load_pretrain: false
@@ -122,12 +134,13 @@ dynamics:
   tqdm_interval_sec: 1.0
 
 unio4:
-  bppo_steps: 8000  # Total PPO target step count; full resume continues from saved global_step to this value.
+  # Numeric PPO experiment hyperparameters.
+  bppo_steps: 8000  # Total PPO target step count; exact resume continues from saved global_step to this value.
   bppo_lr: 1.0e-5
   optimizer:
-    _target_: torch.optim.Adam
+    _target_: torch.optim.Adam  # Experiment choice; optimizer must accept params and lr.
   lr_scheduler:
-    _target_: torch.optim.lr_scheduler.StepLR
+    _target_: torch.optim.lr_scheduler.StepLR  # Experiment choice.
     step_size: 2
     gamma: 0.98
   clip_ratio: 0.25
@@ -143,12 +156,12 @@ unio4:
   eval_step: 50
   eval_freq: 1000
   checkpoint_every_steps: 1000  # 0 disables periodic full-state PPO checkpoints.
-  fix_encoder: true  # V1 fixed: PPO updates Decoder/action head/log_std only.
-  use_gae: false  # V1 only supported value: false for transition-model OPE gating.
+  fix_encoder: true  # V1 fixed: PPO updates ACT decoder/action head/log_std only.
+  use_gae: false  # V1 fixed: online-style GAE is not wired into the current Offline PPO/OPE path.
   use_ema_eval: false
   eval_times: 1
   finetune_batch_size: 128
-  stage1_resume_dir: null  # If set, Critic/Dynamics final artifacts are reused instead of retrained.
+  stage1_resume_dir: null  # Reuse Critic/Dynamics artifacts only when their saved contract matches the current config.
   artifact_dir: null
   global_best_dir: null
 

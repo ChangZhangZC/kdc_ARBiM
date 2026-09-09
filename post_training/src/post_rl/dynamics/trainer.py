@@ -1,3 +1,4 @@
+import copy
 import os
 from typing import Dict
 
@@ -43,10 +44,6 @@ def train_dynamics(
             f"feature_dim={feature_dim} does not match "
             f"obs_adapter.feature_dim={obs_adapter.feature_dim}"
         )
-    if not chunk_as_single_action:
-        raise ValueError(
-            "ACT transformer-latent OPE currently requires chunk_as_single_action=true."
-        )
     if cfg.predict_r:
         raise NotImplementedError(
             "Transformer-latent dynamics follows RL-100 OPE gating with predict_r=false."
@@ -56,7 +53,12 @@ def train_dynamics(
             "ACT transformer-latent V1 supports token-structured MLP dynamics only."
         )
 
-    model_action_dim = action_dim * n_action_steps
+    effective_action_steps = n_action_steps if chunk_as_single_action else 1
+    model_action_dim = action_dim * effective_action_steps
+    model_cfg = copy.deepcopy(cfg)
+    if not chunk_as_single_action:
+        model_cfg.n_action_steps = 1
+
     dynamics_model = EnsembleDynamicsModel(
         obs_dim=feature_dim,
         action_dim=model_action_dim,
@@ -65,7 +67,7 @@ def train_dynamics(
         num_elites=cfg.dynamics.n_elites,
         weight_decays=cfg.dynamics.dynamics_weight_decay,
         device=device,
-        cfg=cfg,
+        cfg=model_cfg,
         with_reward=cfg.predict_r,
     )
 
@@ -85,9 +87,9 @@ def train_dynamics(
         action_dim=model_action_dim,
         gamma=cfg.critic.gamma,
         device=device,
-        chunk_as_single_action=True,
+        chunk_as_single_action=chunk_as_single_action,
         n_action_steps=n_action_steps,
-        prediction_mode="full",
+        prediction_mode=cfg.dynamics.prediction_mode,
     )
 
     os.makedirs(dynamics_save_path, exist_ok=True)
