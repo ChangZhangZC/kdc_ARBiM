@@ -31,6 +31,10 @@ class ACTObservationAdapter:
     ) -> None:
         if n_obs_steps < 1:
             raise ValueError("n_obs_steps must be >= 1")
+        if not fix_encoder:
+            raise ValueError(
+                "ACT Scheme C requires a frozen transformer state encoder."
+            )
         if dist.is_available() and dist.is_initialized() and not fix_encoder:
             raise RuntimeError(
                 "DDP dynamics training currently requires dynamics.fix_encoder=true."
@@ -44,11 +48,9 @@ class ACTObservationAdapter:
         self.feature_dim = encoder.output_dim
 
         self.encoder.to(self.device)
-
-        if fix_encoder:
-            self.encoder.eval()
-            for param in self.encoder.parameters():
-                param.requires_grad = False
+        self.encoder.eval()
+        for param in self.encoder.parameters():
+            param.requires_grad = False
 
     def _to_device(self, data):
         if isinstance(data, dict):
@@ -177,14 +179,15 @@ class ACTObservationAdapter:
         start: int = 0,
         track_grad: bool = False,
     ) -> torch.Tensor:
+        if track_grad:
+            raise ValueError(
+                "ACT Scheme C state encoder is frozen and does not support track_grad=True."
+            )
         obs, batch_size = self.prepare_obs(obs, start=start)
         encode_fn = getattr(self.encoder, "encode_tokens", self.encoder)
 
-        if track_grad and not self.fix_encoder:
+        with torch.no_grad():
             features = encode_fn(obs)
-        else:
-            with torch.no_grad():
-                features = encode_fn(obs)
 
         if features.ndim != 3:
             raise ValueError(
