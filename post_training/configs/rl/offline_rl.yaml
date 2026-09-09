@@ -9,18 +9,11 @@ input:
   policy_checkpoint: /path/to/act/checkpoint
   dataset_path: /path/to/offline_dataset.zarr
 
-horizon: 50
-n_obs_steps: 1
-n_action_steps: 50
-chunk_as_single_action: true
+horizon: 50  # V1 fixed: training window equals the ACT checkpoint chunk_size.
+n_obs_steps: 1  # V1 fixed: Scheme C uses one observation state per macro-step.
+n_action_steps: 50  # V1 fixed: must equal horizon and ACT checkpoint chunk_size.
+chunk_as_single_action: true  # V1 fixed: one ACT chunk is one RL macro-action.
 chunk_adv_clip: null
-offline_chunk_ratio_mode: scalar
-offline_chunk_adv_mode: scalar_iql
-chunk_vdelta_gae_n_rollout: 3
-chunk_vdelta_gae_lambda: 0.95
-chunk_vdelta_gae_chunk_source: repeat_first
-bppo_chunk_level_ratio: true
-ft_all_actions: true
 
 use_action_embed: true
 use_conv_action_embed: false
@@ -30,8 +23,8 @@ conv_kernel_size: 5
 conv_n_groups: 8
 action_recon_beta: 0.5
 
-dynamics_type: mlp
-predict_r: false
+dynamics_type: mlp  # V1 only supported value: mlp.
+predict_r: false  # V1 only supported value: false; OPE score comes from Critic Q.
 use_shared_memory: false
 use_wandb: true
 eval: false
@@ -54,16 +47,16 @@ dataset:
 
 dataloader:
   batch_size: 128
-  num_workers: 8
+  num_workers: 2
   shuffle: true
-  pin_memory: true
+  pin_memory: false
   persistent_workers: false
 
 val_dataloader:
   batch_size: 128
-  num_workers: 8
+  num_workers: 2
   shuffle: false
-  pin_memory: true
+  pin_memory: false
   persistent_workers: false
 
 optimizer:
@@ -79,10 +72,11 @@ training:
   debug: false
   num_critic_epochs: 600
   use_ema: true
-  max_train_steps: null
   tqdm_interval_sec: 1.0
 
 critic:
+  latent_readout: mean  # V1 only supported value: mean.
+  sequence_stride: ${n_action_steps}
   q_hidden_dim: 512
   q_depth: 3
   q_lr: 1.0e-4
@@ -97,17 +91,16 @@ critic:
   action_embed_layer_norm: false
   action_scale_norm: false
   is_double_q: true
-  is_iql: true
-  is_share_encoder: true
-  fix_encoder: true
-  encoder_update_with: value
+  is_iql: true  # V1 fixed: offline critic is IQL.
+  is_share_encoder: true  # V1 fixed: Actor/Critic/Dynamics share the same latent definition.
+  fix_encoder: true  # V1 fixed: ACT state encoder stays frozen during post-training.
   load_pretrain: false
   artifact_dir: null
   save_every_epochs: 0
 
 dynamics:
-  latent_mode: transformer_encoder
-  prediction_mode: full
+  latent_mode: transformer_encoder  # V1 only supported value: transformer_encoder.
+  prediction_mode: full  # V1 only supported value: full token state.
   ope_rollout_length: 2
   dynamics_hidden_dims: [400, 400, 400, 400]
   dynamics_weight_decay: [2.5e-5, 5.0e-5, 7.5e-5, 7.5e-5, 1.0e-4]
@@ -115,9 +108,9 @@ dynamics:
   n_elites: 5
   dynamics_max_epochs: 200
   max_epochs_since_update: 50
+  logvar_loss_coef: 0.01
   predict_delta: true
-  first_action: false
-  fix_encoder: true
+  fix_encoder: true  # V1 fixed: transition-model latent space must not drift.
   action_embed_layer_norm: false
   action_scale_norm: false
   load_pretrain: false
@@ -130,21 +123,18 @@ unio4:
   bppo_lr: 1.0e-5
   clip_ratio: 0.25
   entropy_weight: 0.0
+  max_grad_norm: 0.5
   decay: 0.96
-  omega: 0.7
+  decay_stop_step: 200
   is_clip_decay: true
   is_bppo_lr_decay: false
   is_update_old_policy: true
   is_linear_decay: true
-  bppo_batch_size: 512
   temperature: null
   eval_step: 50
   eval_freq: 1000
-  ratio_strategy: scalar
-  fix_encoder: true
-  rollout_length: 1
-  use_gae: false
-  first_action: false
+  fix_encoder: true  # V1 fixed: PPO updates Decoder/action head/log_std only.
+  use_gae: false  # V1 only supported value: false for transition-model OPE gating.
   use_ema_eval: false
   idql_eval: false
   eval_times: 1
@@ -156,7 +146,6 @@ unio4:
 
 ppo:
   eval_env_num: 1
-  lamda: 0.95
   enable_ratio_logging: true
   ratio_log_every_updates: 10
   ratio_plot_on_final_flush: true
