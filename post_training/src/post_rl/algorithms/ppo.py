@@ -54,21 +54,12 @@ class ProximalPolicyOptimization:
             return
 
         model = self._policy.model
-        frontend_names = [
-            "backbone",
-            "encoder_img_feat_input_proj",
-            "encoder_robot_state_input_proj",
-            "encoder_env_state_input_proj",
-            "depth_backbone",
-            "encoder_depth_feat_input_proj",
-            "cross_modal_fusion",
-            "cross_modal_fusion_proj",
-        ]
-        for name in frontend_names:
+        model.requires_grad_(False)
+        for name in ("decoder", "decoder_pos_embed", "action_head"):
             module = getattr(model, name, None)
             if module is not None:
-                module.requires_grad_(False)
-                module.eval()
+                module.requires_grad_(True)
+        self._policy.raw_log_std.requires_grad_(True)
 
     def _register_gradient_sync_hooks(self, params) -> None:
         for handle in self._grad_hook_handles:
@@ -95,7 +86,7 @@ class ProximalPolicyOptimization:
         self._register_gradient_sync_hooks(params)
         self._optimizer = torch.optim.Adam(params, lr=self._policy_lr)
 
-    def _sync_old_policy_before_forward(self, module, inputs) -> None:
+    def _sync_old_policy(self) -> None:
         if not dist.is_available() or not dist.is_initialized():
             return
 
@@ -122,6 +113,9 @@ class ProximalPolicyOptimization:
         for buffer in self._old_policy.buffers():
             dist.broadcast(buffer.data, src=0)
         self._old_policy_version = target_version
+
+    def _sync_old_policy_before_forward(self, module, inputs) -> None:
+        self._sync_old_policy()
 
     def weighted_advantage(self, advantage: torch.Tensor) -> torch.Tensor:
         if self._omega == 0.5:
@@ -194,6 +188,7 @@ class ProximalPolicyOptimization:
     ) -> torch.Tensor:
         action = action.detach()
         advantage = advantage.detach()
+        self._sync_old_policy()
 
         with torch.no_grad():
             old_log_prob_raw, _ = self._old_policy.evaluate_action_chunk(obs, action)
