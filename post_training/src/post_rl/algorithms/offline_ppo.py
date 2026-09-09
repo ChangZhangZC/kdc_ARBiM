@@ -31,10 +31,8 @@ class BehaviorProximalPolicyOptimization(ProximalPolicyOptimization):
             clip_ratio=clip_ratio,
             entropy_weight=entropy_weight,
             decay=decay,
-            omega=0.5,
-            batch_size=int(cfg.unio4.finetune_batch_size),
-            is_iql=True,
-            ratio_strategy="scalar",
+            optimizer_cfg=cfg.unio4.optimizer,
+            lr_scheduler_cfg=cfg.unio4.lr_scheduler,
             fix_encoder=fix_encoder,
         )
         if not cfg.chunk_as_single_action:
