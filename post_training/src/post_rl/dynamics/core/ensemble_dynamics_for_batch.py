@@ -197,12 +197,15 @@ class EnsembleDynamics_batch(BaseDynamics):
 
     @torch.no_grad()
     def validate(self, inputs, targets) -> List[float]:
+        was_training = self.model.training
         self.model.eval()
         state_tokens, action = inputs
         targets = self._as_tokens(targets)
         mean, _ = self.model(state_tokens, action)
         reduce_dims = tuple(range(1, mean.ndim))
         loss = ((mean - targets) ** 2).mean(dim=reduce_dims)
+        if was_training:
+            self.model.train()
         return list(loss.cpu().numpy())
 
     @torch.no_grad()
