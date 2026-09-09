@@ -1,8 +1,29 @@
 import os
+import pathlib
+import sys
+
+REPO_ROOT = pathlib.Path(__file__).resolve().parents[2]
+POST_TRAINING_SRC = REPO_ROOT / "post_training" / "src"
+LEROBOT_SRC = REPO_ROOT / "third_party" / "lerobot" / "src"
+
+if not LEROBOT_SRC.is_dir():
+    raise RuntimeError(
+        "LeRobot submodule is not initialized. "
+        "Run `git submodule update --init --recursive`."
+    )
+
+for path in (REPO_ROOT, POST_TRAINING_SRC, LEROBOT_SRC):
+    path_str = str(path)
+    if path_str not in sys.path:
+        sys.path.insert(0, path_str)
+
+os.chdir(REPO_ROOT)
+
+import lerobot_patches.custom_patches
 
 import hydra
 
-from train_ddp import TrainACTWorkspace
+from post_rl.training.workspace import TrainACTWorkspace
 
 
 @hydra.main(version_base=None, config_path="../configs/rl", config_name="offline_rl")
@@ -19,10 +40,9 @@ def main(cfg):
         workspace.run()
     finally:
         if workspace is not None:
-            wandb_run = getattr(workspace, "wandb_run", None)
-            if wandb_run is not None:
+            if workspace.wandb_run is not None:
                 try:
-                    wandb_run.finish()
+                    workspace.wandb_run.finish()
                 except Exception:
                     pass
             workspace.cleanup_shared_memory()
