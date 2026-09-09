@@ -43,6 +43,27 @@ def MLP(
     return nn.Sequential(*layers)
 
 
+def _read_state(state: torch.Tensor, state_dim: int) -> torch.Tensor:
+    if state.ndim == 4:
+        state = state.mean(dim=-2).reshape(state.shape[0], -1)
+    elif state.ndim == 3:
+        state = state.mean(dim=1)
+    elif state.ndim == 2:
+        pass
+    else:
+        raise ValueError(
+            f"Critic state must be [B,D], [B,S,D], or [B,T,S,D], got "
+            f"{tuple(state.shape)}"
+        )
+
+    if state.shape[-1] != state_dim:
+        raise ValueError(
+            f"Critic state dim {state.shape[-1]} does not match expected "
+            f"state_dim={state_dim}."
+        )
+    return state
+
+
 class ACTCriticEncoder(nn.Module):
     def __init__(
         self,
@@ -91,7 +112,7 @@ class ValueMLP(nn.Module):
         if self._obs_encoder is not None and isinstance(state, dict):
             state = self._obs_encoder(state)
 
-        state = state.reshape(-1, self.state_dim)
+        state = _read_state(state, self.state_dim)
         return self._net(state)
 
 
@@ -237,10 +258,10 @@ class QMLP(nn.Module):
         a: torch.Tensor,
         return_action_recon_loss: bool = False,
     ):
-        if self._obs_encoder is not None:
+        if self._obs_encoder is not None and isinstance(s, dict):
             s = self._obs_encoder(s)
 
-        s = s.reshape(-1, self.state_dim)
+        s = _read_state(s, self.state_dim)
         a_embed, a_recon = self.encode_action(a)
 
         sa = torch.cat([s, a_embed], dim=1)
@@ -408,10 +429,10 @@ class DoubleQMLP(nn.Module):
         a: torch.Tensor,
         return_action_recon_loss: bool = False,
     ):
-        if self._obs_encoder is not None:
+        if self._obs_encoder is not None and isinstance(s, dict):
             s = self._obs_encoder(s)
 
-        s = s.reshape(-1, self.state_dim)
+        s = _read_state(s, self.state_dim)
         a_embed, a_recon = self.encode_action(a)
 
         sa = torch.cat([s, a_embed], dim=1)
