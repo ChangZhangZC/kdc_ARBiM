@@ -205,11 +205,14 @@ class ACTStateEncoder(nn.Module):
         self.config = source.config
         self.encoder_latent_input_proj = source.encoder_latent_input_proj
         self.encoder_1d_feature_pos_embed = source.encoder_1d_feature_pos_embed
-        self.encoder_robot_state_input_proj = source.encoder_robot_state_input_proj
-        self.encoder_env_state_input_proj = source.encoder_env_state_input_proj
-        self.backbone = source.backbone
-        self.encoder_cam_feat_pos_embed = source.encoder_cam_feat_pos_embed
-        self.encoder_img_feat_input_proj = source.encoder_img_feat_input_proj
+        if self.config.robot_state_feature:
+            self.encoder_robot_state_input_proj = source.encoder_robot_state_input_proj
+        if self.config.env_state_feature:
+            self.encoder_env_state_input_proj = source.encoder_env_state_input_proj
+        if self.config.image_features:
+            self.backbone = source.backbone
+            self.encoder_cam_feat_pos_embed = source.encoder_cam_feat_pos_embed
+            self.encoder_img_feat_input_proj = source.encoder_img_feat_input_proj
         self.encoder = source.encoder
         if self.config.use_depth and self.config.depth_features:
             self.depth_backbone = source.depth_backbone
