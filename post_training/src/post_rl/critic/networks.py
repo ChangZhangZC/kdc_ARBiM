@@ -2,9 +2,9 @@ import torch
 import torch.nn as nn
 
 from .action_embedding import ActionChunkEncoder, ActionChunkDecoder
+from ..policy.act_latent import ACTStateEncoder
 from kuavo_train.wrapper.policy.act.ACTModelWrapper import CustomACTModelWrapper
-from copy import deepcopy
-from lerobot.utils.constants import OBS_STATE
+
 
 def MLP(
     input_dim: int,
@@ -50,57 +50,19 @@ class ACTCriticEncoder(nn.Module):
         copy_model: bool = True,
     ) -> None:
         super().__init__()
-        model = deepcopy(act_model) if copy_model else act_model
+        self.state_encoder = ACTStateEncoder(act_model, copy_model=copy_model)
+        self.output_dim = self.state_encoder.output_dim
 
-        self.config = model.config
-        self.use_depth = bool(self.config.use_depth and self.config.depth_features)
-
-        self.backbone = model.backbone
-        self.image_proj = model.encoder_img_feat_input_proj
-        self.state_proj = model.encoder_robot_state_input_proj
-
-        if self.use_depth:
-            self.depth_backbone = model.depth_backbone
-            self.depth_proj = model.encoder_depth_feat_input_proj
-            self.cross_modal_fusion = model.cross_modal_fusion
-            self.cross_modal_fusion_proj = model.cross_modal_fusion_proj
-
-        self.n_cameras = len(self.config.image_features)
-        self.output_dim = self.config.dim_model * (self.n_cameras + int(self.config.robot_state_feature is not None))
+    def encode_tokens(self, obs: dict[str, torch.Tensor]) -> torch.Tensor:
+        return self.state_encoder(obs)
 
     def forward(self, obs: dict[str, torch.Tensor]) -> torch.Tensor:
-        rgb_features = []
-        for key in self.config.image_features:
-            feat = self.backbone(obs[key])["feature_map"]
-            feat = self.image_proj(feat)
-            rgb_features.append(feat)
-
-        if self.use_depth:
-            depth_features = []
-            for key in self.config.depth_features:
-                depth = obs[key].mean(dim=-3, keepdim=True)
-                feat = self.depth_backbone(depth)["feature_map"]
-                feat = self.depth_proj(feat)
-                depth_features.append(feat)
-
-            rgb_tokens = [x.flatten(2).permute(2, 0, 1) for x in rgb_features]
-            depth_tokens = [x.flatten(2).permute(2, 0, 1) for x in depth_features]
-            fused_rgb, fused_depth = self.cross_modal_fusion(rgb_tokens, depth_tokens)
-
-            visual_features = [
-                self.cross_modal_fusion_proj(torch.cat([rgb, depth], dim=-1)).mean(dim=0)
-                for rgb, depth in zip(fused_rgb, fused_depth)
-            ]
-        else:
-            visual_features = [x.mean(dim=(-2, -1)) for x in rgb_features]
-
-        state_feature = self.state_proj(obs[OBS_STATE])
-        return torch.cat([*visual_features, state_feature], dim=-1)
+        return self.encode_tokens(obs).mean(dim=1)
 
     def output_shape(self) -> int:
         return self.output_dim
-    
-    
+
+
 class ValueMLP(nn.Module):
     def __init__(
         self,
@@ -254,7 +216,6 @@ class QMLP(nn.Module):
 
         return a, None
 
-
     def compute_action_recon_loss(
         self,
         a: torch.Tensor,
@@ -296,7 +257,6 @@ class QMLP(nn.Module):
             return q, recon_loss
 
         return q
-
 
 
 class DoubleQMLP(nn.Module):
@@ -400,7 +360,7 @@ class DoubleQMLP(nn.Module):
             self._obs_encoder.eval()
             for param in self._obs_encoder.parameters():
                 param.requires_grad = False
-                
+
     def encode_action(
         self,
         a: torch.Tensor,
@@ -427,7 +387,6 @@ class DoubleQMLP(nn.Module):
 
         return a, None
 
-
     def compute_action_recon_loss(
         self,
         a: torch.Tensor,
@@ -442,7 +401,7 @@ class DoubleQMLP(nn.Module):
             a_recon,
             a_flat,
         )
-        
+
     def forward(
         self,
         s: torch.Tensor | dict[str, torch.Tensor],
