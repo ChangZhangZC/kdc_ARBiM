@@ -3,6 +3,7 @@ from typing import Callable, Dict, List, Tuple
 
 import numpy as np
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 
 from .base_dynamics import BaseDynamics
@@ -192,10 +193,11 @@ class EnsembleDynamics_batch(BaseDynamics):
 
     @torch.no_grad()
     def validate(self, inputs, targets) -> List[float]:
-        self.model.eval()
+        model = self._model()
+        model.eval()
         state_tokens, action = inputs
         targets = self._as_tokens(targets)
-        mean, _ = self.model(state_tokens, action)
+        mean, _ = model(state_tokens, action)
         reduce_dims = tuple(range(1, mean.ndim))
         loss = ((mean - targets) ** 2).mean(dim=reduce_dims)
         return list(loss.cpu().numpy())
@@ -274,11 +276,18 @@ class EnsembleDynamics_batch(BaseDynamics):
         state_dict: Dict = None,
         use_gae: bool = False,
     ):
-        critic_state = self._critic_readout(nobs_features)
         q_owner = getattr(Q, "__self__", None)
         if q_owner is not None and hasattr(q_owner, "get_advantage"):
-            return q_owner.get_advantage(critic_state, nactions)
-        return Q(critic_state, nactions)
+            return q_owner.get_advantage(self._as_tokens(nobs_features), nactions)
+        return Q(self._as_tokens(nobs_features), nactions)
+
+    def _policy_obs(self, batch_obs: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+        normalized = self.obs_adapter.normalize_obs(batch_obs)
+        obs_idx = self.n_obs_steps - 1
+        return {
+            key: value[:, obs_idx]
+            for key, value in normalized.items()
+        }
 
     @torch.no_grad()
     def rollout(
@@ -296,28 +305,31 @@ class EnsembleDynamics_batch(BaseDynamics):
             raise NotImplementedError(
                 "GAE-based OPE is not part of the RL-100-aligned ACT V1 path."
             )
-        if rollout_length < 1:
-            raise ValueError("rollout_length must be >= 1")
+
+        effective_rollout_length = int(
+            getattr(
+                self.cfg.dynamics,
+                "ope_rollout_length",
+                rollout_length,
+            )
+        )
+        if effective_rollout_length < 1:
+            raise ValueError("OPE rollout length must be >= 1")
 
         q_eval = iql.minQ if is_iql else Q
-        policy_batch = self.obs_adapter.normalize_obs(batch["obs"])
-        _, encoder_pos_embed = policy.encode_observation(policy_batch)
-        policy_features = self.obs2latent(batch["obs"])
+        policy_obs = self._policy_obs(batch["obs"])
+        policy_features, encoder_pos_embed = policy.encode_observation(policy_obs)
+        policy_features = self._as_tokens(policy_features)
         rollout_qs = []
         rewards_arr = []
 
-        for _ in range(int(rollout_length)):
+        for _ in range(effective_rollout_length):
             actions, _, _ = policy.sample_action_chunk_from_latent(
                 policy_features,
                 encoder_pos_embed,
             )
             action_chunk = actions[:, :self.n_action_steps]
-            rollout_qs.append(
-                q_eval(
-                    self._critic_readout(policy_features),
-                    action_chunk,
-                )
-            )
+            rollout_qs.append(q_eval(policy_features, action_chunk))
             next_obs, reward, _, _ = self.step(
                 policy_features,
                 action_chunk,
@@ -335,6 +347,18 @@ class EnsembleDynamics_batch(BaseDynamics):
             if rewards_arr
             else 0.0
         )
+
+        if dist.is_available() and dist.is_initialized():
+            metrics = torch.tensor(
+                [float(q_evaluation.detach().item()), reward_mean],
+                device=self.device,
+                dtype=torch.float32,
+            )
+            dist.all_reduce(metrics, op=dist.ReduceOp.SUM)
+            metrics /= dist.get_world_size()
+            q_evaluation = metrics[0]
+            reward_mean = float(metrics[1].item())
+
         return q_evaluation, reward_mean
 
     @torch.no_grad()
