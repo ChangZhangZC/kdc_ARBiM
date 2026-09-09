@@ -5,7 +5,7 @@ import hydra
 import torch
 
 from .core.ensemble_dynamics_for_batch import EnsembleDynamics_batch
-from .models.token_dynamics_model import EnsembleTokenDynamicsModel
+from .models.dynamics_model import EnsembleDynamicsModel
 from .utils.termination_fns import get_termination_fn
 from .utils.logger import Logger, make_log_dirs
 
@@ -49,8 +49,8 @@ def train_dynamics(
         )
 
     model_action_dim = action_dim * n_action_steps
-    dynamics_model = EnsembleTokenDynamicsModel(
-        token_dim=feature_dim,
+    dynamics_model = EnsembleDynamicsModel(
+        obs_dim=feature_dim,
         action_dim=model_action_dim,
         hidden_dims=cfg.dynamics.dynamics_hidden_dims,
         num_ensemble=cfg.dynamics.n_ensemble,
@@ -58,6 +58,7 @@ def train_dynamics(
         weight_decays=cfg.dynamics.dynamics_weight_decay,
         device=device,
         cfg=cfg,
+        with_reward=cfg.predict_r,
     )
 
     if not cfg.dynamics.fix_encoder:
