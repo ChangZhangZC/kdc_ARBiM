@@ -40,6 +40,31 @@ class TrainACTWorkspace(_ResumableTrainACTWorkspace):
                 "normalization contract."
             )
         normalizer = normalizers[0]
+        expected_modes = {
+            "STATE": "MEAN_STD",
+            "ACTION": "MEAN_STD",
+            "VISUAL": "MEAN_STD",
+            "RGB": "MEAN_STD",
+            "DEPTH": "MIN_MAX",
+        }
+        mode_errors = []
+        for key, feature in normalizer.features.items():
+            feature_type = getattr(feature.type, "value", str(feature.type))
+            expected = expected_modes.get(str(feature_type))
+            if expected is None:
+                continue
+            actual_mode = normalizer.norm_map.get(feature.type)
+            actual = getattr(actual_mode, "value", str(actual_mode))
+            if str(actual) != expected:
+                mode_errors.append(
+                    f"{key}: {feature_type} requires {expected}, got {actual}"
+                )
+        if mode_errors:
+            raise RuntimeError(
+                "ACT normalization mapping is incompatible with the post-RL "
+                "normalization adapter:\n- " + "\n- ".join(mode_errors)
+            )
+
         normalizer_contract = {
             "stats": self.stats,
             "norm_map": {
