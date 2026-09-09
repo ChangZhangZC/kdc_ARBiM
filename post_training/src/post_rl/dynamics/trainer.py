@@ -5,7 +5,7 @@ import hydra
 import torch
 
 from .core.ensemble_dynamics_for_batch import EnsembleDynamics_batch
-from .models.dynamics_model import EnsembleDynamicsModel
+from .models.token_dynamics_model import EnsembleTokenDynamicsModel
 from .utils.termination_fns import get_termination_fn
 from .utils.logger import Logger, make_log_dirs
 
@@ -26,49 +26,38 @@ def train_dynamics(
         raise ValueError(
             "obs_adapter.fix_encoder must match cfg.dynamics.fix_encoder"
         )
-    if n_obs_steps != cfg.n_obs_steps or n_obs_steps != obs_adapter.n_obs_steps:
+    if n_obs_steps != 1 or obs_adapter.n_obs_steps != 1:
         raise ValueError(
-            "n_obs_steps must match cfg.n_obs_steps and obs_adapter.n_obs_steps"
+            "ACT transformer-latent dynamics currently requires n_obs_steps=1."
         )
     if feature_dim != obs_adapter.feature_dim:
         raise ValueError(
             f"feature_dim={feature_dim} does not match "
             f"obs_adapter.feature_dim={obs_adapter.feature_dim}"
         )
-
-    prediction_mode = getattr(cfg.dynamics, "prediction_mode", "last")
-
-    if chunk_as_single_action:
-        action_dim = action_dim * n_action_steps
-
-    if prediction_mode == "full":
-        output_obs_dim = feature_dim * n_obs_steps
-        print(
-            f"==========================Dynamics prediction mode: FULL "
-            f"(output dim: {output_obs_dim})=========================="
+    if not chunk_as_single_action:
+        raise ValueError(
+            "ACT transformer-latent OPE currently requires chunk_as_single_action=true."
         )
-    else:
-        output_obs_dim = feature_dim
-        print(
-            f"==========================Dynamics prediction mode: LAST "
-            f"(output dim: {output_obs_dim})=========================="
-        )
-
-    if cfg.dynamics_type == "diffusion":
+    if cfg.predict_r:
         raise NotImplementedError(
-            "ARBiM ACT V1 does not migrate RL-100 Diffusion Dynamics."
+            "Transformer-latent dynamics follows RL-100 OPE gating with predict_r=false."
+        )
+    if cfg.dynamics_type != "mlp":
+        raise NotImplementedError(
+            "ACT transformer-latent V1 supports token-structured MLP dynamics only."
         )
 
-    dynamics_model = EnsembleDynamicsModel(
-        obs_dim=output_obs_dim,
-        action_dim=action_dim,
+    model_action_dim = action_dim * n_action_steps
+    dynamics_model = EnsembleTokenDynamicsModel(
+        token_dim=feature_dim,
+        action_dim=model_action_dim,
         hidden_dims=cfg.dynamics.dynamics_hidden_dims,
         num_ensemble=cfg.dynamics.n_ensemble,
         num_elites=cfg.dynamics.n_elites,
         weight_decays=cfg.dynamics.dynamics_weight_decay,
         device=device,
         cfg=cfg,
-        with_reward=cfg.predict_r,
     )
 
     if not cfg.dynamics.fix_encoder:
@@ -78,14 +67,12 @@ def train_dynamics(
             + list(obs_adapter.encoder.parameters()),
         )
     else:
-        print("==========================fix encoder==========================")
         dynamics_optim = hydra.utils.instantiate(
             cfg.optimizer,
             params=dynamics_model.parameters(),
         )
 
     termination_fn = get_termination_fn(task=cfg.task_name)
-
     dynamics = EnsembleDynamics_batch(
         dynamics_model,
         dynamics_optim,
@@ -93,16 +80,15 @@ def train_dynamics(
         env,
         obs_adapter,
         cfg=cfg,
-        action_dim=action_dim,
+        action_dim=model_action_dim,
         gamma=cfg.critic.gamma,
         device=device,
-        chunk_as_single_action=chunk_as_single_action,
+        chunk_as_single_action=True,
         n_action_steps=n_action_steps,
-        prediction_mode=prediction_mode,
+        prediction_mode="full",
     )
 
     os.makedirs(dynamics_save_path, exist_ok=True)
-
     log_dirs = make_log_dirs(
         cfg.task_name,
         cfg.name,
@@ -110,17 +96,14 @@ def train_dynamics(
         None,
         record_params=None,
     )
-
     output_config = {
         "consoleout_backup": "stdout",
         "policy_training_progress": "csv",
         "dynamics_training_progress": "csv",
         "tb": "tensorboardX",
     }
-
     logger = Logger(log_dirs, output_config)
     dynamics.set_logger(logger)
-
     return dynamics
 
 
