@@ -106,7 +106,9 @@ critic:
   save_every_epochs: 0
 
 dynamics:
+  latent_mode: transformer_encoder
   prediction_mode: full
+  ope_rollout_length: 2
   dynamics_hidden_dims: [400, 400, 400, 400]
   dynamics_weight_decay: [2.5e-5, 5.0e-5, 7.5e-5, 7.5e-5, 1.0e-4]
   n_ensemble: 7
