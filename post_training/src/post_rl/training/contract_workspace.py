@@ -1,6 +1,7 @@
 import hashlib
 import json
 import os
+from collections.abc import Mapping
 
 import numpy as np
 import torch
@@ -54,8 +55,8 @@ class TrainACTWorkspace(_ResumableTrainACTWorkspace):
                 digest.update(str(array.dtype).encode("utf-8"))
                 digest.update(array.tobytes())
                 return
-            if isinstance(value, dict):
-                digest.update(b"dict")
+            if isinstance(value, Mapping):
+                digest.update(b"mapping")
                 for key in sorted(value, key=lambda item: str(item)):
                     update(value[key], f"{path}/{key}")
                 return
