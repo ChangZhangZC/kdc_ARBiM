@@ -219,6 +219,7 @@ class BehaviorProximalPolicyOptimization(ProximalPolicyOptimization):
         clip_ratio_now: float | None = None,
     ) -> float:
         self.iteration += 1
+        self._sync_old_policy()
         normalized_obs = self.obs_adapter.normalize_obs(batch["obs"])
         policy_obs = {key: value[:, 0] for key, value in normalized_obs.items()}
 
