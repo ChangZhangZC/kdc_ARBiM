@@ -38,7 +38,7 @@ class EnsembleDynamics_batch(BaseDynamics):
                 "ACT transformer-latent dynamics currently requires n_obs_steps=1."
             )
         if not getattr(self._unwrap(model), "token_dynamics", False):
-            raise TypeError("Expected EnsembleTokenDynamicsModel.")
+            raise TypeError("Expected transformer-token EnsembleDynamicsModel.")
 
         self.terminal_fn = terminal_fn
         self._penalty_coef = penalty_coef
@@ -89,6 +89,31 @@ class EnsembleDynamics_batch(BaseDynamics):
         )
         return latent[:, 0]
 
+    def _as_tokens(self, features: torch.Tensor) -> torch.Tensor:
+        features = torch.as_tensor(
+            features,
+            device=self.device,
+            dtype=torch.float32,
+        )
+        if features.ndim == 3:
+            return features
+        if features.ndim == 2:
+            token_dim = self._model().token_dim
+            if features.shape[-1] % token_dim != 0:
+                raise ValueError(
+                    f"Flattened latent dim {features.shape[-1]} is not divisible "
+                    f"by token_dim={token_dim}."
+                )
+            return features.reshape(features.shape[0], -1, token_dim)
+        raise ValueError(
+            f"Expected ACT latent [B,S,D] or flattened [B,S*D], got "
+            f"{tuple(features.shape)}"
+        )
+
+    def _critic_readout(self, state_tokens: torch.Tensor) -> torch.Tensor:
+        state_tokens = self._as_tokens(state_tokens)
+        return state_tokens.mean(dim=1)
+
     def _dataset_chunk_action(self, batch: Dict) -> torch.Tensor:
         actions = self.obs_adapter.normalize_action(batch["action"])
         start = self.n_obs_steps - 1
@@ -101,9 +126,11 @@ class EnsembleDynamics_batch(BaseDynamics):
 
     def _targets(
         self,
-        state_tokens: torch.Tensor,
-        next_state_tokens: torch.Tensor,
+        state_features: torch.Tensor,
+        next_state_features: torch.Tensor,
     ) -> torch.Tensor:
+        state_tokens = self._as_tokens(state_features)
+        next_state_tokens = self._as_tokens(next_state_features)
         if state_tokens.shape != next_state_tokens.shape:
             raise ValueError(
                 f"Dynamics latent shape mismatch: {tuple(state_tokens.shape)} vs "
@@ -114,6 +141,17 @@ class EnsembleDynamics_batch(BaseDynamics):
             if self.predict_delta
             else next_state_tokens
         )
+
+    def format_samples_for_training(
+        self,
+        data: Dict,
+        nobs_features: torch.Tensor,
+        next_nobs_features: torch.Tensor,
+    ):
+        state_tokens = self._as_tokens(nobs_features)
+        targets = self._targets(nobs_features, next_nobs_features)
+        action = self._dataset_chunk_action(data)
+        return (state_tokens, action), targets
 
     def learn(
         self,
@@ -127,9 +165,12 @@ class EnsembleDynamics_batch(BaseDynamics):
                 "RL-100-style ACT latent OPE uses predict_r=false."
             )
 
-        targets = self._targets(nobs_features, next_nobs_features)
-        action = self._dataset_chunk_action(batch)
-        mean, logvar = self.model(nobs_features, action)
+        (state_tokens, action), targets = self.format_samples_for_training(
+            batch,
+            nobs_features,
+            next_nobs_features,
+        )
+        mean, logvar = self.model(state_tokens, action)
         inv_var = torch.exp(-logvar)
         reduce_dims = tuple(range(1, mean.ndim))
         mse_loss_inv = ((mean - targets).pow(2) * inv_var).mean(dim=reduce_dims)
@@ -150,16 +191,11 @@ class EnsembleDynamics_batch(BaseDynamics):
         self.optim.step()
 
     @torch.no_grad()
-    def validate_batch(
-        self,
-        batch: Dict,
-        nobs_features: torch.Tensor,
-        next_nobs_features: torch.Tensor,
-    ) -> List[float]:
+    def validate(self, inputs, targets) -> List[float]:
         self.model.eval()
-        targets = self._targets(nobs_features, next_nobs_features)
-        action = self._dataset_chunk_action(batch)
-        mean, _ = self.model(nobs_features, action)
+        state_tokens, action = inputs
+        targets = self._as_tokens(targets)
+        mean, _ = self.model(state_tokens, action)
         reduce_dims = tuple(range(1, mean.ndim))
         loss = ((mean - targets) ** 2).mean(dim=reduce_dims)
         return list(loss.cpu().numpy())
@@ -171,19 +207,9 @@ class EnsembleDynamics_batch(BaseDynamics):
         action: torch.Tensor,
         policy_features: torch.Tensor | None = None,
     ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, Dict]:
-        state_tokens = torch.as_tensor(
-            policy_features if policy_features is not None else nobs_features,
-            device=self.device,
-            dtype=torch.float32,
+        state_tokens = self._as_tokens(
+            policy_features if policy_features is not None else nobs_features
         )
-        if state_tokens.ndim == 4 and state_tokens.shape[1] == 1:
-            state_tokens = state_tokens[:, 0]
-        if state_tokens.ndim != 3:
-            raise ValueError(
-                f"Dynamics step expects ACT latent [B,S,D], got "
-                f"{tuple(state_tokens.shape)}"
-            )
-
         action = torch.as_tensor(
             action,
             device=self.device,
@@ -248,10 +274,11 @@ class EnsembleDynamics_batch(BaseDynamics):
         state_dict: Dict = None,
         use_gae: bool = False,
     ):
+        critic_state = self._critic_readout(nobs_features)
         q_owner = getattr(Q, "__self__", None)
         if q_owner is not None and hasattr(q_owner, "get_advantage"):
-            return q_owner.get_advantage(nobs_features, nactions)
-        return Q(nobs_features, nactions)
+            return q_owner.get_advantage(critic_state, nactions)
+        return Q(critic_state, nactions)
 
     @torch.no_grad()
     def rollout(
@@ -285,7 +312,12 @@ class EnsembleDynamics_batch(BaseDynamics):
                 encoder_pos_embed,
             )
             action_chunk = actions[:, :self.n_action_steps]
-            rollout_qs.append(q_eval(policy_features, action_chunk))
+            rollout_qs.append(
+                q_eval(
+                    self._critic_readout(policy_features),
+                    action_chunk,
+                )
+            )
             next_obs, reward, _, _ = self.step(
                 policy_features,
                 action_chunk,
@@ -315,7 +347,7 @@ class EnsembleDynamics_batch(BaseDynamics):
         state_tokens = (
             self.obs2latent(obs)
             if isinstance(obs, dict)
-            else torch.as_tensor(obs, device=self.device, dtype=torch.float32)
+            else self._as_tokens(obs)
         )
         mean, logvar = self.model(state_tokens, action)
         if self.predict_delta:
