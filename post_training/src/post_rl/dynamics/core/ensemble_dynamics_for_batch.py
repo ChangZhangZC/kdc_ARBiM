@@ -1,5 +1,5 @@
 import os
-from typing import Callable, Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Tuple
 
 import numpy as np
 import torch
@@ -26,564 +26,218 @@ class EnsembleDynamics_batch(BaseDynamics):
         device: str = "cpu",
         chunk_as_single_action: bool = False,
         n_action_steps: int = 1,
-        prediction_mode: str = "last",
+        prediction_mode: str = "full",
     ) -> None:
         super().__init__(model, optim)
+        if not chunk_as_single_action:
+            raise ValueError(
+                "ACT transformer-latent dynamics requires chunk_as_single_action=true."
+            )
+        if obs_adapter.n_obs_steps != 1:
+            raise ValueError(
+                "ACT transformer-latent dynamics currently requires n_obs_steps=1."
+            )
+        if not getattr(self._unwrap(model), "token_dynamics", False):
+            raise TypeError("Expected EnsembleTokenDynamicsModel.")
+
         self.terminal_fn = terminal_fn
         self._penalty_coef = penalty_coef
         self._uncertainty_mode = uncertainty_mode
         self.env = env
         self.obs_adapter = obs_adapter
         self.cfg = cfg
-        self.n_obs_steps = cfg.n_obs_steps
+        self.n_obs_steps = 1
         self.predict_delta = cfg.dynamics.predict_delta
-        self.use_conv_action_embed = getattr(cfg, "use_conv_action_embed", False)
-        self.chunk_as_single_action = chunk_as_single_action
+        self.chunk_as_single_action = True
         self.n_action_steps = n_action_steps
-        self.prediction_mode = prediction_mode
-
-        model = self.model.module if hasattr(self.model, "module") else self.model
-        self.holdout_losses = [1e10 for _ in range(model.num_ensemble)]
-
+        self.prediction_mode = "full"
         self.lamda = lamda
         self.gamma = gamma
-        self.cnt = 0
         self.action_dim = action_dim
         self.predict_r = cfg.predict_r
         self.dynamics_type = cfg.dynamics_type
-        self.device = device
+        self.device = torch.device(device)
+        self.cnt = 0
+        self.holdout_losses = [
+            1e10 for _ in range(self._model().num_ensemble)
+        ]
+
+    @staticmethod
+    def _unwrap(model: nn.Module) -> nn.Module:
+        return model.module if hasattr(model, "module") else model
+
+    def _model(self) -> nn.Module:
+        return self._unwrap(self.model)
 
     def set_logger(self, logger) -> None:
         self.logger = logger
         self.logger.log("Training dynamics:")
 
-    @staticmethod
-    def _q_requires_raw_obs(Q: Callable) -> bool:
-        q_owner = getattr(Q, "__self__", None)
-        if q_owner is not None and getattr(q_owner, "eval_with_raw_obs", False):
-            return True
-        if q_owner is not None and hasattr(q_owner, "is_share_encoder"):
-            return not bool(q_owner.is_share_encoder)
-        q_module = getattr(q_owner, "_Q", None) if q_owner is not None else Q
-        return getattr(q_module, "_obs_encoder", None) is not None
-
-    @staticmethod
-    def _as_column_tensor(value, ref: torch.Tensor) -> torch.Tensor:
-        tensor = torch.as_tensor(value, device=ref.device, dtype=ref.dtype)
-        tensor = tensor.reshape(ref.shape[0], -1)
-        if tensor.shape[1] != 1:
-            tensor = tensor[:, :1]
-        return tensor
-
-    @staticmethod
-    def _as_chunk_reward_tensor(tensor: torch.Tensor) -> torch.Tensor:
-        if tensor.ndim == 3:
-            tensor = tensor[..., 0]
-        return tensor
-
-    def _discounted_chunk_rewards(
-        self,
-        reward_chunk: torch.Tensor,
-        not_done_chunk: Optional[torch.Tensor] = None,
-        done_chunk: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
-        reward_chunk = self._as_chunk_reward_tensor(reward_chunk)
-        gamma_weights = torch.pow(
-            torch.tensor(
-                self.gamma,
-                device=reward_chunk.device,
-                dtype=reward_chunk.dtype,
-            ),
-            torch.arange(
-                reward_chunk.shape[1],
-                device=reward_chunk.device,
-                dtype=reward_chunk.dtype,
-            ),
-        )
-
-        if not_done_chunk is None and done_chunk is not None:
-            done_chunk = self._as_chunk_reward_tensor(done_chunk).to(
-                device=reward_chunk.device,
-                dtype=reward_chunk.dtype,
-            )
-            not_done_chunk = 1.0 - done_chunk
-
-        if not_done_chunk is not None:
-            not_done_chunk = self._as_chunk_reward_tensor(not_done_chunk).to(
-                device=reward_chunk.device,
-                dtype=reward_chunk.dtype,
-            )
-            prior_not_done = torch.ones_like(reward_chunk)
-            if reward_chunk.shape[1] > 1:
-                prior_not_done[:, 1:] = torch.cumprod(
-                    not_done_chunk[:, :-1],
-                    dim=1,
-                )
-            reward_chunk = reward_chunk * prior_not_done
-
-        return torch.sum(
-            reward_chunk * gamma_weights,
-            dim=-1,
-            keepdim=True,
-        )
-
-    def _return_and_gae(
-        self,
-        rewards,
-        terminals,
-        q_values=None,
-        final_bootstrap: Optional[torch.Tensor] = None,
-        gamma: Optional[float] = None,
-    ):
-        if gamma is None:
-            gamma = self.gamma
-
-        if q_values is not None and len(q_values) > 0:
-            if len(q_values) != len(rewards):
-                raise ValueError(
-                    f"Expected one q_value per reward, got "
-                    f"{len(q_values)} q_values and {len(rewards)} rewards."
-                )
-            ref = self._as_column_tensor(q_values[0], q_values[0])
-            q_values = [
-                self._as_column_tensor(q_value, ref)
-                for q_value in q_values
-            ]
-        elif final_bootstrap is not None:
-            ref = self._as_column_tensor(final_bootstrap, final_bootstrap)
-        else:
-            raise ValueError(
-                "Need q_values or final_bootstrap to infer rollout shape."
-            )
-
-        if final_bootstrap is not None:
-            final_bootstrap = self._as_column_tensor(final_bootstrap, ref)
-
-        returns = torch.zeros_like(ref)
-        discount = torch.ones_like(ref)
-        alive = torch.ones_like(ref)
-        reward_tensors, alive_tensors, nonterminals = [], [], []
-
-        for reward, terminal in zip(rewards, terminals):
-            reward_t = self._as_column_tensor(reward, ref)
-            terminal_t = self._as_column_tensor(
-                terminal,
-                ref,
-            ).clamp(0.0, 1.0)
-            alive_before = alive
-            nonterminal = alive_before * (1.0 - terminal_t)
-            masked_reward = alive_before * reward_t
-            returns = returns + discount * masked_reward
-
-            reward_tensors.append(masked_reward)
-            alive_tensors.append(alive_before)
-            nonterminals.append(nonterminal)
-
-            discount = discount * gamma
-            alive = nonterminal
-
-        if final_bootstrap is not None:
-            returns = returns + discount * alive * final_bootstrap
-
-        gae_advantages = None
-        if q_values is not None and len(q_values) > 0:
-            final_q = (
-                final_bootstrap
-                if final_bootstrap is not None
-                else torch.zeros_like(ref)
-            )
-            deltas = []
-            for i, q_value in enumerate(q_values):
-                next_q = (
-                    q_values[i + 1]
-                    if i < len(q_values) - 1
-                    else final_q
-                )
-                delta = (
-                    reward_tensors[i]
-                    + gamma * nonterminals[i] * next_q
-                    - alive_tensors[i] * q_value
-                )
-                deltas.append(delta)
-
-            gae = torch.zeros_like(ref)
-            gae_advantages = []
-            for i in reversed(range(len(deltas))):
-                gae = (
-                    deltas[i]
-                    + gamma
-                    * self.lamda
-                    * nonterminals[i]
-                    * gae
-                )
-                gae_advantages.insert(0, gae)
-            gae_advantages = torch.stack(gae_advantages).squeeze(-1)
-
-        return returns, gae_advantages
-      
-    def obs2latent(self, nobs):
-        return self.obs_adapter.encode(
+    def obs2latent(self, nobs) -> torch.Tensor:
+        latent = self.obs_adapter.encode(
             nobs,
             start=0,
             track_grad=not self.obs_adapter.fix_encoder,
         )
-        
-    def next_obs2latent(self, nobs):
-        start = self.n_action_steps - 1 if self.chunk_as_single_action else 0
-        return self.obs_adapter.encode(
+        return latent[:, 0]
+
+    def next_obs2latent(self, nobs) -> torch.Tensor:
+        latent = self.obs_adapter.encode(
             nobs,
-            start=start,
+            start=self.n_action_steps - 1,
             track_grad=not self.obs_adapter.fix_encoder,
         )
+        return latent[:, 0]
 
-    def format_samples_for_training(
-        self,
-        data: Dict,
-        nobs_features: torch.Tensor,
-        next_nobs_features: torch.Tensor,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        batch_size = data["action"].shape[0]
-
-        if self.predict_delta:
-            targets = next_nobs_features - nobs_features
-        else:
-            targets = next_nobs_features
-
-        actions = self.obs_adapter.normalize_action(data["action"])
-
+    def _dataset_chunk_action(self, batch: Dict) -> torch.Tensor:
+        actions = self.obs_adapter.normalize_action(batch["action"])
         start = self.n_obs_steps - 1
-
-        if self.cfg.chunk_as_single_action:
-            end = start + self.n_action_steps
-            action = actions[:, start:end]
-
-            if self.predict_r:
-                reward_chunk = data["reward"][:, start:end]
-                not_done_chunk = None
-                done_chunk = None
-
-                if "not_done" in data:
-                    not_done_chunk = data["not_done"][:, start:end]
-                elif "done" in data:
-                    done_chunk = data["done"][:, start:end]
-
-                rewards = self._discounted_chunk_rewards(
-                    reward_chunk,
-                    not_done_chunk,
-                    done_chunk,
-                )
-        else:
-            action = actions[:, start]
-            if self.predict_r:
-                rewards = data["reward"][:, start]
-
-        model = self.model.module if hasattr(self.model, "module") else self.model
-
-        if self.use_conv_action_embed:
-            Da = model._single_action_dim
-            action_chunk = action.reshape(batch_size, -1, Da)
-            z = model._conv_action_encoder(action_chunk)
-            action = model._conv_action_layer_norm(
-                z.reshape(batch_size, -1)
+        end = start + self.n_action_steps
+        if actions.shape[1] < end:
+            raise ValueError(
+                f"Dynamics needs action horizon >= {end}, got {actions.shape[1]}."
             )
-        elif self.cfg.use_action_embed:
-            action = action.reshape(batch_size, -1)
-            action = model._action_encoder(action)
-        else:
-            action = action.reshape(batch_size, -1)
-            if getattr(model, "use_action_scale_norm", False):
-                action = model._action_scale_layer_norm(action)
+        return actions[:, start:end]
 
-        inputs = torch.cat(
-            (nobs_features, action.reshape(batch_size, -1)),
-            dim=-1,
+    def _targets(
+        self,
+        state_tokens: torch.Tensor,
+        next_state_tokens: torch.Tensor,
+    ) -> torch.Tensor:
+        if state_tokens.shape != next_state_tokens.shape:
+            raise ValueError(
+                f"Dynamics latent shape mismatch: {tuple(state_tokens.shape)} vs "
+                f"{tuple(next_state_tokens.shape)}"
+            )
+        return (
+            next_state_tokens - state_tokens
+            if self.predict_delta
+            else next_state_tokens
         )
 
+    def learn(
+        self,
+        batch: Dict,
+        nobs_features: torch.Tensor,
+        next_nobs_features: torch.Tensor,
+        logvar_loss_coef: float = 0.01,
+    ) -> torch.Tensor:
         if self.predict_r:
-            targets = torch.cat(
-                (targets, rewards.reshape(batch_size, -1)),
-                dim=-1,
+            raise NotImplementedError(
+                "RL-100-style ACT latent OPE uses predict_r=false."
             )
 
-        return inputs, targets
-  
+        targets = self._targets(nobs_features, next_nobs_features)
+        action = self._dataset_chunk_action(batch)
+        mean, logvar = self.model(nobs_features, action)
+        inv_var = torch.exp(-logvar)
+        reduce_dims = tuple(range(1, mean.ndim))
+        mse_loss_inv = ((mean - targets).pow(2) * inv_var).mean(dim=reduce_dims)
+        var_loss = logvar.mean(dim=reduce_dims)
+        model = self._model()
+        loss = mse_loss_inv.sum() + var_loss.sum()
+        loss = loss + model.get_decay_loss()
+        loss = (
+            loss
+            + logvar_loss_coef * model.max_logvar.sum()
+            - logvar_loss_coef * model.min_logvar.sum()
+        )
+        return loss
+
+    def optimize(self, loss: torch.Tensor) -> None:
+        self.optim.zero_grad()
+        loss.backward()
+        self.optim.step()
+
+    @torch.no_grad()
+    def validate_batch(
+        self,
+        batch: Dict,
+        nobs_features: torch.Tensor,
+        next_nobs_features: torch.Tensor,
+    ) -> List[float]:
+        self.model.eval()
+        targets = self._targets(nobs_features, next_nobs_features)
+        action = self._dataset_chunk_action(batch)
+        mean, _ = self.model(nobs_features, action)
+        reduce_dims = tuple(range(1, mean.ndim))
+        loss = ((mean - targets) ** 2).mean(dim=reduce_dims)
+        return list(loss.cpu().numpy())
 
     @torch.no_grad()
     def step(
         self,
         nobs_features: torch.Tensor,
         action: torch.Tensor,
-        policy_features: torch.Tensor = None,
+        policy_features: torch.Tensor | None = None,
     ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, Dict]:
-        batch_size = nobs_features.shape[0]
-        model = self.model.module if hasattr(self.model, "module") else self.model
-
-        if self.use_conv_action_embed:
-            action = torch.as_tensor(
-                action,
-                dtype=torch.float32,
-                device=nobs_features.device,
-            )
-            Da = model._single_action_dim
-            action_chunk = action.reshape(batch_size, -1, Da)
-            z = model._conv_action_encoder(action_chunk)
-            action = model._conv_action_layer_norm(z.reshape(batch_size, -1))
-        elif self.cfg.use_action_embed:
-            action = action.reshape(batch_size, -1)
-            action = model._action_encoder(action)
-        else:
-            action = torch.as_tensor(
-                action,
-                dtype=torch.float32,
-                device=nobs_features.device,
-            ).reshape(batch_size, -1)
-            if getattr(model, "use_action_scale_norm", False):
-                action = model._action_scale_layer_norm(action)
-
-        action = action.reshape(batch_size, -1)
-
-        if self.prediction_mode == "full" and policy_features is not None:
-            input_features = policy_features.reshape(batch_size, -1)
-        else:
-            input_features = nobs_features
-
-        input_features_np = input_features.cpu().numpy()
-        action_np = action.cpu().numpy()
-        obs_act = np.concatenate([input_features_np, action_np], axis=-1)
-
-        mean, logvar = self.model(obs_act)
-        mean = mean.cpu().numpy()
-        logvar = logvar.cpu().numpy()
-        is_diffusion_dynamics = bool(
-            getattr(model, "is_diffusion_dynamics", False)
+        state_tokens = torch.as_tensor(
+            policy_features if policy_features is not None else nobs_features,
+            device=self.device,
+            dtype=torch.float32,
         )
+        if state_tokens.ndim == 4 and state_tokens.shape[1] == 1:
+            state_tokens = state_tokens[:, 0]
+        if state_tokens.ndim != 3:
+            raise ValueError(
+                f"Dynamics step expects ACT latent [B,S,D], got "
+                f"{tuple(state_tokens.shape)}"
+            )
 
+        action = torch.as_tensor(
+            action,
+            device=self.device,
+            dtype=torch.float32,
+        )
+        mean, logvar = self.model(state_tokens, action)
         if self.predict_delta:
-            if self.predict_r:
-                mean[..., :-1] += input_features_np
-            else:
-                mean += input_features_np
+            mean = mean + state_tokens.unsqueeze(0)
 
-        std = np.sqrt(np.exp(logvar))
-        if is_diffusion_dynamics:
-            ensemble_samples = mean.astype(np.float32)
-        else:
-            ensemble_samples = (
-                mean + np.random.normal(size=mean.shape) * std
-            ).astype(np.float32)
-
-        _, batch_size, _ = ensemble_samples.shape
+        std = torch.sqrt(torch.exp(logvar))
+        samples = mean + torch.randn_like(std) * std
+        model = self._model()
+        batch_size = state_tokens.shape[0]
         model_idxs = model.random_elite_idxs(batch_size)
-        samples = ensemble_samples[model_idxs, np.arange(batch_size)]
+        batch_idx = torch.arange(batch_size, device=self.device)
+        elite_idx = torch.as_tensor(model_idxs, device=self.device)
+        next_state = samples[elite_idx, batch_idx]
 
-        if self.predict_r:
-            next_obs = samples[..., :-1]
-            reward = samples[..., -1:]
-        else:
-            next_obs = samples
-            reward = np.zeros((batch_size, 1), dtype=np.float32)
-
+        reward = np.zeros((batch_size, 1), dtype=np.float32)
+        state_np = state_tokens.detach().cpu().numpy().reshape(batch_size, -1)
+        next_np_flat = next_state.detach().cpu().numpy().reshape(batch_size, -1)
+        action_np = action.detach().cpu().numpy().reshape(batch_size, -1)
         terminal = self.terminal_fn(
-            input_features_np,
+            state_np,
             action_np,
-            next_obs,
+            next_np_flat,
             self.env,
         )
         info = {"raw_reward": reward}
 
         if self._penalty_coef:
+            std_np = std.detach().cpu().numpy().reshape(
+                std.shape[0],
+                batch_size,
+                -1,
+            )
             if self._uncertainty_mode == "aleatoric":
-                penalty = np.amax(np.linalg.norm(std, axis=2), axis=0)
-            elif self._uncertainty_mode == "pairwise-diff":
-                next_obses_mean = mean[..., :-1]
-                next_obs_mean = np.mean(next_obses_mean, axis=0)
-                diff = next_obses_mean - next_obs_mean
-                penalty = np.amax(np.linalg.norm(diff, axis=2), axis=0)
+                penalty = np.amax(np.linalg.norm(std_np, axis=2), axis=0)
             elif self._uncertainty_mode == "ensemble_std":
-                next_obses_mean = mean[..., :-1]
-                penalty = np.sqrt(next_obses_mean.var(0).mean(1))
+                mean_np = mean.detach().cpu().numpy().reshape(
+                    mean.shape[0],
+                    batch_size,
+                    -1,
+                )
+                penalty = np.sqrt(mean_np.var(0).mean(1))
             else:
                 raise ValueError(
                     f"Unsupported uncertainty mode: {self._uncertainty_mode}"
                 )
-
             penalty = np.expand_dims(penalty, 1).astype(np.float32)
-            assert penalty.shape == reward.shape
             reward = reward - self._penalty_coef * penalty
             info["penalty"] = penalty
 
-        if self.prediction_mode == "full":
-            feature_dim = next_obs.shape[-1] // self.n_obs_steps
-            next_obs = next_obs.reshape(
-                batch_size,
-                self.n_obs_steps,
-                feature_dim,
-            )
-
-        return next_obs, reward, terminal, info
-
-    @torch.no_grad()
-    def multi_step(
-        self,
-        single_nob_features: torch.Tensor,
-        nobs_features: torch.Tensor,
-        nactions: torch.Tensor,
-        reward_strategy: str = "sum",
-        discount: float = 1.0,
-        Return: float = 0.0,
-        Qs: List[torch.Tensor] = None,
-        Q: Callable = None,
-    ):
-        n_step_actions = nactions.shape[1]
-        rewards = 0
-        batch_size = nactions.shape[0]
-
-        for i in range(n_step_actions):
-            action = nactions[:, i, :self.action_dim]
-
-            if Q is not None:
-                Qs.append(
-                    Q(
-                        nobs_features.reshape(batch_size, -1),
-                        action,
-                    )
-                )
-
-            next_obs, reward, terminal, info = self.step(
-                single_nob_features,
-                action,
-                nobs_features,
-            )
-
-            if reward_strategy == "sum":
-                rewards += reward
-
-            Return += discount * reward
-            discount *= self.gamma
-
-            model = self.model.module if hasattr(self.model, "module") else self.model
-            device = (
-                model._device
-                if hasattr(model, "_device")
-                else next(model.parameters()).device
-            )
-
-            if self.prediction_mode == "full":
-                nobs_features = torch.from_numpy(next_obs).to(device)
-                single_nob_features = nobs_features[:, -1, :]
-            else:
-                single_nob_features = torch.from_numpy(next_obs).to(device)
-                nobs_features = torch.cat(
-                    (
-                        nobs_features[:, 1:, :],
-                        single_nob_features.unsqueeze(1),
-                    ),
-                    dim=1,
-                )
-
-        return next_obs, rewards, terminal, info, Return, Qs, discount
-
-    @torch.no_grad()
-    def multi_step_evaluation(
-        self,
-        nobs_features: torch.Tensor,
-        nactions: torch.Tensor,
-        Q: Callable,
-        state_dict: Dict = None,
-        use_gae: bool = False,
-    ):
-        n_step_actions = nactions.shape[1]
-        all_obs_features, rewards, terminals, infos, Qs = [], [], [], [], []
-        G, discount = 0, 1
-        use_state_dict_q = self._q_requires_raw_obs(Q)
-
-        if use_state_dict_q and n_step_actions > 1:
-            raise ValueError(
-                "multi_step_evaluation cannot update raw observation inputs "
-                "across latent dynamics rollout when Q owns its encoder."
-            )
-
-        batch_size = nactions.shape[0]
-        policy_features = nobs_features.reshape(
-            batch_size,
-            self.n_obs_steps,
-            -1,
-        )
-        single_nob_features = policy_features[:, -1, :]
-
-        for i in range(n_step_actions):
-            if use_state_dict_q:
-                q_input = state_dict
-            else:
-                q_input = policy_features.reshape(batch_size, -1)
-
-            action = nactions[:, i, :self.action_dim]
-            Qs.append(Q(q_input, action))
-            all_obs_features.append(policy_features)
-
-            next_obs, reward, terminal, info = self.step(
-                single_nob_features,
-                action,
-                policy_features,
-            )
-
-            G += discount * reward
-            discount *= self.gamma
-            rewards.append(reward)
-            terminals.append(terminal)
-            infos.append(info)
-
-            model = self.model.module if hasattr(self.model, "module") else self.model
-            device = (
-                model._device
-                if hasattr(model, "_device")
-                else next(model.parameters()).device
-            )
-
-            if self.prediction_mode == "full":
-                policy_features = torch.from_numpy(next_obs).to(device)
-                single_nob_features = policy_features[:, -1, :]
-            else:
-                single_nob_features = torch.from_numpy(next_obs).to(device)
-                policy_features = torch.cat(
-                    (
-                        policy_features[:, 1:, :],
-                        single_nob_features.unsqueeze(1),
-                    ),
-                    dim=1,
-                )
-
-        if use_gae:
-            G_tensor, gae_advantages = self._return_and_gae(
-                rewards,
-                terminals,
-                q_values=Qs,
-                final_bootstrap=None,
-                gamma=self.gamma,
-            )
-            return (
-                all_obs_features,
-                rewards,
-                terminals,
-                infos,
-                G_tensor.squeeze(-1),
-                gae_advantages,
-            )
-
-        bootstrap_q = Qs[-1].detach().cpu()
-        G_tensor = (
-            torch.as_tensor(G, dtype=bootstrap_q.dtype)
-            + discount * bootstrap_q
-        )
-
-        return (
-            all_obs_features,
-            rewards,
-            terminals,
-            infos,
-            G_tensor.squeeze(),
-            None,
-        )
+        return next_state.cpu().numpy(), reward, terminal, info
 
     @torch.no_grad()
     def chunk_evaluation(
@@ -594,204 +248,92 @@ class EnsembleDynamics_batch(BaseDynamics):
         state_dict: Dict = None,
         use_gae: bool = False,
     ):
-        batch_size = nactions.shape[0]
-        policy_features = nobs_features.reshape(
-            batch_size,
-            self.n_obs_steps,
-            -1,
-        )
-
-        use_state_dict_q = self._q_requires_raw_obs(Q)
-
-        if use_state_dict_q:
-            if state_dict is None:
-                raise ValueError(
-                    "chunk_evaluation requires raw state_dict when Q owns "
-                    "its observation encoder."
-                )
-            q_input = state_dict
-        else:
-            q_input = policy_features.reshape(batch_size, -1)
-
         q_owner = getattr(Q, "__self__", None)
-
         if q_owner is not None and hasattr(q_owner, "get_advantage"):
-            return q_owner.get_advantage(q_input, nactions)
+            return q_owner.get_advantage(nobs_features, nactions)
+        return Q(nobs_features, nactions)
 
-        return Q(q_input, nactions)
-
-    def learn(
-        self,
-        batch: dict,
-        nobs_features: torch.Tensor,
-        next_nobs_features: torch.Tensor,
-        logvar_loss_coef: float = 0.01,
-    ) -> float:
-        self.model.train()
-        model = self.model.module if hasattr(self.model, "module") else self.model
-
-        if self.use_conv_action_embed and not hasattr(model, "compute_loss"):
-            batch_size = nobs_features.shape[0]
-
-            if self.predict_delta:
-                targets = next_nobs_features - nobs_features
-            else:
-                targets = next_nobs_features
-
-            actions = self.obs_adapter.normalize_action(batch["action"])
-
-            if self.cfg.chunk_as_single_action:
-                start = self.n_obs_steps - 1
-                end = start + self.n_action_steps
-                action = actions[:, start:end]
-
-                if self.predict_r:
-                    reward_chunk = batch["reward"][:, start:end]
-                    not_done_chunk = None
-                    done_chunk = None
-
-                    if "not_done" in batch:
-                        not_done_chunk = batch["not_done"][:, start:end]
-                    elif "done" in batch:
-                        done_chunk = batch["done"][:, start:end]
-
-                    rewards = self._discounted_chunk_rewards(
-                        reward_chunk,
-                        not_done_chunk,
-                        done_chunk,
-                    )
-            else:
-                action = actions[:, self.n_obs_steps - 1]
-
-                if self.predict_r:
-                    rewards = batch["reward"][:, self.n_obs_steps - 1]
-
-            if self.predict_r:
-                targets = torch.cat(
-                    (targets, rewards.reshape(batch_size, -1)),
-                    dim=-1,
-                )
-
-            Da = model._single_action_dim
-            action_chunk = action.reshape(batch_size, -1, Da)
-            action_recon_beta = getattr(
-                self.cfg,
-                "action_recon_beta",
-                0.5,
-            )
-
-            return self.model(
-                nobs_features,
-                targets=targets,
-                action_chunk=action_chunk,
-                logvar_loss_coef=logvar_loss_coef,
-                action_recon_beta=action_recon_beta,
-            )
-
-        inputs_batch, targets_batch = self.format_samples_for_training(
-            batch,
-            nobs_features,
-            next_nobs_features,
-        )
-
-        if hasattr(model, "compute_loss"):
-            loss = model.compute_loss(
-                inputs_batch,
-                targets_batch,
-            )
-        else:
-            mean, logvar = self.model(inputs_batch)
-            inv_var = torch.exp(-logvar)
-            mse_loss_inv = (
-                (mean - targets_batch).pow(2) * inv_var
-            ).mean(dim=(1, 2))
-            var_loss = logvar.mean(dim=(1, 2))
-
-            loss = mse_loss_inv.sum() + var_loss.sum()
-            loss = loss + model.get_decay_loss()
-            loss = (
-                loss
-                + logvar_loss_coef * model.max_logvar.sum()
-                - logvar_loss_coef * model.min_logvar.sum()
-            )
-
-        return loss
-
-    def optimize(self, loss: float) -> None:
-        self.optim.zero_grad()
-        loss.backward()
-        self.optim.step()
-        
     @torch.no_grad()
-    def validate(
+    def rollout(
         self,
-        inputs: np.ndarray,
-        targets: np.ndarray,
-    ) -> List[float]:
-        self.model.eval()
-        model = self.model.module if hasattr(self.model, "module") else self.model
-        device = (
-            model._device
-            if hasattr(model, "_device")
-            else next(model.parameters()).device
+        policy: nn.Module,
+        Q: nn.Module,
+        iql: nn.Module,
+        batch: dict,
+        rollout_length: int,
+        is_iql: bool = True,
+        use_gae: bool = False,
+        first_action: bool = False,
+    ) -> Tuple[torch.Tensor, float]:
+        if use_gae:
+            raise NotImplementedError(
+                "GAE-based OPE is not part of the RL-100-aligned ACT V1 path."
+            )
+        if rollout_length < 1:
+            raise ValueError("rollout_length must be >= 1")
+
+        q_eval = iql.minQ if is_iql else Q
+        policy_batch = self.obs_adapter.normalize_obs(batch["obs"])
+        _, encoder_pos_embed = policy.encode_observation(policy_batch)
+        policy_features = self.obs2latent(batch["obs"])
+        rollout_qs = []
+        rewards_arr = []
+
+        for _ in range(int(rollout_length)):
+            actions, _, _ = policy.sample_action_chunk_from_latent(
+                policy_features,
+                encoder_pos_embed,
+            )
+            action_chunk = actions[:, :self.n_action_steps]
+            rollout_qs.append(q_eval(policy_features, action_chunk))
+            next_obs, reward, _, _ = self.step(
+                policy_features,
+                action_chunk,
+            )
+            rewards_arr.append(np.asarray(reward).reshape(-1))
+            policy_features = torch.as_tensor(
+                next_obs,
+                device=self.device,
+                dtype=policy_features.dtype,
+            )
+
+        q_evaluation = torch.mean(torch.stack(rollout_qs))
+        reward_mean = (
+            float(np.concatenate(rewards_arr).mean())
+            if rewards_arr
+            else 0.0
         )
-        targets = torch.as_tensor(targets).to(device)
-        mean, _ = self.model(inputs)
-        loss = ((mean - targets) ** 2).mean(dim=(1, 2))
-        return list(loss.cpu().numpy())
+        return q_evaluation, reward_mean
+
+    @torch.no_grad()
+    def compute_model_uncertainty(
+        self,
+        obs,
+        action,
+        uncertainty_mode: str = "aleatoric",
+    ) -> np.ndarray:
+        state_tokens = (
+            self.obs2latent(obs)
+            if isinstance(obs, dict)
+            else torch.as_tensor(obs, device=self.device, dtype=torch.float32)
+        )
+        mean, logvar = self.model(state_tokens, action)
+        if self.predict_delta:
+            mean = mean + state_tokens.unsqueeze(0)
+        std = torch.sqrt(torch.exp(logvar))
+        flat_std = std.cpu().numpy().reshape(std.shape[0], std.shape[1], -1)
+        if uncertainty_mode == "aleatoric":
+            penalty = np.amax(np.linalg.norm(flat_std, axis=2), axis=0)
+        elif uncertainty_mode == "ensemble_std":
+            flat_mean = mean.cpu().numpy().reshape(mean.shape[0], mean.shape[1], -1)
+            penalty = np.sqrt(flat_mean.var(0).mean(1))
+        else:
+            raise ValueError(f"Unsupported uncertainty mode: {uncertainty_mode}")
+        return self._penalty_coef * np.expand_dims(penalty, 1).astype(np.float32)
 
     def select_elites(self, metrics: List) -> List[int]:
-        pairs = [
-            (metric, index)
-            for metric, index in zip(metrics, range(len(metrics)))
-        ]
-        pairs = sorted(pairs, key=lambda x: x[0])
-        model = self.model.module if hasattr(self.model, "module") else self.model
-        return [pairs[i][1] for i in range(model.num_elites)]
-
-    def post_well_learned(self) -> None:
-        indexes = self.select_elites(self.holdout_losses)
-        model = self.model.module if hasattr(self.model, "module") else self.model
-        model.set_elites(indexes)
-        model.load_save()
-        self.logger.log(
-            "elites:{} , holdout loss: {}".format(
-                indexes,
-                np.sort(self.holdout_losses)[:model.num_elites].mean(),
-            )
-        )
-        self.save(self.logger.model_dir)
-        self.model.eval()
-
-    @torch.no_grad()
-    def validation(
-        self,
-        holdout_data: dict,
-        nobs_features: torch.Tensor,
-        next_nobs_features: torch.Tensor,
-        train_loss: float,
-        wandb,
-        epoch,
-        max_epochs_since_update=5,
-        max_epochs=500,
-    ) -> list:
-        holdout_inputs, holdout_targets = self.format_samples_for_training(
-            data=holdout_data,
-            nobs_features=nobs_features,
-            next_nobs_features=next_nobs_features,
-        )
-        new_holdout_losses = self.validate(
-            holdout_inputs,
-            holdout_targets,
-        )
-        return self._update_holdout_and_log(
-            new_holdout_losses,
-            train_loss,
-            wandb,
-            epoch,
-            max_epochs_since_update,
-            max_epochs,
-        )
+        pairs = sorted((metric, index) for index, metric in enumerate(metrics))
+        return [pairs[i][1] for i in range(self._model().num_elites)]
 
     def _update_holdout_and_log(
         self,
@@ -802,14 +344,12 @@ class EnsembleDynamics_batch(BaseDynamics):
         max_epochs_since_update=5,
         max_epochs=500,
     ) -> bool:
-        model = self.model.module if hasattr(self.model, "module") else self.model
+        model = self._model()
         holdout_loss = np.sort(new_holdout_losses)[:model.num_elites].mean()
-
         self.logger.logkv("loss/dynamics_train_loss", train_loss)
         self.logger.logkv("loss/dynamics_holdout_loss", holdout_loss)
         self.logger.set_timestep(epoch)
         self.logger.dumpkvs(exclude=["policy_training_progress"])
-
         wandb.log({"loss/dynamics_train_loss": train_loss})
         wandb.log({"loss/dynamics_holdout_loss": holdout_loss})
 
@@ -830,128 +370,37 @@ class EnsembleDynamics_batch(BaseDynamics):
         else:
             self.cnt += 1
 
-        if self.cnt >= max_epochs_since_update:
-            return True
-        if max_epochs and epoch >= max_epochs:
-            return True
-        return False
+        return (
+            self.cnt >= max_epochs_since_update
+            or bool(max_epochs and epoch >= max_epochs)
+        )
+
+    def post_well_learned(self) -> None:
+        indexes = self.select_elites(self.holdout_losses)
+        model = self._model()
+        model.set_elites(indexes)
+        model.load_save()
+        self.logger.log(
+            "elites:{} , holdout loss: {}".format(
+                indexes,
+                np.sort(self.holdout_losses)[:model.num_elites].mean(),
+            )
+        )
+        self.save(self.logger.model_dir)
+        self.model.eval()
 
     def save(self, save_path: str) -> None:
-        model = self.model.module if hasattr(self.model, "module") else self.model
+        model = self._model()
         torch.save(
             model.state_dict(),
             os.path.join(save_path, "dynamics.pth"),
         )
-        print(f"dynamics model saved in {save_path}")
-        
+
     def load(self, load_path: str) -> None:
-        model = self.model.module if hasattr(self.model, "module") else self.model
-        device = (
-            model._device
-            if hasattr(model, "_device")
-            else next(model.parameters()).device
-        )
+        model = self._model()
         model.load_state_dict(
             torch.load(
                 os.path.join(load_path, "dynamics.pth"),
-                map_location=device,
+                map_location=self.device,
             )
         )
-        print(f"dynamics model loaded from {load_path}")
-        
-    @torch.no_grad()
-    def rollout(
-        self,
-        policy: nn.Module,
-        Q: nn.Module,
-        iql: nn.Module,
-        batch: dict,
-        rollout_length: int,
-        is_iql: bool = True,
-        use_gae: bool = False,
-        first_action: bool = False,
-    ) -> Tuple[Dict[str, np.ndarray], Dict]:
-        if use_gae:
-            raise NotImplementedError(
-                "ACT V1 rollout does not support recursive GAE because "
-                "ACT cannot consume predicted dynamics latent."
-            )
-
-        q_eval = iql.minQ if is_iql else Q
-        policy_batch = self.obs_adapter.normalize_obs(batch["obs"])
-        actions, _, _ = policy.sample_action_chunk(policy_batch)
-
-        batch_size = actions.shape[0]
-        nobs_features = self.obs2latent(batch["obs"])
-        policy_features = nobs_features.reshape(
-            batch_size,
-            self.n_obs_steps,
-            -1,
-        )
-        single_nob_features = policy_features[:, -1, :]
-        rewards_arr = np.array([])
-        rollout_qs = []
-
-        if self.chunk_as_single_action:
-            if rollout_length != 1:
-                raise ValueError(
-                    "ACT V1 chunk dynamics supports rollout_length=1 only."
-                )
-
-            actions = actions[:, :self.n_action_steps]
-            rollout_qs.append(
-                q_eval(
-                    policy_features.reshape(batch_size, -1),
-                    actions,
-                )
-            )
-            _, reward, _, _ = self.step(
-                single_nob_features,
-                actions,
-                policy_features,
-            )
-            rewards_arr = np.append(rewards_arr, reward.flatten())
-        else:
-            if rollout_length < 1 or rollout_length > actions.shape[1]:
-                raise ValueError(
-                    f"ACT V1 single-step dynamics requires rollout_length "
-                    f"in [1, {actions.shape[1]}], got {rollout_length}."
-                )
-
-            model = self.model.module if hasattr(self.model, "module") else self.model
-            device = (
-                model._device
-                if hasattr(model, "_device")
-                else next(model.parameters()).device
-            )
-
-            for i in range(rollout_length):
-                action_i = actions[:, i, :self.action_dim]
-                rollout_qs.append(
-                    q_eval(
-                        policy_features.reshape(batch_size, -1),
-                        action_i,
-                    )
-                )
-                next_obs, reward, _, _ = self.step(
-                    single_nob_features,
-                    action_i,
-                    policy_features,
-                )
-                rewards_arr = np.append(rewards_arr, reward.flatten())
-
-                if self.prediction_mode == "full":
-                    policy_features = torch.from_numpy(next_obs).to(device)
-                    single_nob_features = policy_features[:, -1, :]
-                else:
-                    single_nob_features = torch.from_numpy(next_obs).to(device)
-                    policy_features = torch.cat(
-                        (
-                            policy_features[:, 1:, :],
-                            single_nob_features.unsqueeze(1),
-                        ),
-                        dim=1,
-                    )
-
-        q_evaluation = torch.mean(torch.stack(rollout_qs))
-        return q_evaluation, rewards_arr.mean()
