@@ -5,6 +5,7 @@ from collections.abc import Mapping
 
 import numpy as np
 import torch
+from lerobot.processor import NormalizerProcessorStep
 
 from .resumable_workspace import TrainACTWorkspace as _ResumableTrainACTWorkspace
 
@@ -28,7 +29,32 @@ class TrainACTWorkspace(_ResumableTrainACTWorkspace):
 
     def _build_act_observation_frontends(self) -> None:
         super()._build_act_observation_frontends()
-        self._normalizer_sha256 = self._fingerprint_stats(self.stats)
+        normalizers = [
+            step
+            for step in self.policy_preprocessor.steps
+            if isinstance(step, NormalizerProcessorStep)
+        ]
+        if len(normalizers) != 1:
+            raise RuntimeError(
+                "Expected exactly one NormalizerProcessorStep while building the "
+                "normalization contract."
+            )
+        normalizer = normalizers[0]
+        normalizer_contract = {
+            "stats": self.stats,
+            "norm_map": {
+                str(key): str(value)
+                for key, value in normalizer.norm_map.items()
+            },
+            "features": {
+                str(key): {
+                    "type": str(feature.type),
+                    "shape": list(feature.shape),
+                }
+                for key, feature in normalizer.features.items()
+            },
+        }
+        self._normalizer_sha256 = self._fingerprint_stats(normalizer_contract)
         if self.rank == 0:
             print(
                 "ACT normalization contract ready: "
