@@ -23,7 +23,7 @@ import lerobot_patches.custom_patches
 
 import hydra
 
-from post_rl.training.workspace import TrainACTWorkspace
+from post_rl.training import TrainACTWorkspace
 
 
 @hydra.main(version_base=None, config_path="../configs/rl", config_name="offline_rl")
