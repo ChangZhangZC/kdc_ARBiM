@@ -26,6 +26,14 @@ def train_dynamics(
         raise ValueError(
             "obs_adapter.fix_encoder must match cfg.dynamics.fix_encoder"
         )
+    if not cfg.dynamics.fix_encoder:
+        raise ValueError(
+            "ACT transformer-latent dynamics requires dynamics.fix_encoder=true."
+        )
+    if cfg.dynamics.get("latent_mode", None) != "transformer_encoder":
+        raise ValueError(
+            "ACT Scheme C requires dynamics.latent_mode=transformer_encoder."
+        )
     if n_obs_steps != 1 or obs_adapter.n_obs_steps != 1:
         raise ValueError(
             "ACT transformer-latent dynamics currently requires n_obs_steps=1."
@@ -61,17 +69,10 @@ def train_dynamics(
         with_reward=cfg.predict_r,
     )
 
-    if not cfg.dynamics.fix_encoder:
-        dynamics_optim = hydra.utils.instantiate(
-            cfg.optimizer,
-            params=list(dynamics_model.parameters())
-            + list(obs_adapter.encoder.parameters()),
-        )
-    else:
-        dynamics_optim = hydra.utils.instantiate(
-            cfg.optimizer,
-            params=dynamics_model.parameters(),
-        )
+    dynamics_optim = hydra.utils.instantiate(
+        cfg.optimizer,
+        params=dynamics_model.parameters(),
+    )
 
     termination_fn = get_termination_fn(task=cfg.task_name)
     dynamics = EnsembleDynamics_batch(
