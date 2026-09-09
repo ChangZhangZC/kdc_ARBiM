@@ -96,6 +96,11 @@ class EnsembleDynamics_batch(BaseDynamics):
         )
 
     def _critic_readout(self, state_tokens: torch.Tensor) -> torch.Tensor:
+        mode = str(self.cfg.critic.get("latent_readout", "mean"))
+        if mode != "mean":
+            raise ValueError(
+                f"Unsupported critic.latent_readout={mode}; Scheme C V1 supports only 'mean'."
+            )
         return self._as_tokens(state_tokens).mean(dim=1)
 
     def obs2latent(self, nobs) -> torch.Tensor:
@@ -158,7 +163,6 @@ class EnsembleDynamics_batch(BaseDynamics):
         batch: Dict,
         nobs_features: torch.Tensor,
         next_nobs_features: torch.Tensor,
-        logvar_loss_coef: float = 0.01,
     ) -> torch.Tensor:
         if self.predict_r:
             raise NotImplementedError(
@@ -176,6 +180,7 @@ class EnsembleDynamics_batch(BaseDynamics):
         mse_loss_inv = ((mean - targets).pow(2) * inv_var).mean(dim=reduce_dims)
         var_loss = logvar.mean(dim=reduce_dims)
         model = self._model()
+        logvar_loss_coef = float(self.cfg.dynamics.logvar_loss_coef)
         loss = mse_loss_inv.sum() + var_loss.sum()
         loss = loss + model.get_decay_loss()
         loss = (
