@@ -25,7 +25,7 @@ import hydra
 import torch
 import torch.distributed as dist
 
-from post_rl.training.workspace import TrainACTWorkspace
+from post_rl.training import TrainACTWorkspace
 
 
 def setup_ddp() -> None:
