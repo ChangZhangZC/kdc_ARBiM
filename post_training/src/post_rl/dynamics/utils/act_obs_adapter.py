@@ -1,5 +1,4 @@
 import torch
-import torch.distributed as dist
 import torch.nn as nn
 
 from lerobot.utils.constants import OBS_STATE
@@ -35,16 +34,12 @@ class ACTObservationAdapter:
             raise ValueError(
                 "ACT Scheme C requires a frozen transformer state encoder."
             )
-        if dist.is_available() and dist.is_initialized() and not fix_encoder:
-            raise RuntimeError(
-                "DDP dynamics training currently requires dynamics.fix_encoder=true."
-            )
 
         self.encoder = encoder
         self.stats = stats
         self.n_obs_steps = n_obs_steps
         self.device = torch.device(device)
-        self.fix_encoder = fix_encoder
+        self.fix_encoder = True
         self.feature_dim = encoder.output_dim
 
         self.encoder.to(self.device)
