@@ -5,6 +5,7 @@
 hydra-core==1.3.2
 omegaconf
 numpy
+PyYAML
 zarr
 numba
 wandb
