@@ -3,6 +3,7 @@ import os
 
 import torch
 import torch.distributed as dist
+from omegaconf import OmegaConf
 
 from .ppo import ProximalPolicyOptimization
 from ..critic.iql_critic import IQLCritic
@@ -61,6 +62,61 @@ class BehaviorProximalPolicyOptimization(ProximalPolicyOptimization):
         self._ratio_log_dir = None
         self._ratio_log_flush_interval = 50
         self._ratio_log_written_until = 0
+
+    def _resume_hparams(self) -> dict:
+        return {
+            "n_action_steps": int(self.cfg.n_action_steps),
+            "chunk_adv_clip": self.cfg.get("chunk_adv_clip", None),
+            "bppo_steps": int(self.cfg.unio4.bppo_steps),
+            "bppo_lr": float(self.cfg.unio4.bppo_lr),
+            "clip_ratio": float(self.cfg.unio4.clip_ratio),
+            "entropy_weight": float(self.cfg.unio4.entropy_weight),
+            "max_grad_norm": float(self.cfg.unio4.max_grad_norm),
+            "decay": float(self.cfg.unio4.decay),
+            "decay_stop_step": int(self.cfg.unio4.decay_stop_step),
+            "is_clip_decay": bool(self.cfg.unio4.is_clip_decay),
+            "is_bppo_lr_decay": bool(self.cfg.unio4.is_bppo_lr_decay),
+            "is_update_old_policy": bool(self.cfg.unio4.is_update_old_policy),
+            "is_linear_decay": bool(self.cfg.unio4.is_linear_decay),
+            "temperature": self.cfg.unio4.temperature,
+            "eval_step": int(self.cfg.unio4.eval_step),
+            "finetune_batch_size": int(self.cfg.unio4.finetune_batch_size),
+            "finetune_sequence_stride": int(
+                self.cfg.dataset.finetune_sequence_stride
+            ),
+            "ope_rollout_length": int(self.cfg.dynamics.ope_rollout_length),
+            "optimizer": OmegaConf.to_container(
+                self.cfg.unio4.optimizer,
+                resolve=True,
+            ),
+            "lr_scheduler": OmegaConf.to_container(
+                self.cfg.unio4.lr_scheduler,
+                resolve=True,
+            ),
+        }
+
+    def training_state_dict(self) -> dict:
+        state = super().training_state_dict()
+        state["offline_hparams"] = self._resume_hparams()
+        return state
+
+    def load_training_state_dict(self, state: dict) -> None:
+        if "offline_hparams" not in state:
+            raise KeyError("PPO resume state is missing offline_hparams.")
+        saved = state["offline_hparams"]
+        current = self._resume_hparams()
+        mismatch = {
+            key: (saved.get(key), current.get(key))
+            for key in current
+            if saved.get(key) != current.get(key)
+        }
+        if mismatch:
+            raise RuntimeError(
+                "Full PPO resume requires the original PPO/OPE hyperparameters. "
+                f"Mismatch: {mismatch}. Use input.policy_checkpoint_type=rl "
+                "for a new warm-start RL run with changed hyperparameters."
+            )
+        super().load_training_state_dict(state)
 
     def _normalize_advantage(self, advantage: torch.Tensor) -> torch.Tensor:
         flat = advantage.detach().reshape(-1).to(dtype=torch.float64)
