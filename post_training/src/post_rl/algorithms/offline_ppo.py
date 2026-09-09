@@ -263,7 +263,7 @@ class BehaviorProximalPolicyOptimization(ProximalPolicyOptimization):
         )
 
         if is_clip_decay:
-            if is_linear_decay:
+            if bool(self.cfg.unio4.is_linear_decay):
                 if clip_ratio_now is None:
                     raise ValueError("clip_ratio_now is required for linear clip decay.")
                 self._clip_ratio = clip_ratio_now
@@ -293,12 +293,13 @@ class BehaviorProximalPolicyOptimization(ProximalPolicyOptimization):
             torch.nn.utils.clip_grad_norm_(trainable_params, max_grad_norm)
         self._optimizer.step()
 
-        if is_lr_decay:
-            self._scheduler.step()
-        if is_linear_decay:
-            if bppo_lr_now is None:
-                raise ValueError("bppo_lr_now is required for linear LR decay.")
+        linear_decay = bool(self.cfg.unio4.is_linear_decay)
+        if linear_decay:
+            progress = (self.iteration - 1) / max(int(self.cfg.unio4.bppo_steps), 1)
+            lr_now = float(self.cfg.unio4.bppo_lr) * (1.0 - progress)
             for group in self._optimizer.param_groups:
-                group["lr"] = bppo_lr_now
+                group["lr"] = lr_now
+        elif is_lr_decay:
+            self._scheduler.step()
 
         return float(loss.item())
