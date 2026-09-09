@@ -2,7 +2,6 @@ import copy
 import json
 import os
 import random
-from copy import deepcopy
 
 import hydra
 import numpy as np
@@ -11,7 +10,10 @@ import torch.distributed as dist
 import tqdm
 from omegaconf import OmegaConf
 from termcolor import cprint
+from torch.utils.data import DataLoader
+from torch.utils.data.distributed import DistributedSampler
 
+from post_rl.data.offline_dataset import OfflineDataset
 from post_rl.policy.stochastic_act_config import StochasticACTConfigWrapper
 from post_rl.policy.stochastic_act_policy import StochasticACTPolicyWrapper
 from post_rl.utils.common import dict_apply
@@ -162,6 +164,15 @@ class TrainACTWorkspace(_CoreTrainACTWorkspace):
             )
         return checkpoint_type, str(cfg.input.policy_checkpoint)
 
+    def _validate_scheme_c_contract(self, cfg) -> None:
+        super()._validate_scheme_c_contract(cfg)
+        if int(cfg.unio4.bppo_steps) < 0:
+            raise ValueError("unio4.bppo_steps must be >= 0")
+        if int(cfg.unio4.eval_step) < 1:
+            raise ValueError("unio4.eval_step must be >= 1")
+        if int(cfg.unio4.checkpoint_every_steps) < 0:
+            raise ValueError("unio4.checkpoint_every_steps must be >= 0")
+
     def _apply_debug_overrides(self, cfg) -> None:
         if self._resume_metadata is None:
             return super()._apply_debug_overrides(cfg)
@@ -194,12 +205,15 @@ class TrainACTWorkspace(_CoreTrainACTWorkspace):
         )
 
     def _apply_resume_config(self, cfg) -> None:
-        if self._resume_metadata is None:
+        if self._resume_metadata is not None:
+            cfg.critic.load_pretrain = True
+            cfg.dynamics.load_pretrain = True
+            cfg.critic.artifact_dir = self._resolve_resume_artifact_dir("critic")
+            cfg.dynamics.artifact_dir = self._resolve_resume_artifact_dir("dynamics")
             return
-        cfg.critic.load_pretrain = True
-        cfg.dynamics.load_pretrain = True
-        cfg.critic.artifact_dir = self._resolve_resume_artifact_dir("critic")
-        cfg.dynamics.artifact_dir = self._resolve_resume_artifact_dir("dynamics")
+        if cfg.unio4.get("stage1_resume_dir"):
+            cfg.critic.load_pretrain = True
+            cfg.dynamics.load_pretrain = True
 
     def _validate_resume_dataset(self) -> None:
         if self._resume_metadata is None:
@@ -225,12 +239,56 @@ class TrainACTWorkspace(_CoreTrainACTWorkspace):
         self.critic._target_Q.eval()
 
     def _build_finetune_dataloader(self) -> None:
-        super()._build_finetune_dataloader()
+        cfg = self.cfg
+        stride = int(cfg.dataset.finetune_sequence_stride)
+        dataset = OfflineDataset(
+            buffer=self.buffer,
+            horizon=cfg.horizon,
+            pad_before=cfg.dataset.pad_before,
+            pad_after=cfg.dataset.pad_after,
+            sequence_stride=stride,
+            seed=cfg.training.seed,
+            val_ratio=0.0,
+            max_train_episodes=cfg.dataset.max_train_episodes,
+            use_depth=cfg.dataset.use_depth,
+        )
+        kwargs = self._dataloader_kwargs(
+            cfg.dataloader,
+            batch_size=int(cfg.unio4.finetune_batch_size),
+            shuffle=False,
+        )
+        if self.is_ddp:
+            kwargs["batch_size"] = self._per_rank_batch_size(
+                cfg.unio4.finetune_batch_size,
+                "unio4.finetune_batch_size",
+            )
+
+        self.finetune_sampler = DistributedSampler(
+            dataset,
+            num_replicas=self.world_size,
+            rank=self.rank,
+            shuffle=True,
+            seed=int(cfg.training.seed),
+            drop_last=self.is_ddp,
+        )
+        self.finetune_dataloader = DataLoader(
+            dataset,
+            sampler=self.finetune_sampler,
+            **kwargs,
+        )
+        self.finetune_dataset = dataset
+        self._finetune_iter = None
+        self._finetune_epoch = 0
         self._finetune_batch_in_epoch = 0
+        self.unio4.set_old_policy()
+        if self.rank == 0:
+            print(
+                f"Finetune dataset: {len(dataset)} samples "
+                f"(stride={stride}, batch_size={cfg.unio4.finetune_batch_size})"
+            )
 
     def _new_finetune_iterator(self):
-        if self.finetune_sampler is not None:
-            self.finetune_sampler.set_epoch(self._finetune_epoch)
+        self.finetune_sampler.set_epoch(self._finetune_epoch)
         return iter(self.finetune_dataloader)
 
     def _prime_finetune_iterator(self) -> None:
