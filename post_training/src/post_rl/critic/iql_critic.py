@@ -1,9 +1,10 @@
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
 from copy import deepcopy
 
-from net import ACTCriticEncoder, ValueMLP, QMLP, DoubleQMLP
+from .networks import ACTCriticEncoder, ValueMLP, QMLP, DoubleQMLP
 from lerobot.utils.constants import OBS_STATE
 
 RGB_BUFFER_TO_FEATURE = {
@@ -63,6 +64,10 @@ class IQLCritic(nn.Module):
             raise ValueError("encoder_update_with must be 'value', 'q', or 'both'")
         if n_obs_steps < 1 or n_action_steps < 1:
             raise ValueError("n_obs_steps and n_action_steps must be >= 1")
+        if dist.is_available() and dist.is_initialized() and not fix_encoder:
+            raise RuntimeError(
+                "DDP critic training currently requires critic.fix_encoder=true."
+            )
 
         self._device = device
         self.stats = stats
@@ -86,7 +91,6 @@ class IQLCritic(nn.Module):
         self.action_recon_beta = action_recon_beta
 
         self.state_dim = obs_encoder.output_dim * n_obs_steps
-        
         self.use_conv_action_embed = use_conv_action_embed
 
         if is_share_encoder:
@@ -119,7 +123,7 @@ class IQLCritic(nn.Module):
         )
 
         q_cls = DoubleQMLP if is_double_q else QMLP
-        
+
         self._Q = q_cls(obs_encoder=q_encoder, **q_kwargs).to(device)
         self._target_Q = q_cls(obs_encoder=target_q_encoder, **q_kwargs).to(device)
         self._target_Q.load_state_dict(self._Q.state_dict())
@@ -137,7 +141,7 @@ class IQLCritic(nn.Module):
 
         self._build_optimizers(q_lr, v_lr)
         self.train()
-        
+
     def _build_optimizers(self, q_lr: float, v_lr: float) -> None:
         if self.is_share_encoder and self.fix_encoder:
             self.obs_encoder.eval()
@@ -168,11 +172,9 @@ class IQLCritic(nn.Module):
                 self.obs_encoder.parameters(),
                 lr=min(q_lr, v_lr),
             )
-            
+
     def train(self, mode: bool = True):
         super().train(mode)
-
-        # Target Q 永远只作为稳定的 Bellman / IQL target。
         self._target_Q.eval()
 
         if not self.fix_encoder:
@@ -187,7 +189,7 @@ class IQLCritic(nn.Module):
                     encoder.eval()
 
         return self
-    
+
     def _get_stat(
         self,
         feature: str,
@@ -203,7 +205,7 @@ class IQLCritic(nn.Module):
             device=ref.device,
             dtype=torch.float32,
         )
-        
+
     def _normalize_mean_std(
         self,
         x: torch.Tensor,
@@ -220,7 +222,7 @@ class IQLCritic(nn.Module):
             std = std.view(*shape)
 
         return (x - mean) / (std + 1e-8)
-    
+
     def _normalize_min_max(
         self,
         x: torch.Tensor,
@@ -237,7 +239,7 @@ class IQLCritic(nn.Module):
             max_v = max_v.view(*shape)
 
         return 2.0 * (x - min_v) / (max_v - min_v + 1e-8) - 1.0
-    
+
     def _normalize_obs(
         self,
         obs: dict[str, torch.Tensor],
@@ -264,13 +266,13 @@ class IQLCritic(nn.Module):
                 )
 
         return normalized
-    
+
     def _normalize_action(
         self,
         action: torch.Tensor,
     ) -> torch.Tensor:
         return self._normalize_mean_std(action, ACTION_FEATURE)
-        
+
     def _prepare_obs(
         self,
         obs: dict[str, torch.Tensor],
@@ -296,7 +298,6 @@ class IQLCritic(nn.Module):
 
         return prepared, batch_size
 
-    
     def _encode_shared_obs(
         self,
         obs: dict[str, torch.Tensor],
@@ -314,7 +315,7 @@ class IQLCritic(nn.Module):
                 features = self.obs_encoder(obs)
 
         return features.reshape(batch_size, self.state_dim)
-    
+
     def _prepare_action(
         self,
         action: torch.Tensor,
@@ -328,7 +329,7 @@ class IQLCritic(nn.Module):
             )
 
         return action
-    
+
     def minQ(
         self,
         s: torch.Tensor | dict[str, torch.Tensor],
@@ -347,7 +348,7 @@ class IQLCritic(nn.Module):
             return torch.min(q1, q2)
 
         return self._Q(s, a)
-    
+
     def target_minQ(
         self,
         s: torch.Tensor | dict[str, torch.Tensor],
@@ -366,7 +367,7 @@ class IQLCritic(nn.Module):
             return torch.min(q1, q2)
 
         return self._target_Q(s, a)
-    
+
     def expectile_loss(
         self,
         error: torch.Tensor,
@@ -377,7 +378,7 @@ class IQLCritic(nn.Module):
             1.0 - self._omega,
         )
         return weight * error.pow(2)
-    
+
     @staticmethod
     def _as_column(
         tensor: torch.Tensor,
@@ -392,7 +393,7 @@ class IQLCritic(nn.Module):
             )
 
         return tensor
-    
+
     def _select_transition(
         self,
         batch: dict,
@@ -445,7 +446,7 @@ class IQLCritic(nn.Module):
         )
 
         return action, reward, not_done
-    
+
     def _prepare_nonshared_obs(
         self,
         batch: dict,
@@ -464,7 +465,7 @@ class IQLCritic(nn.Module):
         )
 
         return obs, next_obs
-    
+
     def _update_value(
         self,
         batch: dict,
@@ -511,7 +512,7 @@ class IQLCritic(nn.Module):
         self._v_optimizer.step()
 
         return value_loss
-    
+
     def _update_q(
         self,
         batch: dict,
@@ -554,13 +555,16 @@ class IQLCritic(nn.Module):
             with torch.no_grad():
                 next_v = self._value(next_obs)
 
-        target_q = (reward + not_done * (self._gamma ** self.n_action_steps) * next_v)
+        target_q = reward + not_done * (self._gamma ** self.n_action_steps) * next_v
 
         action_recon_loss = None
-
         if self._is_double_q:
             if self.use_conv_action_embed:
-                q1, q2, action_recon_loss = self._Q(q_input,action,return_action_recon_loss=True,)
+                q1, q2, action_recon_loss = self._Q(
+                    q_input,
+                    action,
+                    return_action_recon_loss=True,
+                )
             else:
                 q1, q2 = self._Q(q_input, action)
 
@@ -579,10 +583,7 @@ class IQLCritic(nn.Module):
             q_loss = F.mse_loss(q, target_q)
 
         if action_recon_loss is not None:
-            q_loss = (
-                q_loss
-                + self.action_recon_beta * action_recon_loss
-            )
+            q_loss = q_loss + self.action_recon_beta * action_recon_loss
 
         self._q_optimizer.zero_grad()
         q_loss.backward()
@@ -596,7 +597,7 @@ class IQLCritic(nn.Module):
             self._encoder_optimizer.step()
 
         return q_loss
-    
+
     def _update_target_q(self) -> None:
         self._total_update_step += 1
 
@@ -645,8 +646,8 @@ class IQLCritic(nn.Module):
             return self._value(s)
 
         s, _ = self._prepare_obs(s)
-        return self._value(s)    
-    
+        return self._value(s)
+
     @torch.no_grad()
     def get_advantage(
         self,
@@ -679,7 +680,7 @@ class IQLCritic(nn.Module):
 
         v = self._value(s)
         return q - v
-    
+
     def save(
         self,
         q_path: str,
@@ -699,7 +700,7 @@ class IQLCritic(nn.Module):
                 else self.obs_encoder
             )
             torch.save(encoder.state_dict(), encoder_path)
-            
+
     def load(
         self,
         q_path: str,
@@ -707,9 +708,7 @@ class IQLCritic(nn.Module):
         encoder_path: str | None = None,
     ) -> None:
         self._Q.load_state_dict(torch.load(q_path, map_location=self._device))
-
         self._target_Q.load_state_dict(self._Q.state_dict())
-
         self._value.load_state_dict(torch.load(v_path, map_location=self._device))
 
         if self.is_share_encoder and encoder_path is not None:

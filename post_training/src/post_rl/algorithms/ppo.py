@@ -1,8 +1,10 @@
 from copy import deepcopy
 
+import hydra
 import torch
+import torch.distributed as dist
 
-from StochasticACTPolicyWrapper import StochasticACTPolicyWrapper
+from ..policy.stochastic_act_policy import StochasticACTPolicyWrapper
 
 
 class ProximalPolicyOptimization:
@@ -14,82 +16,76 @@ class ProximalPolicyOptimization:
         clip_ratio: float,
         entropy_weight: float,
         decay: float,
-        omega: float,
-        batch_size: int,
-        is_iql: bool,
-        ratio_strategy: str,
+        optimizer_cfg,
+        lr_scheduler_cfg,
         fix_encoder: bool,
     ) -> None:
+        if not fix_encoder:
+            raise ValueError(
+                "ACT Scheme C requires unio4.fix_encoder=true so the OPE latent space stays fixed."
+            )
+
         self._device = device
         self._policy = deepcopy(policy).to(device)
-        self._fix_encoder = fix_encoder
-        self._policy_lr = policy_lr
-        self._clip_ratio = clip_ratio
-        self._entropy_weight = entropy_weight
-        self._decay = decay
-        self._omega = omega
-        self._batch_size = batch_size
-        self._is_iql = is_iql
-        self._ratio_strategy = ratio_strategy
-        
-        if ratio_strategy not in {"per_step", "scalar"}:
-            raise ValueError(
-                f"Unsupported ratio_strategy={ratio_strategy}. "
-                "Expected 'per_step' or 'scalar'."
-            )
-        
+        self._policy_lr = float(policy_lr)
+        self._clip_ratio = float(clip_ratio)
+        self._entropy_weight = float(entropy_weight)
+        self._decay = float(decay)
+        self._optimizer_cfg = optimizer_cfg
+        self._lr_scheduler_cfg = lr_scheduler_cfg
+        self._grad_hook_handles = []
+        self._old_policy_version = 0
+
         self._policy.eval()
         self.set_old_policy()
         self._build_optimizer()
         self._build_scheduler()
 
-
-        
     def _configure_trainable_params(self) -> None:
         for param in self._policy.parameters():
             param.requires_grad = True
-        if not self._fix_encoder:
-            return
 
         model = self._policy.model
-        frontend_names = [
-            "backbone",
-            "encoder_img_feat_input_proj",
-            "encoder_robot_state_input_proj",
-            "encoder_env_state_input_proj",
-            "depth_backbone",
-            "encoder_depth_feat_input_proj",
-            "cross_modal_fusion",
-            "cross_modal_fusion_proj",
-        ]
-        for name in frontend_names:
+        model.requires_grad_(False)
+        for name in ("decoder", "decoder_pos_embed", "action_head"):
             module = getattr(model, name, None)
             if module is not None:
-                module.requires_grad_(False)
-                module.eval()
-                
+                module.requires_grad_(True)
+        self._policy.raw_log_std.requires_grad_(True)
+
+    def _register_gradient_sync_hooks(self, params) -> None:
+        for handle in self._grad_hook_handles:
+            handle.remove()
+        self._grad_hook_handles = []
+
+        if not dist.is_available() or not dist.is_initialized():
+            return
+        world_size = dist.get_world_size()
+
+        def sync_grad(grad):
+            dist.all_reduce(grad, op=dist.ReduceOp.SUM)
+            return grad / world_size
+
+        for param in params:
+            self._grad_hook_handles.append(param.register_hook(sync_grad))
+
     def _build_optimizer(self) -> None:
         self._configure_trainable_params()
-        params = [p for p in self._policy.parameters() if p.requires_grad]
+        params = [param for param in self._policy.parameters() if param.requires_grad]
         if not params:
             raise RuntimeError("PPO policy has no trainable parameters.")
-        self._optimizer = torch.optim.Adam(params, lr=self._policy_lr)
-        
-    def weighted_advantage(self, advantage: torch.Tensor) -> torch.Tensor:
-        if self._omega == 0.5:
-            return advantage
-        weight = torch.where(
-            advantage > 0,
-            torch.as_tensor(self._omega, device=advantage.device, dtype=advantage.dtype),
-            torch.as_tensor(1.0 - self._omega, device=advantage.device, dtype=advantage.dtype),
+        self._register_gradient_sync_hooks(params)
+        self._optimizer = hydra.utils.instantiate(
+            self._optimizer_cfg,
+            params=params,
+            lr=self._policy_lr,
         )
-        return weight * advantage
 
-    @staticmethod
-    def _sum_step_event_dims(x: torch.Tensor) -> torch.Tensor:
-        if x.ndim != 3:
-            raise ValueError(f"Expected [B,H,D], got {tuple(x.shape)}")
-        return x.sum(dim=-1)
+    def _build_scheduler(self) -> None:
+        self._scheduler = hydra.utils.instantiate(
+            self._lr_scheduler_cfg,
+            optimizer=self._optimizer,
+        )
 
     @staticmethod
     def _sum_chunk_event_dims(x: torch.Tensor) -> torch.Tensor:
@@ -97,123 +93,31 @@ class ProximalPolicyOptimization:
             raise ValueError(f"Expected [B,H,D], got {tuple(x.shape)}")
         return x.reshape(x.shape[0], -1).sum(dim=-1)
 
-    def _reduce_event_dims(self, x: torch.Tensor) -> torch.Tensor:
-        if self._ratio_strategy == "per_step":
-            return self._sum_step_event_dims(x)
-        if self._ratio_strategy == "scalar":
-            return self._sum_chunk_event_dims(x)
-        raise ValueError(
-            f"Unsupported ratio_strategy={self._ratio_strategy}. "
-            "Expected 'per_step' or 'scalar'."
+    def _sync_old_policy(self) -> None:
+        if not dist.is_available() or not dist.is_initialized():
+            return
+
+        version = torch.tensor(
+            [self._old_policy_version],
+            device=self._device,
+            dtype=torch.long,
         )
-        
-    def _align_advantage(
-        self,
-        advantage: torch.Tensor,
-        ratio: torch.Tensor,
-    ) -> torch.Tensor:
-        if self._ratio_strategy == "scalar":
-            advantage = advantage.reshape(advantage.shape[0], -1)
-            if advantage.shape[1] != 1:
-                raise ValueError(
-                    f"Scalar ratio requires scalar advantage, got {tuple(advantage.shape)}"
-                )
-            return advantage[:, 0]
-
-        if advantage.ndim == 1:
-            advantage = advantage.unsqueeze(-1)
-        elif advantage.ndim == 3 and advantage.shape[-1] == 1:
-            advantage = advantage.squeeze(-1)
-        if advantage.ndim != 2:
-            raise ValueError(
-                f"Per-step ratio requires advantage [B,1] or [B,H], got {tuple(advantage.shape)}"
-            )
-        if advantage.shape[1] not in {1, ratio.shape[1]}:
-            raise ValueError(
-                f"Advantage shape {tuple(advantage.shape)} cannot match ratio "
-                f"shape {tuple(ratio.shape)}"
-            )
-        return advantage
-
-    def loss(
-        self,
-        obs: dict,
-        action: torch.Tensor,
-        advantage: torch.Tensor,
-        is_clip_decay: bool = False,
-        is_linear_decay: bool = False,
-        clip_ratio_now: float = None,
-    ) -> torch.Tensor:
-        action = action.detach()
-        advantage = advantage.detach()
-
-        with torch.no_grad():
-            old_log_prob_raw, _ = self._old_policy.evaluate_action_chunk(obs, action)
-
-        new_log_prob_raw, entropy_raw = self._policy.evaluate_action_chunk(obs, action)
-        old_log_prob = self._reduce_event_dims(old_log_prob_raw)
-        new_log_prob = self._reduce_event_dims(new_log_prob_raw)
-        entropy = self._reduce_event_dims(entropy_raw)
-
-        ratio = torch.exp(new_log_prob - old_log_prob)
-        advantage = self.weighted_advantage(advantage.detach())
-        advantage = self._align_advantage(advantage, ratio)
-
-        if is_clip_decay:
-            if is_linear_decay:
-                if clip_ratio_now is None:
-                    raise ValueError("clip_ratio_now is required for linear clip decay.")
-                self._clip_ratio = clip_ratio_now
-            else:
-                self._clip_ratio *= self._decay
-
-        loss1 = ratio * advantage
-        loss2 = torch.clamp(
-            ratio,
-            1.0 - self._clip_ratio,
-            1.0 + self._clip_ratio,
-        ) * advantage
-        entropy_bonus = entropy * self._entropy_weight
-        return -(torch.min(loss1, loss2) + entropy_bonus).mean()
-    
-    def update(
-        self,
-        obs: dict,
-        action: torch.Tensor,
-        advantage: torch.Tensor,
-        is_clip_decay: bool = False,
-        is_lr_decay: bool = False,
-        is_linear_decay: bool = False,
-        bppo_lr_now: float = None,
-        clip_ratio_now: float = None,
-    ) -> float:
-        policy_loss = self.loss(
-            obs=obs,
-            action=action,
-            advantage=advantage,
-            is_clip_decay=is_clip_decay,
-            is_linear_decay=is_linear_decay,
-            clip_ratio_now=clip_ratio_now,
+        dist.broadcast(version, src=0)
+        target_version = int(version.item())
+        needs_sync = torch.tensor(
+            [int(self._old_policy_version != target_version)],
+            device=self._device,
+            dtype=torch.long,
         )
+        dist.all_reduce(needs_sync, op=dist.ReduceOp.MAX)
+        if int(needs_sync.item()) == 0:
+            return
 
-        self._optimizer.zero_grad()
-        policy_loss.backward()
-        trainable_params = [
-            p for p in self._policy.parameters()
-            if p.requires_grad and p.grad is not None
-        ]
-        torch.nn.utils.clip_grad_norm_(trainable_params, 0.5)
-        self._optimizer.step()
-
-        if is_lr_decay:
-            self._scheduler.step()
-        if is_linear_decay:
-            if bppo_lr_now is None:
-                raise ValueError("bppo_lr_now is required for linear LR decay.")
-            for group in self._optimizer.param_groups:
-                group["lr"] = bppo_lr_now
-
-        return policy_loss.item()
+        for param in self._old_policy.parameters():
+            dist.broadcast(param.data, src=0)
+        for buffer in self._old_policy.buffers():
+            dist.broadcast(buffer.data, src=0)
+        self._old_policy_version = target_version
 
     @torch.no_grad()
     def select_action(
@@ -226,23 +130,67 @@ class ProximalPolicyOptimization:
         action, _, _ = self._policy.sample_action_chunk(obs)
         return action
 
-    def _build_scheduler(self) -> None:
-        self._scheduler = torch.optim.lr_scheduler.StepLR(
-            self._optimizer,
-            step_size=2,
-            gamma=0.98,
-        )
+    def training_state_dict(self) -> dict:
+        state = {
+            "policy": self._policy.state_dict(),
+            "old_policy": self._old_policy.state_dict(),
+            "optimizer": self._optimizer.state_dict(),
+            "scheduler": self._scheduler.state_dict(),
+            "policy_lr": self._policy_lr,
+            "clip_ratio": self._clip_ratio,
+            "entropy_weight": self._entropy_weight,
+            "decay": self._decay,
+            "old_policy_version": self._old_policy_version,
+        }
+        if hasattr(self, "iteration"):
+            state["iteration"] = int(self.iteration)
+        return state
+
+    def load_training_state_dict(self, state: dict) -> None:
+        required = {
+            "policy",
+            "old_policy",
+            "optimizer",
+            "scheduler",
+            "policy_lr",
+            "clip_ratio",
+            "entropy_weight",
+            "decay",
+            "old_policy_version",
+        }
+        missing = sorted(required.difference(state))
+        if missing:
+            raise KeyError(f"PPO resume state is missing keys: {missing}")
+
+        self._policy.load_state_dict(state["policy"], strict=True)
+        self._old_policy.load_state_dict(state["old_policy"], strict=True)
+        self._policy_lr = float(state["policy_lr"])
+        self._clip_ratio = float(state["clip_ratio"])
+        self._entropy_weight = float(state["entropy_weight"])
+        self._decay = float(state["decay"])
+        self._old_policy_version = int(state["old_policy_version"])
+        if "iteration" in state and hasattr(self, "iteration"):
+            self.iteration = int(state["iteration"])
+
+        self._optimizer.load_state_dict(state["optimizer"])
+        self._scheduler.load_state_dict(state["scheduler"])
+        self._policy.eval()
+        self._old_policy.eval()
+        for param in self._old_policy.parameters():
+            param.requires_grad = False
 
     def save(self, path: str) -> None:
         self._policy.save_pretrained(path)
-        
+
     def load(self, path: str) -> None:
-        self._policy = StochasticACTPolicyWrapper.from_pretrained(path).to(self._device)
+        self._policy = StochasticACTPolicyWrapper.from_pretrained(path).to(
+            self._device
+        )
         self._policy.eval()
         self.set_old_policy()
         self._build_optimizer()
         self._build_scheduler()
-        
+
     def set_policy(
         self,
         policy: StochasticACTPolicyWrapper,
@@ -256,9 +204,10 @@ class ProximalPolicyOptimization:
         self._old_policy.eval()
         self._build_optimizer()
         self._build_scheduler()
-        
+
     def set_old_policy(self) -> None:
         self._old_policy = deepcopy(self._policy).to(self._device)
         self._old_policy.eval()
         for param in self._old_policy.parameters():
             param.requires_grad = False
+        self._old_policy_version += 1

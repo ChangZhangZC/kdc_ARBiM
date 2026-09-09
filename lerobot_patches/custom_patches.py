@@ -12,6 +12,7 @@ class FeatureType(str, Enum):
     ENV = "ENV"
     ACTION = "ACTION"
     REWARD = "REWARD"
+    LANGUAGE = "LANGUAGE"
     RGB = "RGB"
     DEPTH = "DEPTH"
 
@@ -171,7 +172,7 @@ sys.modules["lerobot.datasets.utils"] = lerobot_datasets_utils
 
 #     Returns:
 #         dict: A dictionary where keys are modalities and values are `nn.ParameterDict` containing
-#             `nn.Parameters` set to `requires_grad=False`, suitable to not be updated during backpropagation.
+#         `nn.Parameters` set to `requires_grad=False`, suitable to not be updated during backpropagation.
 #     """
 #     stats_buffers = {}
 
@@ -246,7 +247,3 @@ sys.modules["lerobot.datasets.utils"] = lerobot_datasets_utils
 # lerobot_policies_normalize = importlib.import_module("lerobot.policies.normalize")
 # lerobot_policies_normalize.create_stats_buffers = create_stats_buffers
 # sys.modules["lerobot.policies.normalize"] = lerobot_policies_normalize
-
-
-
-

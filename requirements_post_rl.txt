@@ -1,0 +1,19 @@
+# Install PyTorch / torchvision for the target CUDA version before this file.
+-e third_party/lerobot
+-e .
+
+hydra-core==1.3.2
+omegaconf
+numpy
+PyYAML
+zarr
+numba
+wandb
+tqdm
+termcolor
+tensorboardX
+matplotlib
+einops
+safetensors
+huggingface_hub
+pympler

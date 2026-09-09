@@ -1,23 +1,35 @@
-import os
-import yaml
 import argparse
-import numpy as np
-from tqdm import tqdm
+import gc
+import os
+import shutil
+import sys
 from pathlib import Path
 
-import gc
-import shutil
-
+import numpy as np
+import yaml
 import zarr
 from termcolor import cprint
+from tqdm import tqdm
 
-# (待确认)这里可能会有包导入路径的问题
+REPO_ROOT = Path(__file__).resolve().parents[4]
+LEROBOT_SRC = REPO_ROOT / "third_party" / "lerobot" / "src"
+
+if not LEROBOT_SRC.is_dir():
+    raise RuntimeError(
+        "LeRobot submodule is not initialized. "
+        "Run `git submodule update --init --recursive`."
+    )
+
+for path in (REPO_ROOT, LEROBOT_SRC):
+    path_str = str(path)
+    if path_str not in sys.path:
+        sys.path.insert(0, path_str)
+
+import lerobot_patches.custom_patches
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
 
-DEFAULT_CONFIG_PATH = os.path.join(
-    os.path.dirname(os.path.abspath(__file__)),
-    'configs',
-    'data_prepare.yaml',
+DEFAULT_CONFIG_PATH = str(
+    REPO_ROOT / "post_training" / "configs" / "data" / "data_prepare.yaml"
 )
 
 RGB_FEATURE_TO_BUFFER = {
@@ -37,16 +49,13 @@ ZARR_CHUNK_LEAD = 50
 
 
 def load_config(path):
-
     with open(path, 'r') as f:
         cfg = yaml.safe_load(f) or {}
 
-    # （待确认）Reward 相关，后续要改
     cfg.setdefault('lambda_penalty', 0.05)
     cfg.setdefault('smooth_penalty', 0.01)
-    
     cfg.setdefault('max_episode_len', 2000)
-    cfg.setdefault("use_depth",False)
+    cfg.setdefault("use_depth", False)
     cfg.setdefault('overwrite', True)
     cfg.setdefault('teleop_sources', [])
 
@@ -252,21 +261,16 @@ def process_raw_teleop_to_npy(config):
                     )
             reward = float(t == episode_length - 1)
 
-            # episode length penalty
             if reward == 1.0:
                 reward -= lambda_penalty * episode_length / max_episode_len
 
-            # action smoothness penalty
             if previous_action is not None:
                 reward -= smooth_penalty * np.linalg.norm(action - previous_action)
 
             previous_action = action
-
-            # terminal
-            done = (t == episode_length - 1)
+            done = t == episode_length - 1
             timeout = done
 
-            # store
             data["agent_pos"].append(state)
             data["action"].append(action)
             data["rgb"].append(rgb)
@@ -282,7 +286,7 @@ def process_raw_teleop_to_npy(config):
     if out_dir:
         os.makedirs(out_dir, exist_ok=True)
     np.save(output_path, data)
-    cprint(f"Saved processed LeRobot npy to {output_path}","green")
+    cprint(f"Saved processed LeRobot npy to {output_path}", "green")
 
 
 def make_buffers(use_depth=False):
@@ -418,27 +422,28 @@ def append_processed_transitions(data, buffers, source_name, config):
         f'transitions: {appended_transitions}'
     )
 
+
 def safe_prepare_output_dir(path, overwrite):
     if os.path.exists(path):
         if not overwrite:
-            cprint(f'output {path} already exists and overwrite=false','red')
+            cprint(f'output {path} already exists and overwrite=false', 'red')
             raise SystemExit(1)
-        
-        cprint(f'overwriting {path}','yellow')
+
+        cprint(f'overwriting {path}', 'yellow')
         shutil.rmtree(path)
 
     parent = os.path.dirname(path)
 
     if parent:
-        os.makedirs(parent,exist_ok=True)
-        
+        os.makedirs(parent, exist_ok=True)
 
-def compute_return(reward,not_done,gamma=RETURN_GAMMA):
+
+def compute_return(reward, not_done, gamma=RETURN_GAMMA):
     size_ = len(reward)
-    return_ = np.zeros((size_, 1),dtype=np.float32)
+    return_ = np.zeros((size_, 1), dtype=np.float32)
     pre_return = 0.0
 
-    for i in tqdm(reversed(range(size_)),total=size_,desc='Computing returns'):
+    for i in tqdm(reversed(range(size_)), total=size_, desc='Computing returns'):
         return_[i] = (
             reward[i]
             + gamma
@@ -449,6 +454,7 @@ def compute_return(reward,not_done,gamma=RETURN_GAMMA):
         pre_return = return_[i]
 
     return return_
+
 
 def write_zarr(buffers, output_path, overwrite):
     """Write multimodal RL transition buffers to a Zarr dataset."""
@@ -493,7 +499,6 @@ def write_zarr(buffers, output_path, overwrite):
                 kwargs['compressor'] = compressor
             return group.create_dataset(name, **kwargs)
 
-        # Zarr v3 fallback
         kwargs = {'data': array, 'overwrite': True}
         if chunks is not None:
             kwargs['chunks'] = chunks
@@ -509,7 +514,6 @@ def write_zarr(buffers, output_path, overwrite):
         rgb = np.stack(buffers[buffer_name], axis=0)
         next_rgb = np.stack(buffers[next_buffer_name], axis=0)
 
-        # Important: Keep RGB original dtype. Do NOT convert to float32.
         rgb_chunks = (ZARR_CHUNK_LEAD, *rgb.shape[1:])
         next_rgb_chunks = (ZARR_CHUNK_LEAD, *next_rgb.shape[1:])
 
@@ -538,7 +542,6 @@ def write_zarr(buffers, output_path, overwrite):
             depth = np.stack(buffers[buffer_name], axis=0)
             next_depth = np.stack(buffers[next_buffer_name], axis=0)
 
-            # Keep current upstream depth dtype. No float32 conversion / normalization here.
             depth_chunks = (ZARR_CHUNK_LEAD, *depth.shape[1:])
             next_depth_chunks = (ZARR_CHUNK_LEAD, *next_depth.shape[1:])
 
@@ -590,15 +593,17 @@ def write_zarr(buffers, output_path, overwrite):
     cprint(f'episode_ends shape: {episode_ends.shape}, episodes: {len(episode_ends)}', 'green')
     cprint(f'Saved zarr file to {output_path}', 'green')
 
+
 def source_id(source):
     return source.get('name') or source['path']
 
 
 def record_source(buffers, kind, source):
-    entry = {'kind': kind,'name': source_id(source),'path': source.get('path'),}
+    entry = {'kind': kind, 'name': source_id(source), 'path': source.get('path')}
 
     if entry not in buffers['source_manifest']:
         buffers['source_manifest'].append(entry)
+
 
 def run_build_zarr(config):
     """
@@ -629,16 +634,13 @@ def run_build_zarr(config):
         name = source_id(src)
         cprint(f'[teleop:{name}] loading {source_path}', 'cyan')
 
-        # Load processed .npy and convert frame-aligned data into RL transitions
         processed_data = load_processed_npy(source_path)
         append_processed_transitions(processed_data, buffers, name, config)
         record_source(buffers, 'teleop_npy', src)
 
-        # processed_data can be large because it contains RGB/depth.
         del processed_data
         gc.collect()
 
-    # Write final Zarr
     write_zarr(buffers, output_path, overwrite)
 
 

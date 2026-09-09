@@ -1,69 +1,110 @@
+import os
+from pathlib import Path
+
 import torch
 from torch import Tensor
 from torch.distributions import Normal
-
-import os
-from pathlib import Path
 from safetensors.torch import load_model
 from huggingface_hub import hf_hub_download
 from huggingface_hub.constants import SAFETENSORS_SINGLE_FILE
 from huggingface_hub.errors import HfHubHTTPError
 
-from kuavo_train.wrapper.policy.act.StochasticACTConfigWrapper import StochasticACTConfigWrapper
-from kuavo_train.wrapper.policy.act.ACTPolicyWrapper import CustomACTPolicyWrapper, OBS_DEPTH
-from lerobot.utils.constants import ACTION, OBS_IMAGES
+from .act_latent import decode_act_state, encode_act_state, prepare_act_model_batch
+from .stochastic_act_config import StochasticACTConfigWrapper
+from kuavo_train.wrapper.policy.act.ACTPolicyWrapper import CustomACTPolicyWrapper
+from lerobot.utils.constants import ACTION
 
 
 class StochasticACTPolicyWrapper(CustomACTPolicyWrapper):
-    
     def __init__(self, config: StochasticACTConfigWrapper):
         super().__init__(config)
-        
+
         action_shape = config.action_feature.shape
         if len(action_shape) != 1:
             raise ValueError(f"Expected 1D action feature, got shape={action_shape}")
         action_dim = action_shape[0]
-        
-        init_ratio = (config.init_log_std - config.log_std_min) / (config.log_std_max - config.log_std_min)
+
+        init_ratio = (
+            (config.init_log_std - config.log_std_min)
+            / (config.log_std_max - config.log_std_min)
+        )
         raw_init = torch.logit(torch.tensor(init_ratio, dtype=torch.float32))
         self.raw_log_std = torch.nn.Parameter(raw_init.repeat(action_dim))
 
     def _get_log_std(self) -> Tensor:
-        return self.config.log_std_min + (self.config.log_std_max - self.config.log_std_min) * torch.sigmoid(self.raw_log_std)
+        return self.config.log_std_min + (
+            self.config.log_std_max - self.config.log_std_min
+        ) * torch.sigmoid(self.raw_log_std)
 
     def _get_std(self) -> Tensor:
         return self._get_log_std().exp()
-    
-    # RL 上层调用这个函数时 policy/model 必须处于 eval() mode。
-    def get_action_mean(self, batch: dict[str, Tensor]) -> Tensor:
+
+    def _prepare_model_batch(self, batch: dict[str, Tensor]) -> dict[str, Tensor]:
         model_batch = dict(batch)
         model_batch.pop(ACTION, None)
         model_batch.pop("action_is_pad", None)
-        if self.config.image_features:
-            model_batch[OBS_IMAGES] = [model_batch[key] for key in self.config.image_features]
-        if self.config.use_depth and self.config.depth_features:
-            model_batch[OBS_DEPTH] = [model_batch[key].mean(dim=-3, keepdim=True) for key in self.config.depth_features]
-        return self.model(model_batch)[0]
-    
+        return prepare_act_model_batch(self.config, model_batch)
+
+    def encode_observation(
+        self,
+        batch: dict[str, Tensor],
+    ) -> tuple[Tensor, Tensor]:
+        model_batch = self._prepare_model_batch(batch)
+        return encode_act_state(self.model, model_batch)
+
+    def get_action_mean(self, batch: dict[str, Tensor]) -> Tensor:
+        latent, encoder_pos_embed = self.encode_observation(batch)
+        return self.get_action_mean_from_latent(latent, encoder_pos_embed)
+
+    def get_action_mean_from_latent(
+        self,
+        latent: Tensor,
+        encoder_pos_embed: Tensor,
+    ) -> Tensor:
+        return decode_act_state(self.model, latent, encoder_pos_embed)
+
     def get_distribution(self, batch: dict[str, Tensor]) -> Normal:
         mu = self.get_action_mean(batch)
-        std = self._get_std()
-        return Normal(mu, std)
-    
-    def sample_action_chunk(self, batch: dict[str, Tensor]) -> tuple[Tensor, Tensor, Tensor]:
+        return Normal(mu, self._get_std())
+
+    def get_distribution_from_latent(
+        self,
+        latent: Tensor,
+        encoder_pos_embed: Tensor,
+    ) -> Normal:
+        mu = self.get_action_mean_from_latent(latent, encoder_pos_embed)
+        return Normal(mu, self._get_std())
+
+    def sample_action_chunk(
+        self,
+        batch: dict[str, Tensor],
+    ) -> tuple[Tensor, Tensor, Tensor]:
         dist = self.get_distribution(batch)
         action = dist.sample()
         return action, dist.log_prob(action), dist.entropy()
-    
-    def evaluate_action_chunk(self, batch: dict[str, Tensor], action_chunk: Tensor) -> tuple[Tensor, Tensor]:
+
+    def sample_action_chunk_from_latent(
+        self,
+        latent: Tensor,
+        encoder_pos_embed: Tensor,
+    ) -> tuple[Tensor, Tensor, Tensor]:
+        dist = self.get_distribution_from_latent(latent, encoder_pos_embed)
+        action = dist.sample()
+        return action, dist.log_prob(action), dist.entropy()
+
+    def evaluate_action_chunk(
+        self,
+        batch: dict[str, Tensor],
+        action_chunk: Tensor,
+    ) -> tuple[Tensor, Tensor]:
         dist = self.get_distribution(batch)
         return dist.log_prob(action_chunk), dist.entropy()
-    
+
     @torch.no_grad()
     def predict_action_chunk(self, batch: dict[str, Tensor]) -> Tensor:
         self.eval()
         return self.get_action_mean(batch)
-    
+
     @classmethod
     def from_il_pretrained(
         cls,
@@ -82,8 +123,12 @@ class StochasticACTPolicyWrapper(CustomACTPolicyWrapper):
         revision: str | None = None,
         **kwargs,
     ) -> "StochasticACTPolicyWrapper":
-        if config is not None and any(v is not None for v in (init_log_std, log_std_min, log_std_max)):
-            raise ValueError("Do not pass stochastic parameters together with an explicit config.")
+        if config is not None and any(
+            v is not None for v in (init_log_std, log_std_min, log_std_max)
+        ):
+            raise ValueError(
+                "Do not pass stochastic parameters together with an explicit config."
+            )
         if config is None:
             config = StochasticACTConfigWrapper.from_il_pretrained(
                 pretrained_name_or_path,
@@ -117,16 +162,26 @@ class StochasticACTPolicyWrapper(CustomACTPolicyWrapper):
                     local_files_only=local_files_only,
                 )
             except HfHubHTTPError as e:
-                raise FileNotFoundError(f"{SAFETENSORS_SINGLE_FILE} not found in {model_id}") from e
+                raise FileNotFoundError(
+                    f"{SAFETENSORS_SINGLE_FILE} not found in {model_id}"
+                ) from e
 
         policy = cls(config)
-        missing, unexpected = load_model(policy, model_file, strict=False, device=config.device)
+        missing, unexpected = load_model(
+            policy,
+            model_file,
+            strict=False,
+            device=config.device,
+        )
         if set(missing) != {"raw_log_std"} or unexpected:
-            raise RuntimeError(f"Invalid IL checkpoint migration: missing={sorted(missing)}, unexpected={sorted(unexpected)}")
+            raise RuntimeError(
+                f"Invalid IL checkpoint migration: "
+                f"missing={sorted(missing)}, unexpected={sorted(unexpected)}"
+            )
         policy.to(config.device)
         policy.eval()
-        return policy  
-    
+        return policy
+
     @classmethod
     def from_pretrained(
         cls,

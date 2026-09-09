@@ -22,27 +22,17 @@ os.chdir(REPO_ROOT)
 import lerobot_patches.custom_patches
 
 import hydra
-import torch
-import torch.distributed as dist
 
 from post_rl.training import TrainACTWorkspace
 
 
-def setup_ddp() -> None:
-    dist.init_process_group(backend="nccl")
-    local_rank = int(os.environ["LOCAL_RANK"])
-    torch.cuda.set_device(local_rank)
-
-
-def cleanup_ddp() -> None:
-    if dist.is_available() and dist.is_initialized():
-        dist.destroy_process_group()
-
-
 @hydra.main(version_base=None, config_path="../configs/rl", config_name="offline_rl")
 def main(cfg):
-    if "RANK" in os.environ and "WORLD_SIZE" in os.environ:
-        setup_ddp()
+    if any(key in os.environ for key in ("RANK", "LOCAL_RANK", "WORLD_SIZE")):
+        raise RuntimeError(
+            "train.py is the single-process entry point. "
+            "Use train_ddp.py with torchrun for distributed training."
+        )
 
     workspace = None
     try:
@@ -56,7 +46,6 @@ def main(cfg):
                 except Exception:
                     pass
             workspace.cleanup_shared_memory()
-        cleanup_ddp()
 
 
 if __name__ == "__main__":
