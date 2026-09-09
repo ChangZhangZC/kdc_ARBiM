@@ -65,8 +65,12 @@ class BehaviorProximalPolicyOptimization(ProximalPolicyOptimization):
 
     def _resume_hparams(self) -> dict:
         return {
+            "training_seed": int(self.cfg.training.seed),
             "n_action_steps": int(self.cfg.n_action_steps),
             "chunk_adv_clip": self.cfg.get("chunk_adv_clip", None),
+            "dataset_pad_before": int(self.cfg.dataset.pad_before),
+            "dataset_pad_after": int(self.cfg.dataset.pad_after),
+            "max_train_episodes": self.cfg.dataset.max_train_episodes,
             "bppo_steps": int(self.cfg.unio4.bppo_steps),
             "bppo_lr": float(self.cfg.unio4.bppo_lr),
             "clip_ratio": float(self.cfg.unio4.clip_ratio),
