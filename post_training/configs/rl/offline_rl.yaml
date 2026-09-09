@@ -42,8 +42,8 @@ dataset:
   use_depth: false
   reward_scaling: none
   fixed_reward_scale: 0.1
-  pad_before: 0
-  pad_after: 0
+  pad_before: 0  # V1 fixed: partial/padded macro-actions are not valid RL transitions.
+  pad_after: 0  # V1 fixed: each sample must contain a complete real 50-step chunk.
   sequence_stride: 1
   finetune_sequence_stride: ${n_action_steps}
   val_ratio: 0.1
@@ -112,7 +112,7 @@ dynamics:
   dynamics_max_epochs: 200
   max_epochs_since_update: 50
   logvar_loss_coef: 0.01
-  predict_delta: true
+  predict_delta: true  # V1 fixed: model predicts delta-z and rollout reconstructs z_next = z + delta-z.
   fix_encoder: true  # V1 fixed: transition-model latent space must not drift.
   action_embed_layer_norm: false
   action_scale_norm: false
