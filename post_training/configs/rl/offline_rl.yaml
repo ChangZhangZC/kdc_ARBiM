@@ -23,9 +23,9 @@ n_action_steps: ${rl_chunk_size}
 # -------------------- Experiment mode switches --------------------
 horizon: ${rl_chunk_size}  # Numeric experiment parameter; must be >= n_action_steps. Default uses one complete RL chunk.
 n_obs_steps: 1  # V1 fixed interface: only 1 is currently implemented for Scheme C.
-chunk_as_single_action: true  # choices: true | false. true uses one chunk-level transition; false follows RL-100-style per-step critic/dynamics/PPO updates.
+chunk_as_single_action: true  # choices: true | false. true uses one chunk-level transition; false uses single-step critic/dynamics transitions while ACT still predicts the aligned full chunk.
 offline_chunk_ratio_mode: scalar  # choices: scalar | per_step. Used when chunk_as_single_action=true; false always uses per-step ratios.
-offline_chunk_adv_mode: scalar_iql  # RL-100 choices: scalar_iql | per_step_vdelta | chunk_vdelta_scalar | chunk_vdelta_gae. V1 executable: scalar_iql; vdelta modes require reward-predicting token dynamics, which is not implemented yet.
+offline_chunk_adv_mode: scalar_iql  # RL-100 choices: scalar_iql | per_step_vdelta | chunk_vdelta_scalar | chunk_vdelta_gae. Used for chunk mode; V1 executable chunk advantage is scalar_iql. false currently uses per-step IQL; vdelta modes require reward-predicting token dynamics and remain interface-only.
 chunk_adv_clip: null  # Numeric experiment parameter; null disables advantage clipping.
 
 # Action representation experiments.
