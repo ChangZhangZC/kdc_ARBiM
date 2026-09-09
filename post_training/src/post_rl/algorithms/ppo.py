@@ -130,6 +130,55 @@ class ProximalPolicyOptimization:
         action, _, _ = self._policy.sample_action_chunk(obs)
         return action
 
+    def training_state_dict(self) -> dict:
+        state = {
+            "policy": self._policy.state_dict(),
+            "old_policy": self._old_policy.state_dict(),
+            "optimizer": self._optimizer.state_dict(),
+            "scheduler": self._scheduler.state_dict(),
+            "policy_lr": self._policy_lr,
+            "clip_ratio": self._clip_ratio,
+            "entropy_weight": self._entropy_weight,
+            "decay": self._decay,
+            "old_policy_version": self._old_policy_version,
+        }
+        if hasattr(self, "iteration"):
+            state["iteration"] = int(self.iteration)
+        return state
+
+    def load_training_state_dict(self, state: dict) -> None:
+        required = {
+            "policy",
+            "old_policy",
+            "optimizer",
+            "scheduler",
+            "policy_lr",
+            "clip_ratio",
+            "entropy_weight",
+            "decay",
+            "old_policy_version",
+        }
+        missing = sorted(required.difference(state))
+        if missing:
+            raise KeyError(f"PPO resume state is missing keys: {missing}")
+
+        self._policy.load_state_dict(state["policy"], strict=True)
+        self._old_policy.load_state_dict(state["old_policy"], strict=True)
+        self._policy_lr = float(state["policy_lr"])
+        self._clip_ratio = float(state["clip_ratio"])
+        self._entropy_weight = float(state["entropy_weight"])
+        self._decay = float(state["decay"])
+        self._old_policy_version = int(state["old_policy_version"])
+        if "iteration" in state and hasattr(self, "iteration"):
+            self.iteration = int(state["iteration"])
+
+        self._optimizer.load_state_dict(state["optimizer"])
+        self._scheduler.load_state_dict(state["scheduler"])
+        self._policy.eval()
+        self._old_policy.eval()
+        for param in self._old_policy.parameters():
+            param.requires_grad = False
+
     def save(self, path: str) -> None:
         self._policy.save_pretrained(path)
 
