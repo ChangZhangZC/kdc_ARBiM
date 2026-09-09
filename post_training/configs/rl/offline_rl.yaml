@@ -9,9 +9,9 @@ input:
   policy_checkpoint: /path/to/act/checkpoint
   dataset_path: /path/to/offline_dataset.zarr
 
-horizon: 50  # V1 fixed: training window equals the ACT checkpoint chunk_size.
+horizon: 50  # V1 fixed: training window equals ACT chunk_size, not deployment replan length.
 n_obs_steps: 1  # V1 fixed: Scheme C uses one observation state per macro-step.
-n_action_steps: 50  # V1 fixed: must equal horizon and ACT checkpoint chunk_size.
+n_action_steps: 50  # V1 fixed: RL macro-action length; must equal horizon and ACT chunk_size.
 chunk_as_single_action: true  # V1 fixed: one ACT chunk is one RL macro-action.
 chunk_adv_clip: null
 
@@ -55,7 +55,7 @@ dataloader:
 val_dataloader:
   batch_size: 128
   num_workers: 2
-  shuffle: false
+  shuffle: false  # V1 fixed: validation is deterministic.
   pin_memory: false
   persistent_workers: false
 
@@ -136,13 +136,11 @@ unio4:
   fix_encoder: true  # V1 fixed: PPO updates Decoder/action head/log_std only.
   use_gae: false  # V1 only supported value: false for transition-model OPE gating.
   use_ema_eval: false
-  idql_eval: false
   eval_times: 1
   finetune_batch_size: 128
   stage1_resume_dir: null
   artifact_dir: null
   global_best_dir: null
-  global_best_ema_dir: null
 
 ppo:
   eval_env_num: 1
