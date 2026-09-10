@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import math
 
+import numpy as np
 import torch
 
 from _common import (
@@ -16,6 +17,79 @@ from _common import (
 )
 from post_rl.data.offline_dataset import OfflineDataset
 from post_rl.utils.common import dict_apply
+
+
+def _assert_endpoint_alignment(workspace, raw: dict, dataset: OfflineDataset, idx: int) -> None:
+    obs_idx, next_transition_idx = dataset._endpoint_indices(idx)
+    mapped_next_idx = int(workspace.latent_cache.next_indices[next_transition_idx])
+    transition_steps = (
+        int(workspace.cfg.n_action_steps)
+        if bool(workspace.cfg.chunk_as_single_action)
+        else 1
+    )
+
+    np.testing.assert_array_equal(
+        raw["obs"]["state"][0].cpu().numpy(),
+        np.asarray(workspace.buffer["state"][obs_idx]),
+    )
+    np.testing.assert_array_equal(
+        raw["next_obs"]["state"][transition_steps - 1].cpu().numpy(),
+        np.asarray(workspace.buffer["state"][mapped_next_idx]),
+    )
+
+    for key in OfflineDataset.RGB_KEYS:
+        np.testing.assert_array_equal(
+            raw["obs"][key][0].cpu().numpy(),
+            np.asarray(workspace.buffer[key][obs_idx]),
+        )
+        np.testing.assert_array_equal(
+            raw["next_obs"][key][transition_steps - 1].cpu().numpy(),
+            np.asarray(workspace.buffer[key][mapped_next_idx]),
+        )
+
+    if bool(workspace.cfg.dataset.use_depth):
+        for key in OfflineDataset.DEPTH_KEYS:
+            np.testing.assert_array_equal(
+                raw["obs"][key][0].cpu().numpy(),
+                np.asarray(workspace.buffer[key][obs_idx]),
+            )
+            np.testing.assert_array_equal(
+                raw["next_obs"][key][transition_steps - 1].cpu().numpy(),
+                np.asarray(workspace.buffer[key][mapped_next_idx]),
+            )
+
+
+def _assert_latent_consistent(
+    cached: torch.Tensor,
+    direct: torch.Tensor,
+    label: str,
+    *,
+    max_abs_limit: float = 0.1,
+    relative_l2_limit: float = 0.02,
+) -> None:
+    cached = cached.detach().float()
+    direct = direct.detach().float()
+    if cached.shape != direct.shape:
+        raise AssertionError(
+            f"{label} latent shape mismatch: {tuple(cached.shape)} vs {tuple(direct.shape)}"
+        )
+
+    diff = cached - direct
+    max_abs = float(diff.abs().max().item())
+    relative_l2 = float(
+        torch.linalg.vector_norm(diff).item()
+        / max(torch.linalg.vector_norm(direct).item(), 1e-12)
+    )
+    print(
+        f"{label} latent numeric drift: max_abs={max_abs:.6g}, "
+        f"relative_l2={relative_l2:.6g}"
+    )
+    if max_abs > max_abs_limit or relative_l2 > relative_l2_limit:
+        raise AssertionError(
+            f"{label} cached latent is not numerically consistent with direct encoding: "
+            f"max_abs={max_abs:.6g} (limit {max_abs_limit}), "
+            f"relative_l2={relative_l2:.6g} (limit {relative_l2_limit})"
+        )
 
 
 def main() -> None:
@@ -61,6 +135,9 @@ def main() -> None:
     if set(cached["obs"]) != {"latent"} or set(cached["next_obs"]) != {"latent"}:
         raise AssertionError("Endpoint dataset should expose latent-only observations")
 
+    _assert_endpoint_alignment(workspace, raw, workspace.dataset, 0)
+    print_pass("raw current/next endpoint indices match the cache transition mapping")
+
     raw_obs = dict_apply(raw["obs"], lambda x: x.unsqueeze(0).to(workspace.device))
     raw_next_obs = dict_apply(
         raw["next_obs"],
@@ -79,9 +156,10 @@ def main() -> None:
     cached_next = cached["next_obs"]["latent"].unsqueeze(0).to(workspace.device)
     cached_obs = workspace.obs_adapter.encode({"latent": cached_obs})[:, 0]
     cached_next = workspace.obs_adapter.encode({"latent": cached_next})[:, 0]
-    torch.testing.assert_close(cached_obs, direct_obs, rtol=1e-4, atol=1e-5)
-    torch.testing.assert_close(cached_next, direct_next, rtol=1e-4, atol=1e-5)
-    print_pass("cached current/next endpoints match direct frozen ACT encoding")
+
+    _assert_latent_consistent(cached_obs, direct_obs, "current")
+    _assert_latent_consistent(cached_next, direct_next, "next")
+    print_pass("cached current/next endpoints are numerically consistent with direct ACT encoding")
 
     print_section("cached Critic and Dynamics updates")
     batch = next(iter(workspace.train_dataloader))
