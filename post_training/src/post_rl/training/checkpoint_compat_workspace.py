@@ -5,10 +5,10 @@ import os
 
 from lerobot.processor import NormalizerProcessorStep, PolicyProcessorPipeline
 
-from .contract_workspace import TrainACTWorkspace as _ContractTrainACTWorkspace
+from .performance_workspace import TrainACTWorkspace as _PerformanceTrainACTWorkspace
 
 
-class TrainACTWorkspace(_ContractTrainACTWorkspace):
+class TrainACTWorkspace(_PerformanceTrainACTWorkspace):
     """Adapt post-RL loading to the Kuavo ACT checkpoint directory layout."""
 
     def _resolve_policy_processor_dir(self) -> str:

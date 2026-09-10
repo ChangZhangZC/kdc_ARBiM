@@ -178,9 +178,23 @@ class ACTObservationAdapter:
             raise ValueError(
                 "ACT Scheme C state encoder is frozen and does not support track_grad=True."
             )
+        if "latent" in obs:
+            latent = obs["latent"].to(self.device, non_blocking=True).float()
+            if latent.ndim == 3:
+                latent = latent.unsqueeze(1)
+            if latent.ndim != 4 or latent.shape[1] != 1:
+                raise ValueError(
+                    "Cached ACT latent must be [B,S,D] or [B,1,S,D], got "
+                    f"{tuple(latent.shape)}"
+                )
+            if latent.shape[-1] != self.feature_dim:
+                raise ValueError(
+                    f"Cached ACT latent dim {latent.shape[-1]} != {self.feature_dim}"
+                )
+            return latent
+
         obs, batch_size = self.prepare_obs(obs, start=start)
         encode_fn = getattr(self.encoder, "encode_tokens", self.encoder)
-
         with torch.no_grad():
             features = encode_fn(obs)
 
