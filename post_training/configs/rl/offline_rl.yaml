@@ -174,6 +174,8 @@ ppo:
   enable_ratio_logging: true
   ratio_log_every_updates: 10
   ratio_plot_on_final_flush: true
+  enable_monitoring_csv: true  # Monitoring only; does not change PPO loss, gradients, or update decisions.
+  monitor_every_updates: 10  # Write one compact PPO diagnostic row every N optimizer updates.
 
 ema:
   update_after_step: 0
