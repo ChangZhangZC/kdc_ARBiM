@@ -30,6 +30,11 @@ class StochasticACTPolicyWrapper(CustomACTPolicyWrapper):
         )
         raw_init = torch.logit(torch.tensor(init_ratio, dtype=torch.float32))
         self.raw_log_std = torch.nn.Parameter(raw_init.repeat(action_dim))
+        self.register_buffer(
+            "_frozen_encoder_pos_embed",
+            torch.empty(0),
+            persistent=False,
+        )
 
     def _get_log_std(self) -> Tensor:
         return self.config.log_std_min + (
@@ -45,10 +50,68 @@ class StochasticACTPolicyWrapper(CustomACTPolicyWrapper):
         model_batch.pop("action_is_pad", None)
         return prepare_act_model_batch(self.config, model_batch)
 
+    def set_frozen_encoder_pos_embed(self, encoder_pos_embed: Tensor) -> None:
+        encoder_pos_embed = torch.as_tensor(
+            encoder_pos_embed,
+            device=next(self.parameters()).device,
+        ).detach()
+        if encoder_pos_embed.ndim != 3:
+            raise ValueError(
+                "Frozen ACT encoder positional embedding must be [S,1,D], got "
+                f"{tuple(encoder_pos_embed.shape)}"
+            )
+        if encoder_pos_embed.shape[-1] != self.model.config.dim_model:
+            raise ValueError(
+                "Frozen ACT encoder positional embedding dim "
+                f"{encoder_pos_embed.shape[-1]} != dim_model={self.model.config.dim_model}"
+            )
+        self._frozen_encoder_pos_embed = encoder_pos_embed.clone()
+
+    def _cached_latent_and_pos(self, latent: Tensor) -> tuple[Tensor, Tensor]:
+        latent = torch.as_tensor(
+            latent,
+            device=next(self.parameters()).device,
+            dtype=torch.float32,
+        )
+        if latent.ndim == 4:
+            if latent.shape[1] != 1:
+                raise ValueError(
+                    "Cached ACT policy latent must contain one observation endpoint, got "
+                    f"{tuple(latent.shape)}"
+                )
+            latent = latent[:, 0]
+        if latent.ndim != 3:
+            raise ValueError(
+                "Cached ACT policy latent must be [B,S,D] or [B,1,S,D], got "
+                f"{tuple(latent.shape)}"
+            )
+        if latent.shape[-1] != self.model.config.dim_model:
+            raise ValueError(
+                f"Cached ACT policy latent dim {latent.shape[-1]} != "
+                f"dim_model={self.model.config.dim_model}"
+            )
+        if self._frozen_encoder_pos_embed.numel() == 0:
+            raise RuntimeError(
+                "Cached ACT policy latent requires frozen encoder positional embeddings. "
+                "Call set_frozen_encoder_pos_embed() after building the ACT frontend."
+            )
+        encoder_pos_embed = self._frozen_encoder_pos_embed.to(
+            device=latent.device,
+            dtype=latent.dtype,
+        )
+        if encoder_pos_embed.shape[0] != latent.shape[1]:
+            raise ValueError(
+                f"Cached ACT policy latent has {latent.shape[1]} tokens but frozen "
+                f"positional embedding has {encoder_pos_embed.shape[0]} tokens"
+            )
+        return latent, encoder_pos_embed
+
     def encode_observation(
         self,
         batch: dict[str, Tensor],
     ) -> tuple[Tensor, Tensor]:
+        if "latent" in batch:
+            return self._cached_latent_and_pos(batch["latent"])
         model_batch = self._prepare_model_batch(batch)
         return encode_act_state(self.model, model_batch)
 

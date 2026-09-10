@@ -116,6 +116,8 @@ def main() -> None:
         raise AssertionError("Frozen latent cache was not built")
     if len(cache.obs) != len(workspace.buffer):
         raise AssertionError("Latent cache length does not match OfflineBuffer")
+    if workspace.model._frozen_encoder_pos_embed.numel() == 0:
+        raise AssertionError("Frozen policy positional embedding was not prepared")
     print_pass(f"cache ready with shape={cache.obs.shape}")
 
     print_section("cached endpoints equal direct ACT encoder")
@@ -184,7 +186,7 @@ def main() -> None:
     workspace.dynamics.optimize(dyn_loss)
     print_pass("Critic and Dynamics update directly from cached latents")
 
-    print_section("single-process PPO endpoint sampler")
+    print_section("PPO frozen-latent reuse")
     workspace._build_ppo()
     workspace._build_finetune_dataloader()
     if workspace.finetune_sampler is None:
@@ -192,9 +194,37 @@ def main() -> None:
     finetune_batch = workspace.sample_finetune_batch()
     if "obs" not in finetune_batch or "next_obs" in finetune_batch:
         raise AssertionError("PPO endpoint batch must contain current obs only")
-    if set(finetune_batch["obs"]) != {"state", *OfflineDataset.RGB_KEYS}:
-        raise AssertionError("PPO endpoint batch must expose raw ACT observation inputs")
-    print_pass("single-process PPO endpoint sampler yields resumable current-observation batches")
+    if set(finetune_batch["obs"]) != {"latent"}:
+        raise AssertionError("PPO should reuse latent-only cached observations")
+
+    policy_obs = workspace.obs_adapter.normalize_obs(finetune_batch["obs"])
+    policy_obs = {key: value[:, 0] for key, value in policy_obs.items()}
+    with torch.no_grad():
+        reused_latent, reused_pos = workspace.unio4._policy.encode_observation(policy_obs)
+    torch.testing.assert_close(
+        reused_latent,
+        finetune_batch["obs"]["latent"][:, 0].float(),
+        rtol=0.0,
+        atol=0.0,
+    )
+    if reused_pos.shape[0] != reused_latent.shape[1]:
+        raise AssertionError("Cached PPO positional embedding/token count mismatch")
+
+    ppo_loss = workspace.unio4.update_distribution(
+        finetune_batch,
+        workspace.critic,
+        is_clip_decay=False,
+        is_lr_decay=False,
+        is_linear_decay=False,
+    )
+    if not math.isfinite(ppo_loss):
+        raise AssertionError(f"Non-finite cached PPO loss: {ppo_loss}")
+    mean_q, mean_reward = workspace._evaluate_dynamics_ope()
+    if not math.isfinite(mean_q) or not math.isfinite(mean_reward):
+        raise AssertionError(
+            f"Non-finite cached Dynamics OPE: mean_q={mean_q}, reward={mean_reward}"
+        )
+    print_pass("PPO update and Dynamics OPE reuse frozen ACT latents")
 
     print("\nSMOKE 07 PASSED")
 
