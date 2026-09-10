@@ -539,8 +539,6 @@ class BehaviorProximalPolicyOptimization(ProximalPolicyOptimization):
         self._monitor_records.append(record)
         if len(self._monitor_records) >= self._monitor_flush_interval:
             self.flush_monitor_logs(force=False)
-        if self.iteration >= int(self.cfg.unio4.bppo_steps):
-            self.flush_monitor_logs(force=True)
 
     def flush_monitor_logs(self, force: bool = True) -> None:
         if not self._enable_monitoring_csv or self._monitor_log_dir is None:
@@ -572,6 +570,7 @@ class BehaviorProximalPolicyOptimization(ProximalPolicyOptimization):
     ) -> float:
         self.iteration += 1
         self._pending_advantage_stats = None
+        monitor_this_update = self._monitor_this_update()
         self._sync_old_policy()
         normalized_obs = self.obs_adapter.normalize_obs(batch["obs"])
         policy_obs = {key: value[:, 0] for key, value in normalized_obs.items()}
@@ -667,8 +666,10 @@ class BehaviorProximalPolicyOptimization(ProximalPolicyOptimization):
 
         loss = policy_loss - self._entropy_weight * entropy
         lr_used = float(self._optimizer.param_groups[0]["lr"])
-        log_std_mean = float(
-            self._policy._get_log_std().detach().float().mean().item()
+        log_std_mean = (
+            float(self._policy._get_log_std().detach().float().mean().item())
+            if monitor_this_update
+            else float("nan")
         )
 
         self._optimizer.zero_grad()
@@ -680,13 +681,16 @@ class BehaviorProximalPolicyOptimization(ProximalPolicyOptimization):
         ]
         max_grad_norm = float(self.cfg.unio4.max_grad_norm)
         if max_grad_norm > 0:
-            grad_norm = float(
-                torch.nn.utils.clip_grad_norm_(
-                    trainable_params,
-                    max_grad_norm,
-                ).item()
+            grad_norm_tensor = torch.nn.utils.clip_grad_norm_(
+                trainable_params,
+                max_grad_norm,
             )
-        elif self._monitor_this_update() and trainable_params:
+            grad_norm = (
+                float(grad_norm_tensor.item())
+                if monitor_this_update
+                else float("nan")
+            )
+        elif monitor_this_update and trainable_params:
             grad_norm = float(
                 torch.linalg.vector_norm(
                     torch.stack(
@@ -718,4 +722,6 @@ class BehaviorProximalPolicyOptimization(ProximalPolicyOptimization):
             lr_used=lr_used,
             log_std_mean=log_std_mean,
         )
+        if self.iteration >= int(self.cfg.unio4.bppo_steps):
+            self.flush_monitor_logs(force=True)
         return float(loss.item())
