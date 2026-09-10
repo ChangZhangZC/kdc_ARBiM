@@ -27,6 +27,7 @@ class OfflineDataset(Dataset):
         endpoint_obs_only: bool = False,
         latent_cache=None,
         include_next_obs: bool = True,
+        next_obs_offset: int | None = None,
     ) -> None:
         if len(buffer) == 0:
             raise ValueError("OfflineBuffer must be loaded before creating dataset.")
@@ -44,6 +45,11 @@ class OfflineDataset(Dataset):
         self.endpoint_obs_only = bool(endpoint_obs_only)
         self.latent_cache = latent_cache
         self.include_next_obs = bool(include_next_obs)
+        self.next_obs_offset = horizon if next_obs_offset is None else int(next_obs_offset)
+        if not 1 <= self.next_obs_offset <= horizon:
+            raise ValueError(
+                f"next_obs_offset must be in [1, horizon={horizon}], got {self.next_obs_offset}"
+            )
 
         if self.endpoint_obs_only:
             self.sampler_keys = ["action", "next_action", "reward", "not_done", "return"]
@@ -97,10 +103,11 @@ class OfflineDataset(Dataset):
         self.latent_cache = latent_cache
 
     def _endpoint_indices(self, idx: int) -> tuple[int, int]:
-        buffer_start_idx, buffer_end_idx, sample_start_idx, sample_end_idx = self.sampler.indices[idx]
+        buffer_start_idx, _, sample_start_idx, sample_end_idx = self.sampler.indices[idx]
         if sample_start_idx != 0 or sample_end_idx != self.horizon:
             raise RuntimeError("Endpoint sampling does not support padded sequences.")
-        return int(buffer_start_idx), int(buffer_end_idx - 1)
+        next_idx = int(buffer_start_idx) + self.next_obs_offset - 1
+        return int(buffer_start_idx), next_idx
 
     def _raw_endpoint_obs(self, index: int, next_obs: bool) -> dict[str, np.ndarray]:
         prefix = "next_" if next_obs else ""
