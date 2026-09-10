@@ -32,6 +32,7 @@ class TrainACTWorkspace(_ContractTrainACTWorkspace):
         cfg = self.cfg
         use_cache = self._performance_enabled()
         endpoint_only = self._endpoint_sampling_enabled() and use_cache
+        latent_cache = getattr(self, "latent_cache", None) if use_cache else None
         self.dataset = OfflineDataset(
             buffer=self.buffer,
             horizon=cfg.horizon,
@@ -43,6 +44,7 @@ class TrainACTWorkspace(_ContractTrainACTWorkspace):
             max_train_episodes=cfg.dataset.max_train_episodes,
             use_depth=cfg.dataset.use_depth,
             endpoint_obs_only=endpoint_only,
+            latent_cache=latent_cache,
             next_obs_offset=self._transition_steps(),
         )
         self.val_dataset = self.dataset.get_validation_dataset()
@@ -168,8 +170,10 @@ class TrainACTWorkspace(_ContractTrainACTWorkspace):
                 expected_metadata=metadata,
             )
 
-        self.dataset.set_latent_cache(self.latent_cache)
-        self.val_dataset.set_latent_cache(self.latent_cache)
+        if hasattr(self, "dataset"):
+            self.dataset.set_latent_cache(self.latent_cache)
+        if hasattr(self, "val_dataset"):
+            self.val_dataset.set_latent_cache(self.latent_cache)
         if self.rank == 0:
             print(
                 "Frozen ACT latent cache ready: "
