@@ -115,6 +115,13 @@ class ACTObservationAdapter:
         obs: dict[str, torch.Tensor],
     ) -> dict[str, torch.Tensor]:
         obs = self._to_device(obs)
+        if "latent" in obs:
+            if set(obs) != {"latent"}:
+                raise ValueError(
+                    "Cached ACT observations must contain only the latent field."
+                )
+            return {"latent": obs["latent"].float()}
+
         normalized = {
             OBS_STATE: self._normalize_mean_std(
                 obs["state"],
