@@ -63,6 +63,18 @@ class BehaviorProximalPolicyOptimization(ProximalPolicyOptimization):
         self._ratio_log_flush_interval = 50
         self._ratio_log_written_until = 0
 
+        self._enable_monitoring_csv = bool(
+            cfg.ppo.get("enable_monitoring_csv", True)
+        )
+        self._monitor_every_updates = max(
+            1,
+            int(cfg.ppo.get("monitor_every_updates", 10)),
+        )
+        self._monitor_records = []
+        self._monitor_log_dir = None
+        self._monitor_flush_interval = 10
+        self._pending_advantage_stats = None
+
     def _resume_hparams(self) -> dict:
         dataset_path = os.path.realpath(
             os.path.abspath(os.path.expanduser(str(self.cfg.input.dataset_path)))
@@ -229,6 +241,26 @@ class BehaviorProximalPolicyOptimization(ProximalPolicyOptimization):
             std.to(dtype=advantage.dtype).unsqueeze(0) + CONST_EPS
         )
 
+    def _monitor_this_update(self) -> bool:
+        if not self._enable_monitoring_csv:
+            return False
+        if self.iteration % self._monitor_every_updates != 0:
+            return False
+        return not (
+            dist.is_available()
+            and dist.is_initialized()
+            and dist.get_rank() != 0
+        )
+
+    def _capture_advantage_stats(self, advantage: torch.Tensor) -> None:
+        if not self._monitor_this_update():
+            return
+        flat = advantage.detach().float().reshape(-1)
+        self._pending_advantage_stats = {
+            "adv_pre_norm_mean": float(flat.mean().item()),
+            "adv_pre_norm_std": float(flat.std(unbiased=False).item()),
+        }
+
     @torch.no_grad()
     def advantage_computation(
         self,
@@ -242,6 +274,7 @@ class BehaviorProximalPolicyOptimization(ProximalPolicyOptimization):
                 torch.exp(advantage * self.temperature),
                 torch.ones_like(advantage) * 100.0,
             )
+        self._capture_advantage_stats(advantage)
         advantage = self._normalize_advantage(advantage)
         clip_value = self.cfg.get("chunk_adv_clip", None)
         if clip_value is not None:
@@ -292,6 +325,7 @@ class BehaviorProximalPolicyOptimization(ProximalPolicyOptimization):
                 torch.exp(advantages * self.temperature),
                 torch.ones_like(advantages) * 100.0,
             )
+        self._capture_advantage_stats(advantages)
         advantages = self._normalize_advantage_by_step(advantages)
         clip_value = self.cfg.get("chunk_adv_clip", None)
         if clip_value is not None:
@@ -336,12 +370,17 @@ class BehaviorProximalPolicyOptimization(ProximalPolicyOptimization):
         return x.sum(dim=-1)
 
     def set_ratio_log_dir(self, log_dir: str | None) -> None:
-        if not self._enable_ratio_logging:
-            self._ratio_log_dir = None
-            return
-        self._ratio_log_dir = log_dir
-        if log_dir is not None:
-            os.makedirs(log_dir, exist_ok=True)
+        self._ratio_log_dir = log_dir if self._enable_ratio_logging else None
+        if self._ratio_log_dir is not None:
+            os.makedirs(self._ratio_log_dir, exist_ok=True)
+
+        self._monitor_log_dir = None
+        if self._enable_monitoring_csv and log_dir is not None:
+            self._monitor_log_dir = os.path.join(
+                os.path.dirname(log_dir),
+                "monitoring",
+            )
+            os.makedirs(self._monitor_log_dir, exist_ok=True)
 
     def _record_ratio_stats(
         self,
@@ -455,6 +494,72 @@ class BehaviorProximalPolicyOptimization(ProximalPolicyOptimization):
         self._ratio_records.clear()
         self._ratio_log_written_until = 0
 
+    def _record_monitor_stats(
+        self,
+        ratio: torch.Tensor,
+        old_logprob: torch.Tensor,
+        new_logprob: torch.Tensor,
+        policy_loss: torch.Tensor,
+        entropy: torch.Tensor,
+        loss: torch.Tensor,
+        grad_norm: float,
+        lr_used: float,
+        log_std_mean: float,
+    ) -> None:
+        if not self._monitor_this_update():
+            return
+
+        ratio_flat = ratio.detach().float().reshape(-1)
+        log_ratio = (
+            new_logprob.detach().float() - old_logprob.detach().float()
+        ).reshape(-1)
+        approx_kl = ((ratio_flat - 1.0) - log_ratio).mean()
+        clip_fraction = (
+            (ratio_flat - 1.0).abs() > float(self._clip_ratio)
+        ).float().mean()
+        advantage_stats = self._pending_advantage_stats or {
+            "adv_pre_norm_mean": float("nan"),
+            "adv_pre_norm_std": float("nan"),
+        }
+        record = {
+            "iteration": int(self.iteration),
+            "loss": float(loss.detach().item()),
+            "policy_loss": float(policy_loss.detach().item()),
+            "entropy": float(entropy.detach().item()),
+            "ratio_mean": float(ratio_flat.mean().item()),
+            "approx_kl": float(approx_kl.item()),
+            "clip_fraction": float(clip_fraction.item()),
+            "adv_pre_norm_mean": float(advantage_stats["adv_pre_norm_mean"]),
+            "adv_pre_norm_std": float(advantage_stats["adv_pre_norm_std"]),
+            "grad_norm": float(grad_norm),
+            "log_std_mean": float(log_std_mean),
+            "lr": float(lr_used),
+            "clip_ratio": float(self._clip_ratio),
+        }
+        self._monitor_records.append(record)
+        if len(self._monitor_records) >= self._monitor_flush_interval:
+            self.flush_monitor_logs(force=False)
+        if self.iteration >= int(self.cfg.unio4.bppo_steps):
+            self.flush_monitor_logs(force=True)
+
+    def flush_monitor_logs(self, force: bool = True) -> None:
+        if not self._enable_monitoring_csv or self._monitor_log_dir is None:
+            return
+        if not self._monitor_records:
+            return
+        if not force and len(self._monitor_records) < self._monitor_flush_interval:
+            return
+
+        csv_path = os.path.join(self._monitor_log_dir, "ppo_metrics.csv")
+        file_exists = os.path.isfile(csv_path)
+        headers = list(self._monitor_records[0].keys())
+        with open(csv_path, "a" if file_exists else "w", newline="") as file:
+            writer = csv.DictWriter(file, fieldnames=headers)
+            if not file_exists:
+                writer.writeheader()
+            writer.writerows(self._monitor_records)
+        self._monitor_records.clear()
+
     def update_distribution(
         self,
         batch: dict,
@@ -466,6 +571,7 @@ class BehaviorProximalPolicyOptimization(ProximalPolicyOptimization):
         clip_ratio_now: float | None = None,
     ) -> float:
         self.iteration += 1
+        self._pending_advantage_stats = None
         self._sync_old_policy()
         normalized_obs = self.obs_adapter.normalize_obs(batch["obs"])
         policy_obs = {key: value[:, 0] for key, value in normalized_obs.items()}
@@ -560,6 +666,10 @@ class BehaviorProximalPolicyOptimization(ProximalPolicyOptimization):
             entropy = self._sum_step_event_dims(entropy_raw).mean()
 
         loss = policy_loss - self._entropy_weight * entropy
+        lr_used = float(self._optimizer.param_groups[0]["lr"])
+        log_std_mean = float(
+            self._policy._get_log_std().detach().float().mean().item()
+        )
 
         self._optimizer.zero_grad()
         loss.backward()
@@ -570,7 +680,22 @@ class BehaviorProximalPolicyOptimization(ProximalPolicyOptimization):
         ]
         max_grad_norm = float(self.cfg.unio4.max_grad_norm)
         if max_grad_norm > 0:
-            torch.nn.utils.clip_grad_norm_(trainable_params, max_grad_norm)
+            grad_norm = float(
+                torch.nn.utils.clip_grad_norm_(
+                    trainable_params,
+                    max_grad_norm,
+                ).item()
+            )
+        elif self._monitor_this_update() and trainable_params:
+            grad_norm = float(
+                torch.linalg.vector_norm(
+                    torch.stack(
+                        [param.grad.detach().norm(2) for param in trainable_params]
+                    )
+                ).item()
+            )
+        else:
+            grad_norm = float("nan")
         self._optimizer.step()
 
         linear_decay = bool(self.cfg.unio4.is_linear_decay)
@@ -582,4 +707,15 @@ class BehaviorProximalPolicyOptimization(ProximalPolicyOptimization):
         elif is_lr_decay:
             self._scheduler.step()
 
+        self._record_monitor_stats(
+            ratio=ratio,
+            old_logprob=old_logprob,
+            new_logprob=new_logprob,
+            policy_loss=policy_loss,
+            entropy=entropy,
+            loss=loss,
+            grad_norm=grad_norm,
+            lr_used=lr_used,
+            log_std_mean=log_std_mean,
+        )
         return float(loss.item())
