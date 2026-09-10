@@ -184,6 +184,18 @@ def main() -> None:
     workspace.dynamics.optimize(dyn_loss)
     print_pass("Critic and Dynamics update directly from cached latents")
 
+    print_section("single-process PPO endpoint sampler")
+    workspace._build_ppo()
+    workspace._build_finetune_dataloader()
+    if workspace.finetune_sampler is None:
+        raise AssertionError("Resumable PPO requires an epoch-addressable finetune sampler")
+    finetune_batch = workspace.sample_finetune_batch()
+    if "obs" not in finetune_batch or "next_obs" in finetune_batch:
+        raise AssertionError("PPO endpoint batch must contain current obs only")
+    if set(finetune_batch["obs"]) != {"state", *OfflineDataset.RGB_KEYS}:
+        raise AssertionError("PPO endpoint batch must expose raw ACT observation inputs")
+    print_pass("single-process PPO endpoint sampler yields resumable current-observation batches")
+
     print("\nSMOKE 07 PASSED")
 
 
