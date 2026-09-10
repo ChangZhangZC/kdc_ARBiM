@@ -25,6 +25,9 @@ class TrainACTWorkspace(_ContractTrainACTWorkspace):
     def _endpoint_sampling_enabled(self) -> bool:
         return bool(self.cfg.dataset.get("endpoint_obs_only", False))
 
+    def _transition_steps(self) -> int:
+        return int(self.cfg.n_action_steps) if bool(self.cfg.chunk_as_single_action) else 1
+
     def _build_main_dataloaders(self) -> None:
         cfg = self.cfg
         use_cache = self._performance_enabled()
@@ -40,6 +43,7 @@ class TrainACTWorkspace(_ContractTrainACTWorkspace):
             max_train_episodes=cfg.dataset.max_train_episodes,
             use_depth=cfg.dataset.use_depth,
             endpoint_obs_only=endpoint_only,
+            next_obs_offset=self._transition_steps(),
         )
         self.val_dataset = self.dataset.get_validation_dataset()
 
@@ -190,6 +194,7 @@ class TrainACTWorkspace(_ContractTrainACTWorkspace):
             use_depth=cfg.dataset.use_depth,
             endpoint_obs_only=True,
             latent_cache=self.latent_cache,
+            next_obs_offset=self._transition_steps(),
         )
         kwargs = self._dataloader_kwargs(cfg.dataloader, drop_last=True)
         if self.is_ddp:
@@ -275,6 +280,7 @@ class TrainACTWorkspace(_ContractTrainACTWorkspace):
             endpoint_obs_only=True,
             latent_cache=None,
             include_next_obs=False,
+            next_obs_offset=self._transition_steps(),
         )
         kwargs = self._dataloader_kwargs(
             cfg.dataloader,
