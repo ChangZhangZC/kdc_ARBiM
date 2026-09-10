@@ -206,6 +206,9 @@ def process_raw_teleop_to_npy(config):
             )
         return array
 
+    # Keep only lightweight frame indices during episode grouping. Caching full
+    # LeRobot frames here retains decoded RGB tensors for the whole dataset and
+    # can exhaust host memory on real datasets.
     episodes = {}
     for frame_index in tqdm(range(len(dataset)), desc="Grouping frames by episode"):
         frame = dataset[frame_index]
@@ -214,7 +217,8 @@ def process_raw_teleop_to_npy(config):
         episode_id = frame["episode_index"]
         if hasattr(episode_id, "item"):
             episode_id = episode_id.item()
-        episodes.setdefault(episode_id, []).append((frame_index, frame))
+        episodes.setdefault(episode_id, []).append(frame_index)
+        del frame
 
     if not episodes:
         raise RuntimeError("LeRobot dataset contains no frames")
@@ -225,7 +229,8 @@ def process_raw_teleop_to_npy(config):
         episode_length = len(episode_frames)
         previous_action = None
 
-        for t, (frame_index, frame) in enumerate(episode_frames):
+        for t, frame_index in enumerate(episode_frames):
+            frame = dataset[frame_index]
             if "observation.state" not in frame or "action" not in frame:
                 missing = [
                     key for key in ("observation.state", "action") if key not in frame
@@ -279,6 +284,7 @@ def process_raw_teleop_to_npy(config):
             data["reward"].append(reward)
             data["done"].append(done)
             data["timeout"].append(timeout)
+            del frame
 
     _validate_processed_data(data, use_depth, 'processed LeRobot output')
 
