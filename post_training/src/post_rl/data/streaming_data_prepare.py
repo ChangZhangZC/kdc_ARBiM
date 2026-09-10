@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import gc
 from pathlib import Path
 
 import numpy as np
@@ -42,9 +41,8 @@ def _episode_id(value):
 
 
 def _group_episode_indices(dataset):
-    """Return episode -> frame-index mapping without retaining decoded frames."""
+    """Return episode -> frame-index mapping without decoding RGB when possible."""
     episodes = {}
-
     hf_dataset = getattr(dataset, "hf_dataset", None)
     if hf_dataset is not None:
         try:
@@ -64,16 +62,11 @@ def _group_episode_indices(dataset):
             raise KeyError(f"frame {frame_index} is missing required key 'episode_index'")
         episodes.setdefault(_episode_id(frame["episode_index"]), []).append(frame_index)
         del frame
-
     return episodes
 
 
 def _validate_frame(frame, frame_index, use_depth):
-    required = [
-        "observation.state",
-        "action",
-        *RGB_FEATURE_TO_BUFFER.keys(),
-    ]
+    required = ["observation.state", "action", *RGB_FEATURE_TO_BUFFER.keys()]
     if use_depth:
         required.extend(DEPTH_FEATURE_TO_BUFFER.keys())
     missing = [key for key in required if key not in frame]
@@ -121,12 +114,70 @@ def _create_dataset(group, name, shape, dtype, compressor):
     return group.create_dataset(name, **kwargs)
 
 
-def build_zarr_from_lerobot(config):
-    """Stream a LeRobot dataset directly into the Offline-RL Zarr contract.
+def _write_block(array, start, values, dtype=None):
+    block = np.stack(values, axis=0)
+    if dtype is not None:
+        block = block.astype(dtype, copy=False)
+    array[start:start + len(values)] = block
 
-    This is the memory-safe path for real RGB datasets. It intentionally bypasses
-    the legacy full-dataset processed-NPY buffer, whose RGB lists scale with the
-    complete dataset size.
+
+def _flush_transition_batch(arrays, batch, start, use_depth):
+    """Write one contiguous batch so each Zarr chunk is compressed only once."""
+    if not batch:
+        return start
+
+    end = start + len(batch)
+    _write_block(arrays["state"], start, [item["state"] for item in batch], np.float32)
+    _write_block(
+        arrays["next_state"], start, [item["next_state"] for item in batch], np.float32
+    )
+    _write_block(arrays["action"], start, [item["action"] for item in batch], np.float32)
+    _write_block(
+        arrays["next_action"], start, [item["next_action"] for item in batch], np.float32
+    )
+
+    arrays["reward"][start:end, 0] = np.asarray(
+        [item["reward"] for item in batch], dtype=np.float32
+    )
+    terminal = np.asarray([item["terminal"] for item in batch], dtype=bool)
+    arrays["done"][start:end, 0] = terminal
+    arrays["timeout"][start:end, 0] = terminal
+
+    for feature_name, buffer_name in RGB_FEATURE_TO_BUFFER.items():
+        _write_block(
+            arrays[buffer_name],
+            start,
+            [item["rgb"][feature_name] for item in batch],
+        )
+        _write_block(
+            arrays[f"next_{buffer_name}"],
+            start,
+            [item["next_rgb"][feature_name] for item in batch],
+        )
+
+    if use_depth:
+        for feature_name, buffer_name in DEPTH_FEATURE_TO_BUFFER.items():
+            _write_block(
+                arrays[buffer_name],
+                start,
+                [item["depth"][feature_name] for item in batch],
+            )
+            _write_block(
+                arrays[f"next_{buffer_name}"],
+                start,
+                [item["next_depth"][feature_name] for item in batch],
+            )
+
+    batch.clear()
+    return end
+
+
+def build_zarr_from_lerobot(config):
+    """Convert LeRobot directly to the Offline-RL Zarr contract with bounded RAM.
+
+    Frames are decoded sequentially, buffered for one small contiguous block, then
+    written as a Zarr slice. The default block size equals ZARR_CHUNK_LEAD so a
+    compressed Zarr chunk is written once instead of being rewritten per frame.
     """
     lerobot_root = config.get("lerobot_root")
     output_path = config.get("zarr_output_path")
@@ -138,8 +189,11 @@ def build_zarr_from_lerobot(config):
     max_episode_len = int(config.get("max_episode_len", 2000))
     lambda_penalty = float(config.get("lambda_penalty", 0.05))
     smooth_penalty = float(config.get("smooth_penalty", 0.01))
+    batch_size = int(config.get("stream_batch_size", ZARR_CHUNK_LEAD))
     if max_episode_len <= 0:
         raise ValueError("max_episode_len must be positive")
+    if batch_size <= 0:
+        raise ValueError("stream_batch_size must be positive")
 
     dataset = load_lerobot_dataset(lerobot_root)
     n_frames = len(dataset)
@@ -180,12 +234,17 @@ def build_zarr_from_lerobot(config):
     compressor = _make_compressor()
     state_shape = first["state"].shape
     action_shape = first["action"].shape
-
     arrays = {
         "state": _create_dataset(data, "state", (n_frames, *state_shape), "float32", compressor),
-        "next_state": _create_dataset(data, "next_state", (n_frames, *state_shape), "float32", compressor),
-        "action": _create_dataset(data, "action", (n_frames, *action_shape), "float32", compressor),
-        "next_action": _create_dataset(data, "next_action", (n_frames, *action_shape), "float32", compressor),
+        "next_state": _create_dataset(
+            data, "next_state", (n_frames, *state_shape), "float32", compressor
+        ),
+        "action": _create_dataset(
+            data, "action", (n_frames, *action_shape), "float32", compressor
+        ),
+        "next_action": _create_dataset(
+            data, "next_action", (n_frames, *action_shape), "float32", compressor
+        ),
         "reward": _create_dataset(data, "reward", (n_frames, 1), "float32", compressor),
         "return": _create_dataset(data, "return", (n_frames, 1), "float32", compressor),
         "done": _create_dataset(data, "done", (n_frames, 1), "bool", compressor),
@@ -210,20 +269,23 @@ def build_zarr_from_lerobot(config):
             arrays[f"next_{buffer_name}"] = _create_dataset(
                 data, f"next_{buffer_name}", (n_frames, *depth.shape), depth.dtype, compressor
             )
+    del first
 
     rewards = np.empty((n_frames, 1), dtype=np.float32)
     not_done = np.empty((n_frames, 1), dtype=np.float32)
     episode_ends = []
+    transition_batch = []
     write_index = 0
+    transition_count = 0
 
     cprint(
-        f"Streaming {n_frames} frames from {len(episodes)} episodes directly to Zarr",
+        f"Streaming {n_frames} frames from {len(episodes)} episodes directly to Zarr "
+        f"in batches of {batch_size}",
         "cyan",
     )
 
-    for episode_frames in tqdm(
-        episodes.values(), total=len(episodes), desc="Streaming episodes to Zarr"
-    ):
+    progress = tqdm(total=n_frames, desc="Streaming frames to Zarr")
+    for episode_frames in episodes.values():
         episode_length = len(episode_frames)
         if episode_length == 0:
             continue
@@ -237,7 +299,8 @@ def build_zarr_from_lerobot(config):
         for t, source_index in enumerate(episode_frames):
             if source_index != current_source_index:
                 raise RuntimeError(
-                    f"stream cursor mismatch: expected source frame {current_source_index}, got {source_index}"
+                    f"stream cursor mismatch: expected source frame {current_source_index}, "
+                    f"got {source_index}"
                 )
 
             terminal = t == episode_length - 1
@@ -264,39 +327,46 @@ def build_zarr_from_lerobot(config):
                     current["action"] - previous_action
                 )
 
-            arrays["state"][write_index] = current["state"].astype(np.float32, copy=False)
-            arrays["next_state"][write_index] = next_item["state"].astype(np.float32, copy=False)
-            arrays["action"][write_index] = current["action"].astype(np.float32, copy=False)
-            arrays["next_action"][write_index] = next_item["action"].astype(np.float32, copy=False)
-            arrays["reward"][write_index, 0] = reward
-            arrays["done"][write_index, 0] = terminal
-            arrays["timeout"][write_index, 0] = terminal
-
-            for feature_name, buffer_name in RGB_FEATURE_TO_BUFFER.items():
-                arrays[buffer_name][write_index] = current["rgb"][feature_name]
-                arrays[f"next_{buffer_name}"][write_index] = next_item["rgb"][feature_name]
-
+            item = {
+                "state": current["state"],
+                "next_state": next_item["state"],
+                "action": current["action"],
+                "next_action": next_item["action"],
+                "rgb": current["rgb"],
+                "next_rgb": next_item["rgb"],
+                "reward": reward,
+                "terminal": terminal,
+            }
             if use_depth:
-                for feature_name, buffer_name in DEPTH_FEATURE_TO_BUFFER.items():
-                    arrays[buffer_name][write_index] = current["depth"][feature_name]
-                    arrays[f"next_{buffer_name}"][write_index] = next_item["depth"][feature_name]
+                item["depth"] = current["depth"]
+                item["next_depth"] = next_item["depth"]
+            transition_batch.append(item)
 
-            rewards[write_index, 0] = reward
-            not_done[write_index, 0] = 0.0 if terminal else 1.0
+            rewards[transition_count, 0] = reward
+            not_done[transition_count, 0] = 0.0 if terminal else 1.0
+            transition_count += 1
+            progress.update(1)
+
             previous_action = np.array(current["action"], copy=True)
-            write_index += 1
-
             if not terminal:
-                del current
                 current = next_item
                 current_source_index = next_source_index
 
-        del current
-        episode_ends.append(write_index)
-        gc.collect()
+            if len(transition_batch) >= batch_size:
+                write_index = _flush_transition_batch(
+                    arrays, transition_batch, write_index, use_depth
+                )
 
-    if write_index != n_frames:
-        raise RuntimeError(f"wrote {write_index} transitions, expected {n_frames}")
+        episode_ends.append(transition_count)
+        del current
+
+    progress.close()
+    write_index = _flush_transition_batch(arrays, transition_batch, write_index, use_depth)
+
+    if transition_count != n_frames or write_index != n_frames:
+        raise RuntimeError(
+            f"processed={transition_count}, wrote={write_index}, expected={n_frames}"
+        )
 
     returns = compute_return(rewards, not_done, gamma=RETURN_GAMMA).astype(np.float32)
     arrays["return"][:] = returns
