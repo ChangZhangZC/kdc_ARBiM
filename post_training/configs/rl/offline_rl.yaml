@@ -60,6 +60,10 @@ dataset:
   finetune_sequence_stride: ${rl_chunk_size}  # Numeric sampling hyperparameter; default advances one RL chunk per PPO sample.
   val_ratio: 0.1
   max_train_episodes: null
+  endpoint_obs_only: false  # Performance option: sample only transition endpoint observations instead of all H RGB frames.
+  use_latent_cache: false  # Performance option: precompute frozen ACT token latents once and reuse them for Critic/Dynamics.
+  latent_cache_dir: null  # null -> dataset_path + encoder/normalizer fingerprint keyed cache directory.
+  latent_cache_batch_size: 64  # One-time endpoint encoding batch size used while building the cache.
 
 dataloader:
   batch_size: 128
