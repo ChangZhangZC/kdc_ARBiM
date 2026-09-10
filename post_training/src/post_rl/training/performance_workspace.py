@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import os
 
+import numpy as np
+import torch
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
 
@@ -136,9 +138,52 @@ class TrainACTWorkspace(_ContractTrainACTWorkspace):
             str(self._normalizer_sha256),
         )
 
+    def _prepare_cached_policy_frontend(self) -> None:
+        if self.latent_cache is None:
+            raise RuntimeError("Frozen latent cache must exist before preparing PPO reuse.")
+        raw_obs = self.dataset._raw_endpoint_obs(0, next_obs=False)
+        raw_batch = {
+            key: torch.from_numpy(np.array(value, copy=True)).unsqueeze(0).to(self.device)
+            for key, value in raw_obs.items()
+        }
+        normalized = self.obs_adapter.normalize_obs(raw_batch)
+        policy_obs = {key: value[:, 0] for key, value in normalized.items()}
+        with torch.no_grad():
+            direct_latent, encoder_pos_embed = self.model.encode_observation(policy_obs)
+
+        cached_latent = torch.from_numpy(
+            np.array(self.latent_cache.obs[0], dtype=np.float32, copy=True)
+        ).unsqueeze(0).to(self.device)
+        if direct_latent.shape != cached_latent.shape:
+            raise RuntimeError(
+                "Frozen policy/cache latent shape mismatch: "
+                f"policy={tuple(direct_latent.shape)}, cache={tuple(cached_latent.shape)}"
+            )
+        diff = direct_latent.float() - cached_latent
+        max_abs = float(diff.abs().max().item())
+        relative_l2 = float(
+            torch.linalg.vector_norm(diff).item()
+            / max(torch.linalg.vector_norm(direct_latent.float()).item(), 1e-12)
+        )
+        if max_abs > 0.1 or relative_l2 > 0.02:
+            raise RuntimeError(
+                "Frozen policy/cache latent contract mismatch: "
+                f"max_abs={max_abs:.6g}, relative_l2={relative_l2:.6g}"
+            )
+
+        self.model.set_frozen_encoder_pos_embed(encoder_pos_embed)
+        self._frozen_encoder_pos_embed = encoder_pos_embed.detach().clone()
+        if self.rank == 0:
+            print(
+                "Frozen ACT policy latent reuse ready: "
+                f"tokens={cached_latent.shape[1]}, dim={cached_latent.shape[2]}, "
+                f"relative_l2={relative_l2:.6g}"
+            )
+
     def _build_act_observation_frontends(self) -> None:
         super()._build_act_observation_frontends()
         self.latent_cache = None
+        self._frozen_encoder_pos_embed = None
         if not self._performance_enabled():
             return
         if not self._endpoint_sampling_enabled():
@@ -174,6 +219,7 @@ class TrainACTWorkspace(_ContractTrainACTWorkspace):
             self.dataset.set_latent_cache(self.latent_cache)
         if hasattr(self, "val_dataset"):
             self.val_dataset.set_latent_cache(self.latent_cache)
+        self._prepare_cached_policy_frontend()
         if self.rank == 0:
             print(
                 "Frozen ACT latent cache ready: "
@@ -271,6 +317,7 @@ class TrainACTWorkspace(_ContractTrainACTWorkspace):
 
         cfg = self.cfg
         stride = int(cfg.dataset.finetune_sequence_stride)
+        use_cache = self._performance_enabled()
         dataset = OfflineDataset(
             buffer=self.buffer,
             horizon=cfg.horizon,
@@ -282,7 +329,7 @@ class TrainACTWorkspace(_ContractTrainACTWorkspace):
             max_train_episodes=cfg.dataset.max_train_episodes,
             use_depth=cfg.dataset.use_depth,
             endpoint_obs_only=True,
-            latent_cache=None,
+            latent_cache=self.latent_cache if use_cache else None,
             include_next_obs=False,
             next_obs_offset=self._transition_steps(),
         )
@@ -318,5 +365,6 @@ class TrainACTWorkspace(_ContractTrainACTWorkspace):
         if self.rank == 0:
             print(
                 f"Finetune dataset: {len(dataset)} samples "
-                f"(stride={stride}, batch_size={cfg.unio4.finetune_batch_size}, endpoint_obs_only=true)"
+                f"(stride={stride}, batch_size={cfg.unio4.finetune_batch_size}, "
+                f"endpoint_obs_only=true, latent_cache={str(use_cache).lower()})"
             )
