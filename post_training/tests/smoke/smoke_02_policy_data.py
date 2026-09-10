@@ -15,6 +15,7 @@ from _common import (
     print_pass,
     print_section,
 )
+from post_rl.data.offline_buffer import LazyZarrArray
 
 
 def main() -> None:
@@ -27,6 +28,23 @@ def main() -> None:
     dataset, batch = build_real_batch(workspace, args.batch_size)
 
     print_section("offline data")
+    modal_keys = [
+        *workspace.buffer.RGB_KEYS,
+        *(f"next_{key}" for key in workspace.buffer.RGB_KEYS),
+    ]
+    if bool(cfg.dataset.use_depth):
+        modal_keys.extend(workspace.buffer.DEPTH_KEYS)
+        modal_keys.extend(f"next_{key}" for key in workspace.buffer.DEPTH_KEYS)
+    non_lazy = [
+        key for key in modal_keys
+        if not isinstance(workspace.buffer[key], LazyZarrArray)
+    ]
+    if non_lazy:
+        raise AssertionError(
+            f"Zarr image/depth modalities must remain lazy in OfflineBuffer: {non_lazy}"
+        )
+    print_pass("Zarr RGB/depth modalities remain lazy and are loaded only per sampled sequence")
+
     required = {"obs", "next_obs", "action", "next_action", "reward", "not_done", "return"}
     missing = required.difference(batch)
     if missing:
