@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import math
+import os
 
 import torch
 
@@ -45,6 +46,8 @@ def main() -> None:
     cfg.unio4.is_clip_decay = False
     cfg.unio4.is_bppo_lr_decay = False
     cfg.unio4.is_linear_decay = False
+    cfg.ppo.enable_monitoring_csv = True
+    cfg.ppo.monitor_every_updates = 1
     workspace = make_workspace(cfg, make_work_dir(args, f"smoke_05_{args.case}"))
     _, batch = build_real_batch(workspace, max(args.batch_size, 2))
 
@@ -126,8 +129,43 @@ def main() -> None:
     if abs(float(logged_ratio) - 1.0) > 1e-5:
         raise AssertionError(f"Logged initial ratio mean is not ~1: {float(logged_ratio)}")
 
+    if not ppo._monitor_records:
+        raise AssertionError("Monitoring-only PPO diagnostics produced no record")
+    monitor = ppo._monitor_records[-1]
+    expected_monitor_keys = {
+        "iteration",
+        "loss",
+        "policy_loss",
+        "entropy",
+        "ratio_mean",
+        "approx_kl",
+        "clip_fraction",
+        "adv_pre_norm_mean",
+        "adv_pre_norm_std",
+        "grad_norm",
+        "log_std_mean",
+        "lr",
+        "clip_ratio",
+    }
+    if set(monitor) != expected_monitor_keys:
+        raise AssertionError(
+            f"Unexpected PPO monitoring fields: {sorted(set(monitor) ^ expected_monitor_keys)}"
+        )
+    for key, value in monitor.items():
+        if key != "iteration" and not math.isfinite(float(value)):
+            raise AssertionError(f"Non-finite PPO monitoring value: {key}={value}")
+    ppo.flush_monitor_logs(force=True)
+    monitor_csv = os.path.join(
+        workspace.get_ppo_artifact_dir(),
+        "monitoring",
+        "ppo_metrics.csv",
+    )
+    if not os.path.isfile(monitor_csv):
+        raise AssertionError(f"PPO monitoring CSV was not written: {monitor_csv}")
+
     print_pass(f"PPO loss is finite and {len(changed)} trainable parameter tensors changed")
     print_pass("frozen ACT parameters stayed unchanged")
+    print_pass("monitoring-only PPO diagnostics were written to compact CSV")
     print("\nSMOKE 05 PASSED")
 
 
