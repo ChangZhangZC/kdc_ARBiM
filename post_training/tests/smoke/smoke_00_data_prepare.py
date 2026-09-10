@@ -2,14 +2,38 @@ from __future__ import annotations
 
 import argparse
 import pathlib
+import sys
+import tempfile
 
 import numpy as np
-import torch
 import zarr
 
-from _common import make_work_dir, print_pass, print_section
+REPO_ROOT = pathlib.Path(__file__).resolve().parents[3]
+POST_RL_SRC = REPO_ROOT / "post_training" / "src"
+LEROBOT_SRC = REPO_ROOT / "third_party" / "lerobot" / "src"
+for path in (REPO_ROOT, POST_RL_SRC, LEROBOT_SRC):
+    path_str = str(path)
+    if path_str not in sys.path:
+        sys.path.insert(0, path_str)
+
 from post_rl.data import data_prepare as dp
-from post_rl.data.offline_buffer import OfflineBuffer
+from post_rl.data.streaming_data_prepare import build_zarr_from_lerobot
+
+
+def _make_work_dir(path: str | None) -> pathlib.Path:
+    if path:
+        work_dir = pathlib.Path(path).expanduser().resolve() / "smoke_00_data_prepare"
+        work_dir.mkdir(parents=True, exist_ok=True)
+        return work_dir
+    return pathlib.Path(tempfile.mkdtemp(prefix="arbim_smoke_00_data_prepare_"))
+
+
+def _print_section(title: str) -> None:
+    print(f"\n=== {title} ===")
+
+
+def _print_pass(message: str) -> None:
+    print(f"[PASS] {message}")
 
 
 def _as_numpy(value, name: str) -> np.ndarray:
@@ -67,12 +91,10 @@ def _probe_lerobot_input(root: str, use_depth: bool) -> tuple[int, int]:
             raise AssertionError(
                 f"LeRobot probe frame {index} is missing required keys: {missing}"
             )
-
         episode_id = frame["episode_index"]
         if hasattr(episode_id, "item"):
             episode_id = episode_id.item()
         episode_ids.add(episode_id)
-
         _as_numpy(frame["observation.state"], f"frame[{index}].observation.state")
         _as_numpy(frame["action"], f"frame[{index}].action")
         for key in dp.RGB_FEATURE_TO_BUFFER:
@@ -84,176 +106,7 @@ def _probe_lerobot_input(root: str, use_depth: bool) -> tuple[int, int]:
     return len(dataset), len(episode_ids)
 
 
-def _episode_ends_from_timeout(timeout) -> np.ndarray:
-    timeout = np.asarray(timeout, dtype=bool)
-    return np.flatnonzero(timeout) + 1
-
-
-def _validate_processed_reward(data: dict, config: dict) -> None:
-    actions = data["action"]
-    rewards = np.asarray(data["reward"], dtype=np.float64)
-    episode_ends = _episode_ends_from_timeout(data["timeout"])
-    if len(episode_ends) == 0:
-        raise AssertionError("Processed data contains no completed episode")
-
-    start = 0
-    for episode_idx, end in enumerate(episode_ends):
-        episode_len = int(end - start)
-        if episode_len <= 0:
-            raise AssertionError(f"Episode {episode_idx} has invalid length {episode_len}")
-
-        for local_t, index in enumerate(range(start, end)):
-            expected = float(local_t == episode_len - 1)
-            if expected == 1.0:
-                expected -= (
-                    float(config["lambda_penalty"])
-                    * episode_len
-                    / float(config["max_episode_len"])
-                )
-            if local_t > 0:
-                current_action = np.asarray(actions[index])
-                previous_action = np.asarray(actions[index - 1])
-                expected -= float(config["smooth_penalty"]) * np.linalg.norm(
-                    current_action - previous_action
-                )
-
-            if not np.isclose(rewards[index], expected, rtol=1e-6, atol=1e-6):
-                raise AssertionError(
-                    f"Reward mismatch at episode={episode_idx}, t={local_t}: "
-                    f"actual={rewards[index]:.8f}, expected={expected:.8f}"
-                )
-        start = int(end)
-
-    if start != len(rewards):
-        raise AssertionError(
-            f"Processed episodes cover {start} frames but dataset has {len(rewards)}"
-        )
-
-
-def _validate_processed_npy(data: dict, use_depth: bool, config: dict) -> np.ndarray:
-    dp._validate_processed_data(data, use_depth, "smoke processed npy")
-    required = ["agent_pos", "action", "rgb", "reward", "done", "timeout"]
-    if use_depth:
-        required.append("depth")
-
-    lengths = {key: len(data[key]) for key in required}
-    if len(set(lengths.values())) != 1:
-        raise AssertionError(f"Processed field lengths differ: {lengths}")
-    if next(iter(lengths.values())) == 0:
-        raise AssertionError("Processed NPY contains zero frames")
-
-    for index, value in enumerate(data["agent_pos"]):
-        _as_numpy(value, f"processed.agent_pos[{index}]")
-    for index, value in enumerate(data["action"]):
-        _as_numpy(value, f"processed.action[{index}]")
-
-    episode_ends = _episode_ends_from_timeout(data["timeout"])
-    done_ends = np.flatnonzero(np.asarray(data["done"], dtype=bool)) + 1
-    np.testing.assert_array_equal(episode_ends, done_ends)
-    if episode_ends[-1] != len(data["timeout"]):
-        raise AssertionError("Final processed episode is not closed at the last frame")
-
-    _validate_processed_reward(data, config)
-    return episode_ends.astype(np.int64)
-
-
-def _transition_probe_indices(n: int, episode_ends: np.ndarray) -> list[int]:
-    indices = {0, n // 2, n - 1}
-    for end in episode_ends:
-        terminal = int(end) - 1
-        indices.add(terminal)
-        if terminal > 0:
-            indices.add(terminal - 1)
-    return sorted(index for index in indices if 0 <= index < n)[:64]
-
-
-def _validate_transition_buffers(
-    data: dict,
-    buffers: dict,
-    episode_ends: np.ndarray,
-    use_depth: bool,
-) -> None:
-    n = len(data["action"])
-    if int(buffers["_total_count"]) != n:
-        raise AssertionError(
-            f"Transition count mismatch: {buffers['_total_count']} != {n}"
-        )
-    np.testing.assert_array_equal(
-        np.asarray(buffers["episode_ends"], dtype=np.int64), episode_ends
-    )
-
-    timeout = np.asarray(data["timeout"], dtype=bool)
-    next_indices = np.arange(n, dtype=np.int64) + 1
-    next_indices[-1] = n - 1
-    terminal_indices = np.flatnonzero(timeout)
-    next_indices[terminal_indices] = terminal_indices
-
-    state = np.stack(data["agent_pos"], axis=0)
-    action = np.stack(data["action"], axis=0)
-    _assert_array_equal(np.stack(buffers["state"], axis=0), state, "buffer.state")
-    _assert_array_equal(
-        np.stack(buffers["next_state"], axis=0),
-        state[next_indices],
-        "buffer.next_state",
-    )
-    _assert_array_equal(np.stack(buffers["action"], axis=0), action, "buffer.action")
-    _assert_array_equal(
-        np.stack(buffers["next_action"], axis=0),
-        action[next_indices],
-        "buffer.next_action",
-    )
-    _assert_array_equal(
-        np.asarray(buffers["reward"], dtype=np.float32),
-        np.asarray(data["reward"], dtype=np.float32),
-        "buffer.reward",
-    )
-    np.testing.assert_array_equal(
-        np.asarray(buffers["done"], dtype=bool), np.asarray(data["done"], dtype=bool)
-    )
-    np.testing.assert_array_equal(
-        np.asarray(buffers["timeout"], dtype=bool), timeout
-    )
-
-    probe_indices = _transition_probe_indices(n, episode_ends)
-    for index in probe_indices:
-        next_index = int(next_indices[index])
-        for feature_name, buffer_name in dp.RGB_FEATURE_TO_BUFFER.items():
-            _assert_array_equal(
-                buffers[buffer_name][index],
-                data["rgb"][index][feature_name],
-                f"{buffer_name}[{index}]",
-            )
-            _assert_array_equal(
-                buffers[f"next_{buffer_name}"][index],
-                data["rgb"][next_index][feature_name],
-                f"next_{buffer_name}[{index}]",
-            )
-        if use_depth:
-            for feature_name, buffer_name in dp.DEPTH_FEATURE_TO_BUFFER.items():
-                _assert_array_equal(
-                    buffers[buffer_name][index],
-                    data["depth"][index][feature_name],
-                    f"{buffer_name}[{index}]",
-                )
-                _assert_array_equal(
-                    buffers[f"next_{buffer_name}"][index],
-                    data["depth"][next_index][feature_name],
-                    f"next_{buffer_name}[{index}]",
-                )
-
-
-def _validate_zarr(
-    zarr_path: str,
-    buffers: dict,
-    episode_ends: np.ndarray,
-    use_depth: bool,
-) -> None:
-    root = zarr.open_group(zarr_path, mode="r")
-    if "data" not in root or "meta" not in root:
-        raise AssertionError("Zarr must contain data/ and meta/ groups")
-    data = root["data"]
-    meta = root["meta"]
-
+def _required_zarr_keys(use_depth: bool) -> set[str]:
     required = {
         "state",
         "next_state",
@@ -269,62 +122,180 @@ def _validate_zarr(
     if use_depth:
         required.update(dp.DEPTH_FEATURE_TO_BUFFER.values())
         required.update(f"next_{name}" for name in dp.DEPTH_FEATURE_TO_BUFFER.values())
+    return required
 
+
+def _transition_probe_indices(n: int, episode_ends: np.ndarray) -> list[int]:
+    indices = {0, n // 2, n - 1}
+    for end in episode_ends:
+        terminal = int(end) - 1
+        indices.add(terminal)
+        if terminal > 0:
+            indices.add(terminal - 1)
+    return sorted(index for index in indices if 0 <= index < n)[:64]
+
+
+def _validate_reward_and_return(data, episode_ends: np.ndarray, config: dict) -> None:
+    actions = np.asarray(data["action"][:], dtype=np.float32)
+    rewards = np.asarray(data["reward"][:], dtype=np.float32)
+    done = np.asarray(data["done"][:], dtype=bool).reshape(-1)
+    timeout = np.asarray(data["timeout"][:], dtype=bool).reshape(-1)
+    stored_return = np.asarray(data["return"][:], dtype=np.float32)
+
+    n = len(actions)
+    expected_done = np.zeros(n, dtype=bool)
+    expected_done[episode_ends - 1] = True
+    np.testing.assert_array_equal(done, expected_done)
+    np.testing.assert_array_equal(timeout, expected_done)
+
+    start = 0
+    for episode_idx, end in enumerate(episode_ends):
+        end = int(end)
+        episode_len = end - start
+        if episode_len <= 0:
+            raise AssertionError(f"episode {episode_idx} has invalid length {episode_len}")
+        for local_t, index in enumerate(range(start, end)):
+            expected_reward = float(local_t == episode_len - 1)
+            if local_t == episode_len - 1:
+                expected_reward -= (
+                    float(config["lambda_penalty"])
+                    * episode_len
+                    / float(config["max_episode_len"])
+                )
+            if local_t > 0:
+                expected_reward -= float(config["smooth_penalty"]) * np.linalg.norm(
+                    actions[index] - actions[index - 1]
+                )
+            if not np.isclose(
+                rewards[index, 0], expected_reward, rtol=1e-6, atol=1e-6
+            ):
+                raise AssertionError(
+                    f"reward mismatch at episode={episode_idx}, t={local_t}: "
+                    f"actual={rewards[index, 0]:.8f}, expected={expected_reward:.8f}"
+                )
+        start = end
+
+    not_done = (~expected_done).astype(np.float32).reshape(-1, 1)
+    expected_return = dp.compute_return(rewards, not_done, gamma=dp.RETURN_GAMMA)
+    np.testing.assert_allclose(stored_return, expected_return, rtol=1e-6, atol=1e-6)
+
+
+def _validate_source_alignment(
+    lerobot_root: str,
+    data,
+    source_indices: np.ndarray,
+    episode_ends: np.ndarray,
+    use_depth: bool,
+) -> None:
+    dataset = dp.load_lerobot_dataset(lerobot_root)
+    n = len(source_indices)
+    terminal_indices = set((episode_ends - 1).tolist())
+
+    for output_index in _transition_probe_indices(n, episode_ends):
+        source_index = int(source_indices[output_index])
+        next_output_index = output_index if output_index in terminal_indices else output_index + 1
+        next_source_index = int(source_indices[next_output_index])
+        frame = dataset[source_index]
+        next_frame = frame if next_source_index == source_index else dataset[next_source_index]
+
+        _assert_array_equal(
+            data["state"][output_index],
+            _as_numpy(frame["observation.state"], f"source.state[{source_index}]").astype(np.float32),
+            f"state[{output_index}]",
+        )
+        _assert_array_equal(
+            data["next_state"][output_index],
+            _as_numpy(next_frame["observation.state"], f"source.next_state[{next_source_index}]").astype(np.float32),
+            f"next_state[{output_index}]",
+        )
+        _assert_array_equal(
+            data["action"][output_index],
+            _as_numpy(frame["action"], f"source.action[{source_index}]").astype(np.float32),
+            f"action[{output_index}]",
+        )
+        _assert_array_equal(
+            data["next_action"][output_index],
+            _as_numpy(next_frame["action"], f"source.next_action[{next_source_index}]").astype(np.float32),
+            f"next_action[{output_index}]",
+        )
+
+        for feature_name, buffer_name in dp.RGB_FEATURE_TO_BUFFER.items():
+            _assert_array_equal(
+                data[buffer_name][output_index],
+                _as_numpy(frame[feature_name], f"source.{feature_name}[{source_index}]"),
+                f"{buffer_name}[{output_index}]",
+            )
+            _assert_array_equal(
+                data[f"next_{buffer_name}"][output_index],
+                _as_numpy(next_frame[feature_name], f"source.next_{feature_name}[{next_source_index}]"),
+                f"next_{buffer_name}[{output_index}]",
+            )
+
+        if use_depth:
+            for feature_name, buffer_name in dp.DEPTH_FEATURE_TO_BUFFER.items():
+                _assert_array_equal(
+                    data[buffer_name][output_index],
+                    _as_numpy(frame[feature_name], f"source.{feature_name}[{source_index}]"),
+                    f"{buffer_name}[{output_index}]",
+                )
+                _assert_array_equal(
+                    data[f"next_{buffer_name}"][output_index],
+                    _as_numpy(next_frame[feature_name], f"source.next_{feature_name}[{next_source_index}]"),
+                    f"next_{buffer_name}[{output_index}]",
+                )
+
+
+def _validate_zarr(
+    zarr_path: str,
+    result: dict,
+    lerobot_root: str,
+    config: dict,
+    use_depth: bool,
+) -> None:
+    root = zarr.open_group(zarr_path, mode="r")
+    if "data" not in root or "meta" not in root:
+        raise AssertionError("Zarr must contain data/ and meta/ groups")
+    data = root["data"]
+    meta = root["meta"]
+    required = _required_zarr_keys(use_depth)
     missing = sorted(required.difference(data.keys()))
     if missing:
         raise AssertionError(f"Zarr data group is missing fields: {missing}")
     if "episode_ends" not in meta:
         raise AssertionError("Zarr meta group is missing episode_ends")
 
-    n = len(buffers["state"])
-    bad_lengths = {key: data[key].shape[0] for key in required if data[key].shape[0] != n}
+    n = int(result["num_frames"])
+    bad_lengths = {
+        key: data[key].shape[0]
+        for key in required
+        if data[key].shape[0] != n
+    }
     if bad_lengths:
         raise AssertionError(f"Zarr fields do not all have length {n}: {bad_lengths}")
 
-    stored_ends = np.asarray(meta["episode_ends"][:], dtype=np.int64)
-    np.testing.assert_array_equal(stored_ends, episode_ends)
-    if len(stored_ends) == 0 or stored_ends[-1] != n:
+    episode_ends = np.asarray(meta["episode_ends"][:], dtype=np.int64)
+    np.testing.assert_array_equal(episode_ends, result["episode_ends"])
+    if len(episode_ends) == 0 or episode_ends[-1] != n:
         raise AssertionError("Zarr episode_ends does not close the final transition")
-    if np.any(np.diff(stored_ends) <= 0):
+    if np.any(np.diff(episode_ends) <= 0):
         raise AssertionError("Zarr episode_ends must be strictly increasing")
 
     for key in ("state", "next_state", "action", "next_action", "reward", "return"):
         _as_numpy(data[key][:], f"zarr.data.{key}")
 
-    probe_indices = _transition_probe_indices(n, episode_ends)
-    image_keys = list(dp.RGB_FEATURE_TO_BUFFER.values())
-    if use_depth:
-        image_keys.extend(dp.DEPTH_FEATURE_TO_BUFFER.values())
-    for key in image_keys:
-        for index in probe_indices:
-            _assert_array_equal(data[key][index], buffers[key][index], f"zarr.{key}[{index}]")
-            _assert_array_equal(
-                data[f"next_{key}"][index],
-                buffers[f"next_{key}"][index],
-                f"zarr.next_{key}[{index}]",
-            )
-
-    offline = OfflineBuffer(
-        device=torch.device("cpu"),
-        gamma=dp.RETURN_GAMMA,
-        use_depth=use_depth,
-    )
-    offline.load_zarr(zarr_path)
-    if len(offline) != n:
-        raise AssertionError(f"OfflineBuffer length mismatch: {len(offline)} != {n}")
-    np.testing.assert_array_equal(offline.episode_ends, episode_ends)
-    offline.compute_return()
-    np.testing.assert_allclose(
-        offline["return"],
-        np.asarray(data["return"][:], dtype=np.float32),
-        rtol=1e-6,
-        atol=1e-6,
+    _validate_reward_and_return(data, episode_ends, config)
+    _validate_source_alignment(
+        lerobot_root,
+        data,
+        np.asarray(result["source_indices"], dtype=np.int64),
+        episode_ends,
+        use_depth,
     )
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Smoke 00: LeRobot -> processed NPY -> Offline RL Zarr contract"
+        description="Smoke 00: memory-safe LeRobot -> Offline RL Zarr contract"
     )
     parser.add_argument("--lerobot-root", required=True)
     parser.add_argument("--work-dir", default=None)
@@ -338,13 +309,11 @@ def main() -> None:
         raise ValueError("--max-episode-len must be positive")
 
     lerobot_root = str(pathlib.Path(args.lerobot_root).expanduser().resolve())
-    work_dir = pathlib.Path(make_work_dir(args, "smoke_00_data_prepare"))
-    processed_path = work_dir / "processed.npy"
+    work_dir = _make_work_dir(args.work_dir)
     zarr_path = work_dir / "offline_rl.zarr"
-
     config = {
         "lerobot_root": lerobot_root,
-        "processed_npy_output": str(processed_path),
+        "zarr_output_path": str(zarr_path),
         "use_depth": bool(args.use_depth),
         "max_episode_len": int(args.max_episode_len),
         "lambda_penalty": float(args.lambda_penalty),
@@ -352,52 +321,33 @@ def main() -> None:
         "overwrite": True,
     }
 
-    print_section("LeRobot input contract")
+    _print_section("LeRobot input contract")
     frame_count, probed_episode_count = _probe_lerobot_input(
         lerobot_root, bool(args.use_depth)
     )
-    print_pass(
+    _print_pass(
         f"LeRobot input probes are valid: frames={frame_count}, "
         f"probe_episode_ids={probed_episode_count}"
     )
 
-    print_section("LeRobot -> processed NPY")
-    dp.process_raw_teleop_to_npy(config)
-    processed = dp.load_processed_npy(str(processed_path))
-    episode_ends = _validate_processed_npy(processed, bool(args.use_depth), config)
-    print_pass(
-        f"processed NPY is valid: frames={len(processed['action'])}, "
-        f"episodes={len(episode_ends)}, reward formula matches"
+    _print_section("LeRobot -> streaming Offline RL Zarr")
+    result = build_zarr_from_lerobot(config)
+    _print_pass(
+        f"streaming conversion completed: frames={result['num_frames']}, "
+        f"episodes={result['num_episodes']}"
     )
 
-    print_section("processed NPY -> transition buffers")
-    buffers = dp.make_buffers(use_depth=bool(args.use_depth))
-    dp.append_processed_transitions(processed, buffers, "smoke_teleop", config)
-    dp.record_source(
-        buffers,
-        "teleop_npy",
-        {"name": "smoke_teleop", "path": str(processed_path)},
-    )
-    _validate_transition_buffers(
-        processed,
-        buffers,
-        episode_ends,
-        bool(args.use_depth),
-    )
-    print_pass("single-step and terminal self-loop transition alignment is correct")
-
-    print_section("transition buffers -> Zarr -> OfflineBuffer")
-    dp.write_zarr(buffers, str(zarr_path), overwrite=True)
+    _print_section("Zarr contract and source alignment")
     _validate_zarr(
         str(zarr_path),
-        buffers,
-        episode_ends,
+        result,
+        lerobot_root,
+        config,
         bool(args.use_depth),
     )
-    print_pass("Zarr contract and OfflineBuffer reload are valid")
+    _print_pass("reward, return, terminal self-loop, RGB and transition alignment are valid")
 
-    print(f"\nProcessed NPY: {processed_path}")
-    print(f"Generated Zarr: {zarr_path}")
+    print(f"\nGenerated Zarr: {zarr_path}")
     print("SMOKE 00 PASSED")
 
 
