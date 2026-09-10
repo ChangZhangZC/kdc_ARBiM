@@ -128,7 +128,7 @@ class OfflineDataset(Dataset):
                 if next_obs
                 else self.latent_cache.obs[index]
             )
-            return {"latent": np.asarray(latent, dtype=np.float32)[None]}
+            return {"latent": np.array(latent, dtype=np.float32, copy=True)[None]}
         return self._raw_endpoint_obs(index, next_obs)
 
     def _sample_to_data(self, sample: dict[str, np.ndarray], idx: int) -> dict[str, Any]:
