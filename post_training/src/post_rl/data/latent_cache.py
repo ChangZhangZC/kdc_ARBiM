@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import shutil
@@ -44,13 +45,35 @@ class LazyNpyArray:
         return state
 
 
+class MappedLatentArray:
+    """View next-observation latents through the transition next-index mapping."""
+
+    def __init__(self, base: LazyNpyArray, next_indices: np.ndarray) -> None:
+        self.base = base
+        self.next_indices = np.asarray(next_indices, dtype=np.int64)
+        self.shape = base.shape
+        self.dtype = base.dtype
+        if len(self.next_indices) != len(base):
+            raise ValueError("next-index map length must match latent cache length")
+
+    def __getitem__(self, index):
+        mapped = self.next_indices[index]
+        return self.base[mapped]
+
+    def __len__(self) -> int:
+        return len(self.base)
+
+
 class FrozenLatentCache:
     def __init__(self, directory: str, expected_metadata: dict | None = None) -> None:
         self.directory = os.path.abspath(directory)
         metadata_path = os.path.join(self.directory, "metadata.json")
         obs_path = os.path.join(self.directory, "obs_latent.npy")
-        next_obs_path = os.path.join(self.directory, "next_obs_latent.npy")
-        if not all(os.path.isfile(path) for path in (metadata_path, obs_path, next_obs_path)):
+        next_indices_path = os.path.join(self.directory, "next_indices.npy")
+        if not all(
+            os.path.isfile(path)
+            for path in (metadata_path, obs_path, next_indices_path)
+        ):
             raise FileNotFoundError(f"Incomplete frozen latent cache: {self.directory}")
         with open(metadata_path, "r") as file:
             self.metadata = json.load(file)
@@ -63,31 +86,51 @@ class FrozenLatentCache:
             if mismatch:
                 raise RuntimeError(f"Frozen latent cache contract mismatch: {mismatch}")
         self.obs = LazyNpyArray(obs_path)
-        self.next_obs = LazyNpyArray(next_obs_path)
-        if self.obs.shape != self.next_obs.shape:
-            raise RuntimeError(
-                f"Frozen latent cache shape mismatch: {self.obs.shape} vs {self.next_obs.shape}"
-            )
+        self.next_indices = np.load(next_indices_path, mmap_mode="r")
+        self.next_obs = MappedLatentArray(self.obs, self.next_indices)
 
 
-def _raw_endpoint_batch(buffer, start: int, end: int, use_depth: bool, next_obs: bool):
-    prefix = "next_" if next_obs else ""
+def _raw_obs_batch(buffer, start: int, end: int, use_depth: bool):
     obs = {
-        "state": torch.from_numpy(np.asarray(buffer[f"{prefix}state"][start:end])).unsqueeze(1),
+        "state": torch.from_numpy(np.asarray(buffer["state"][start:end])).unsqueeze(1),
     }
     for key in RGB_KEYS:
-        obs[key] = torch.from_numpy(np.asarray(buffer[f"{prefix}{key}"][start:end])).unsqueeze(1)
+        obs[key] = torch.from_numpy(np.asarray(buffer[key][start:end])).unsqueeze(1)
     if use_depth:
         for key in DEPTH_KEYS:
-            obs[key] = torch.from_numpy(np.asarray(buffer[f"{prefix}{key}"][start:end])).unsqueeze(1)
+            obs[key] = torch.from_numpy(np.asarray(buffer[key][start:end])).unsqueeze(1)
     return obs
 
 
-def _encode_endpoint_batch(obs_adapter, buffer, start, end, use_depth, next_obs):
-    obs = _raw_endpoint_batch(buffer, start, end, use_depth, next_obs)
+def _encode_obs_batch(obs_adapter, buffer, start, end, use_depth):
+    obs = _raw_obs_batch(buffer, start, end, use_depth)
     with torch.no_grad():
         latent = obs_adapter.encode(obs, start=0, track_grad=False)[:, 0]
     return latent.detach().float().cpu().numpy()
+
+
+def _build_next_indices(buffer) -> np.ndarray:
+    size = len(buffer)
+    next_indices = np.arange(size, dtype=np.int64) + 1
+    for episode_end in np.asarray(buffer.episode_ends, dtype=np.int64):
+        terminal = int(episode_end) - 1
+        next_indices[terminal] = terminal
+    if np.any(next_indices < 0) or np.any(next_indices >= size):
+        raise RuntimeError("Invalid transition next-index mapping")
+
+    state = np.asarray(buffer["state"])
+    next_state = np.asarray(buffer["next_state"])
+    if not np.allclose(next_state, state[next_indices], rtol=1e-6, atol=1e-6):
+        raise RuntimeError(
+            "Frozen latent cache requires the ARBiM transition alignment contract: "
+            "next_obs[i] must equal obs[i+1], with terminal self-loops."
+        )
+    return next_indices
+
+
+def _episode_ends_sha256(buffer) -> str:
+    episode_ends = np.asarray(buffer.episode_ends, dtype=np.int64)
+    return hashlib.sha256(episode_ends.tobytes()).hexdigest()
 
 
 def build_frozen_latent_cache(
@@ -101,6 +144,14 @@ def build_frozen_latent_cache(
     progress: bool = True,
 ) -> FrozenLatentCache:
     cache_dir = os.path.abspath(cache_dir)
+    metadata = dict(metadata)
+    metadata.update(
+        {
+            "size": int(len(buffer)),
+            "episode_ends_sha256": _episode_ends_sha256(buffer),
+            "transition_alignment": "next_obs=obs[next_index]; terminal=self",
+        }
+    )
     if os.path.isdir(cache_dir):
         try:
             return FrozenLatentCache(cache_dir, expected_metadata=metadata)
@@ -118,22 +169,27 @@ def build_frozen_latent_cache(
     os.makedirs(tmp_dir, exist_ok=False)
 
     size = len(buffer)
+    next_indices = _build_next_indices(buffer)
     obs_memmap = None
-    next_memmap = None
     try:
         ranges = range(0, size, batch_size)
         if progress:
             from tqdm import tqdm
 
-            ranges = tqdm(ranges, total=(size + batch_size - 1) // batch_size, desc="Caching ACT latents")
+            ranges = tqdm(
+                ranges,
+                total=(size + batch_size - 1) // batch_size,
+                desc="Caching ACT latents",
+            )
 
         for start in ranges:
             end = min(start + batch_size, size)
-            obs_latent = _encode_endpoint_batch(
-                obs_adapter, buffer, start, end, use_depth, next_obs=False
-            )
-            next_latent = _encode_endpoint_batch(
-                obs_adapter, buffer, start, end, use_depth, next_obs=True
+            obs_latent = _encode_obs_batch(
+                obs_adapter,
+                buffer,
+                start,
+                end,
+                use_depth,
             )
             if obs_memmap is None:
                 latent_shape = (size,) + tuple(obs_latent.shape[1:])
@@ -143,32 +199,23 @@ def build_frozen_latent_cache(
                     dtype=np.float32,
                     shape=latent_shape,
                 )
-                next_memmap = np.lib.format.open_memmap(
-                    os.path.join(tmp_dir, "next_obs_latent.npy"),
-                    mode="w+",
-                    dtype=np.float32,
-                    shape=latent_shape,
-                )
             if obs_latent.shape[1:] != obs_memmap.shape[1:]:
                 raise RuntimeError("ACT latent shape changed while building cache")
             obs_memmap[start:end] = obs_latent
-            next_memmap[start:end] = next_latent
 
-        if obs_memmap is None or next_memmap is None:
+        if obs_memmap is None:
             raise RuntimeError("Cannot build latent cache from an empty buffer")
         obs_memmap.flush()
-        next_memmap.flush()
-        metadata = dict(metadata)
         metadata.update(
             {
-                "size": int(size),
                 "latent_shape": list(obs_memmap.shape[1:]),
                 "dtype": "float32",
             }
         )
+        np.save(os.path.join(tmp_dir, "next_indices.npy"), next_indices)
         with open(os.path.join(tmp_dir, "metadata.json"), "w") as file:
             json.dump(metadata, file, indent=2, sort_keys=True)
-        del obs_memmap, next_memmap
+        del obs_memmap
 
         if os.path.isdir(cache_dir):
             shutil.rmtree(cache_dir)
