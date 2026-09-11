@@ -212,6 +212,7 @@ marimo/_lsp/
 __marimo__/
 
 outputs/
+arbim_smoke_outputs/
 
 log/
 .vscode/
