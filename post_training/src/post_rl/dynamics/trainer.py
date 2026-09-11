@@ -1,4 +1,5 @@
 import copy
+import datetime
 import os
 from typing import Dict
 
@@ -8,7 +9,7 @@ import torch
 from .core.ensemble_dynamics_for_batch import EnsembleDynamics_batch
 from .models.dynamics_model import EnsembleDynamicsModel
 from .utils.termination_fns import get_termination_fn
-from .utils.logger import Logger, make_log_dirs
+from .utils.logger import Logger
 
 
 def train_dynamics(
@@ -93,13 +94,14 @@ def train_dynamics(
     )
 
     os.makedirs(dynamics_save_path, exist_ok=True)
-    log_dirs = make_log_dirs(
-        cfg.task_name,
-        cfg.name,
-        cfg.training.seed,
-        None,
-        record_params=None,
+    dynamics_artifact_dir = os.path.dirname(os.path.abspath(dynamics_save_path))
+    timestamp = datetime.datetime.now().strftime("%y-%m%d-%H%M%S-%f")
+    log_dirs = os.path.join(
+        dynamics_artifact_dir,
+        "logs",
+        f"seed_{cfg.training.seed}&timestamp_{timestamp}&pid_{os.getpid()}",
     )
+    os.makedirs(log_dirs, exist_ok=False)
     output_config = {
         "consoleout_backup": "stdout",
         "policy_training_progress": "csv",

@@ -11,7 +11,11 @@ from .performance_workspace import TrainACTWorkspace as _PerformanceTrainACTWork
 
 
 class TrainACTWorkspace(_PerformanceTrainACTWorkspace):
-    """Adapt post-RL loading to the Kuavo ACT checkpoint directory layout."""
+    """Adapt post-RL loading/output layout to the Kuavo ACT toolchain."""
+
+    def get_ppo_artifact_dir(self) -> str:
+        path = self.cfg.unio4.get("artifact_dir", None)
+        return str(path) if path else os.path.join(self.output_dir, "offline_ppo")
 
     def _resolve_policy_processor_dir(self) -> str:
         checkpoint = os.path.abspath(str(self.cfg.input.policy_checkpoint))

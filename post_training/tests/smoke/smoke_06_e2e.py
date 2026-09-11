@@ -56,7 +56,9 @@ def require_path(path: str) -> None:
 
 def main() -> None:
     parser = add_common_args(
-        argparse.ArgumentParser(description="Smoke 06: tiny Critic->Dynamics->PPO E2E + exact resume"),
+        argparse.ArgumentParser(
+            description="Smoke 06: tiny Critic->Dynamics->Offline PPO E2E + exact resume"
+        ),
     )
     args = parser.parse_args()
     root = pathlib.Path(make_work_dir(args, "smoke_06_e2e"))
@@ -72,27 +74,32 @@ def main() -> None:
     workspace = make_workspace(cfg, str(first_dir))
     workspace.run()
     if workspace.global_step != 2:
-        raise AssertionError(f"Expected PPO global_step=2, got {workspace.global_step}")
+        raise AssertionError(f"Expected Offline PPO global_step=2, got {workspace.global_step}")
 
     critic_final = first_dir / "critic" / "checkpoints" / "final"
-    dynamics_final = first_dir / "dynamics" / "checkpoints" / "final"
-    ppo_step1 = first_dir / "ppo" / "checkpoints" / "step_00000001"
-    ppo_final = first_dir / "ppo" / "checkpoints" / "final"
+    dynamics_dir = first_dir / "dynamics"
+    dynamics_final = dynamics_dir / "checkpoints" / "final"
+    dynamics_logs = dynamics_dir / "logs"
+    ppo_step1 = first_dir / "offline_ppo" / "checkpoints" / "step_00000001"
+    ppo_final = first_dir / "offline_ppo" / "checkpoints" / "final"
     for path in (
         critic_final / "Q.pt",
         critic_final / "value.pt",
         critic_final / "contract.json",
         dynamics_final / "contract.json",
+        dynamics_logs,
         ppo_step1 / "training_state.pt",
         ppo_step1 / "resume_meta.json",
         ppo_step1 / "contract.json",
         ppo_final / "training_state.pt",
     ):
         require_path(str(path))
+    if not any(path.is_dir() for path in dynamics_logs.iterdir()):
+        raise AssertionError("Dynamics logs directory does not contain a run subdirectory")
     if workspace.unio4 is None:
-        raise AssertionError("PPO object was not built in the E2E run")
+        raise AssertionError("Offline PPO object was not built in the E2E run")
     first_trainable = snapshot_params(workspace.unio4._policy, trainable_only=True)
-    print_pass("Critic, Dynamics, PPO and periodic resume artifacts were produced")
+    print_pass("Critic, Dynamics, Offline PPO, local Dynamics logs and resume artifacts were produced")
 
     del workspace
     if torch.cuda.is_available():
@@ -106,7 +113,7 @@ def main() -> None:
     if resumed.global_step != 2:
         raise AssertionError(f"Resumed run did not continue to step 2: {resumed.global_step}")
     if resumed.unio4 is None:
-        raise AssertionError("PPO object was not restored in resumed run")
+        raise AssertionError("Offline PPO object was not restored in resumed run")
     max_diff = max_param_diff(first_trainable, resumed.unio4._policy)
     if max_diff > 1e-5:
         raise AssertionError(

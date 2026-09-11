@@ -4,6 +4,7 @@ defaults:
 
 name: post_rl
 task_name: post_training
+experiment_name: experiment  # User-defined experiment label; output dir appends the runtime timestamp.
 
 input:
   policy_checkpoint: /path/to/act/checkpoint
@@ -11,7 +12,7 @@ input:
   dataset_path: /path/to/offline_dataset.zarr
 
 resume:
-  checkpoint_dir: null  # Full PPO-state resume; overrides input.policy_checkpoint/type and restores stage-1 artifact paths.
+  checkpoint_dir: null  # Full Offline PPO-state resume; overrides input.policy_checkpoint/type and restores stage-1 artifact paths.
 
 # -------------------- Hard alignment contract --------------------
 # These three values define one ACT/RL action chunk contract. They are configurable,
@@ -159,7 +160,7 @@ unio4:
   temperature: null
   eval_step: 50
   eval_freq: 1000
-  checkpoint_every_steps: 1000  # 0 disables periodic full-state PPO checkpoints.
+  checkpoint_every_steps: 1000  # 0 disables periodic full-state Offline PPO checkpoints.
   fix_encoder: true  # V1 fixed: PPO updates ACT decoder/action head/log_std only.
   use_gae: false  # V1 fixed: online-style GAE is not wired into the current Offline PPO/OPE path.
   use_ema_eval: false
@@ -197,7 +198,7 @@ logging:
 
 hydra:
   run:
-    dir: post_training/outputs/${now:%Y%m%d_%H%M%S}
+    dir: post_training/outputs/${experiment_name}_${now:%Y%m%d_%H%M%S}
   sweep:
-    dir: post_training/outputs/multirun/${now:%Y%m%d_%H%M%S}
+    dir: post_training/outputs/${experiment_name}_multirun_${now:%Y%m%d_%H%M%S}
     subdir: ${hydra.job.num}
