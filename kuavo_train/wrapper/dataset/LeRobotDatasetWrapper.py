@@ -243,7 +243,16 @@ class CustomLeRobotDataset(LeRobotDataset):
 
 
         # Add task as a string
-        task_idx = item["task_index"].item()
-        item["task"] = self.meta.tasks[task_idx]
+        task_idx = int(item["task_index"].item())
+        tasks = self.meta.tasks
+        if hasattr(tasks, "columns") and "task_index" in tasks.columns:
+            matches = tasks.index[tasks["task_index"] == task_idx]
+            if len(matches) != 1:
+                raise KeyError(
+                    f"Expected exactly one task for task_index={task_idx}, got {len(matches)}"
+                )
+            item["task"] = str(matches[0])
+        else:
+            item["task"] = tasks[task_idx]
 
         return item
