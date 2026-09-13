@@ -21,12 +21,15 @@ from _common import (
 
 def main() -> None:
     parser = add_common_args(
-        argparse.ArgumentParser(description="Smoke 03: IQL Critic forward/backward/update"),
+        argparse.ArgumentParser(
+            description="Smoke 03: JPEG-backed real data -> IQL Critic forward/backward/update"
+        ),
     )
     args = parser.parse_args()
     cfg = load_cfg(args)
     workspace = make_workspace(cfg, make_work_dir(args, "smoke_03_critic"))
     _, batch = build_real_batch(workspace, args.batch_size)
+    print_pass("latest JPEG-backed Zarr -> OfflineBuffer -> Dataset boundary is valid")
     workspace._build_critic()
     critic = workspace.critic
 

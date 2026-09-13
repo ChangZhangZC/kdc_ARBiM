@@ -15,12 +15,14 @@ from _common import (
     print_pass,
     print_section,
 )
-from post_rl.data.offline_buffer import LazyZarrArray
+from post_rl.data.offline_buffer import LazyJpegZarrArray, LazyZarrArray
 
 
 def main() -> None:
     parser = add_common_args(
-        argparse.ArgumentParser(description="Smoke 02: real Zarr + stochastic ACT + Scheme-C latent"),
+        argparse.ArgumentParser(
+            description="Smoke 02: JPEG Zarr + stochastic ACT + Scheme-C latent"
+        ),
     )
     args = parser.parse_args()
     cfg = load_cfg(args)
@@ -28,22 +30,22 @@ def main() -> None:
     dataset, batch = build_real_batch(workspace, args.batch_size)
 
     print_section("offline data")
-    modal_keys = [
-        *workspace.buffer.RGB_KEYS,
-        *(f"next_{key}" for key in workspace.buffer.RGB_KEYS),
-    ]
+    for key in workspace.buffer.RGB_KEYS:
+        current = workspace.buffer[key]
+        nxt = workspace.buffer[f"next_{key}"]
+        if not isinstance(current, LazyJpegZarrArray):
+            raise AssertionError(f"{key} must be LazyJpegZarrArray")
+        if not isinstance(nxt, LazyJpegZarrArray):
+            raise AssertionError(f"next_{key} must be LazyJpegZarrArray")
     if bool(cfg.dataset.use_depth):
-        modal_keys.extend(workspace.buffer.DEPTH_KEYS)
-        modal_keys.extend(f"next_{key}" for key in workspace.buffer.DEPTH_KEYS)
-    non_lazy = [
-        key for key in modal_keys
-        if not isinstance(workspace.buffer[key], LazyZarrArray)
-    ]
-    if non_lazy:
-        raise AssertionError(
-            f"Zarr image/depth modalities must remain lazy in OfflineBuffer: {non_lazy}"
-        )
-    print_pass("Zarr RGB/depth modalities remain lazy and are loaded only per sampled sequence")
+        for key in workspace.buffer.DEPTH_KEYS:
+            if not isinstance(workspace.buffer[key], LazyZarrArray):
+                raise AssertionError(f"{key} must remain LazyZarrArray")
+            if not isinstance(workspace.buffer[f"next_{key}"], LazyZarrArray):
+                raise AssertionError(f"next_{key} must remain LazyZarrArray")
+    print_pass(
+        "RGB uses lazy JPEG-backed views; depth remains lazy dense Zarr when enabled"
+    )
 
     required = {"obs", "next_obs", "action", "next_action", "reward", "not_done", "return"}
     missing = required.difference(batch)
@@ -61,13 +63,20 @@ def main() -> None:
         raise AssertionError(
             f"Action dim mismatch: {batch['action'].shape[-1]} != {action_dim}"
         )
-    print_pass(f"real dataset batch is valid: B={batch_size}, H={horizon}, D={action_dim}")
+    for key in workspace.buffer.RGB_KEYS:
+        if batch["obs"][key].dtype != torch.uint8:
+            raise AssertionError(f"obs.{key} must be uint8 before ACT normalization")
+        if batch["next_obs"][key].dtype != torch.uint8:
+            raise AssertionError(f"next_obs.{key} must be uint8 before ACT normalization")
+    print_pass(
+        f"real dataset batch is valid: B={batch_size}, H={horizon}, D={action_dim}; RGB is uint8"
+    )
 
     print_section("stochastic ACT")
     policy_obs = policy_obs_from_batch(workspace, batch)
     with torch.no_grad():
         mu = workspace.model.get_action_mean(policy_obs)
-        dist = workspace.model.get_distribution(policy_obs)
+        workspace.model.get_distribution(policy_obs)
         sample, log_prob, entropy = workspace.model.sample_action_chunk(policy_obs)
         log_std = workspace.model._get_log_std()
         std = workspace.model._get_std()
@@ -120,7 +129,9 @@ def main() -> None:
     if encoder_pos.shape[0] != latent.shape[1]:
         raise AssertionError("encoder positional-token count does not match latent token count")
     torch.testing.assert_close(latent, adapter_latent, rtol=1e-5, atol=1e-6)
-    print_pass("Actor and Critic/Dynamics observation frontends produce the same ACT latent")
+    print_pass(
+        "JPEG-decoded uint8 RGB reaches the same normalized ACT frontend for Actor and Critic/Dynamics"
+    )
 
     print(f"\nDataset sequences available: {len(dataset)}")
     print("SMOKE 02 PASSED")

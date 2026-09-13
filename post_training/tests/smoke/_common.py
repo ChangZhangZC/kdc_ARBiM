@@ -9,7 +9,9 @@ import sys
 import tempfile
 from collections.abc import Mapping
 
+import numpy as np
 import torch
+import zarr
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[3]
 POST_TRAINING_SRC = REPO_ROOT / "post_training" / "src"
@@ -31,6 +33,11 @@ import lerobot_patches.custom_patches  # noqa: F401,E402
 from omegaconf import OmegaConf  # noqa: E402
 from torch.utils.data import DataLoader  # noqa: E402
 
+from post_rl.data.offline_buffer import (  # noqa: E402
+    RGB_ZARR_STORAGE,
+    LazyJpegZarrArray,
+    LazyZarrArray,
+)
 from post_rl.data.offline_dataset import OfflineDataset  # noqa: E402
 from post_rl.training import TrainACTWorkspace  # noqa: E402
 from post_rl.utils.common import dict_apply  # noqa: E402
@@ -119,8 +126,74 @@ def make_workspace(cfg, output_dir: str) -> TrainACTWorkspace:
     return TrainACTWorkspace(cfg, output_dir=output_dir)
 
 
+def assert_latest_rgb_storage(workspace: TrainACTWorkspace) -> None:
+    """Validate the current JPEG-backed Zarr/OfflineBuffer boundary."""
+    dataset_path = str(workspace.cfg.input.dataset_path)
+    root = zarr.open_group(dataset_path, mode="r")
+    if root.attrs.get("rgb_storage") != RGB_ZARR_STORAGE:
+        raise AssertionError(
+            f"Expected rgb_storage={RGB_ZARR_STORAGE!r}, got {root.attrs.get('rgb_storage')!r}"
+        )
+    if "data" not in root:
+        raise AssertionError("Offline RL Zarr is missing data group")
+    data = root["data"]
+    if "next_index" not in data:
+        raise AssertionError("JPEG Offline RL Zarr is missing data/next_index")
+
+    size = len(workspace.buffer)
+    if int(data["next_index"].shape[0]) != size:
+        raise AssertionError("next_index length does not match OfflineBuffer size")
+
+    for key in workspace.buffer.RGB_KEYS:
+        jpeg_data = f"{key}_jpeg_data"
+        jpeg_offsets = f"{key}_jpeg_offsets"
+        missing = [name for name in (jpeg_data, jpeg_offsets) if name not in data]
+        if missing:
+            raise AssertionError(f"JPEG Offline RL Zarr is missing RGB fields: {missing}")
+        if key in data or f"next_{key}" in data:
+            raise AssertionError(
+                f"Latest JPEG Zarr must not duplicate dense {key}/next_{key} arrays"
+            )
+
+        current = workspace.buffer[key]
+        nxt = workspace.buffer[f"next_{key}"]
+        if not isinstance(current, LazyJpegZarrArray):
+            raise AssertionError(f"{key} must use LazyJpegZarrArray, got {type(current).__name__}")
+        if not isinstance(nxt, LazyJpegZarrArray):
+            raise AssertionError(
+                f"next_{key} must use LazyJpegZarrArray, got {type(nxt).__name__}"
+            )
+        if current.dtype != np.dtype(np.uint8) or nxt.dtype != np.dtype(np.uint8):
+            raise AssertionError(f"{key}/next_{key} logical dtype must be uint8")
+        if len(current) != size or len(nxt) != size:
+            raise AssertionError(f"{key}/next_{key} logical length must match buffer size")
+
+        for index in (0, size - 1):
+            current_image = np.asarray(current[index])
+            next_image = np.asarray(nxt[index])
+            if current_image.dtype != np.uint8 or next_image.dtype != np.uint8:
+                raise AssertionError(f"Decoded {key} images must be uint8")
+            if current_image.shape != current.shape[1:]:
+                raise AssertionError(
+                    f"Decoded {key} shape {current_image.shape} != logical {current.shape[1:]}"
+                )
+            if next_image.shape != nxt.shape[1:]:
+                raise AssertionError(
+                    f"Decoded next_{key} shape {next_image.shape} != logical {nxt.shape[1:]}"
+                )
+
+    if bool(workspace.cfg.dataset.use_depth):
+        for key in workspace.buffer.DEPTH_KEYS:
+            for logical_key in (key, f"next_{key}"):
+                if not isinstance(workspace.buffer[logical_key], LazyZarrArray):
+                    raise AssertionError(
+                        f"{logical_key} must remain a lazy dense Zarr array"
+                    )
+
+
 def build_real_batch(workspace: TrainACTWorkspace, batch_size: int):
     workspace.buffer = workspace._load_buffer()
+    assert_latest_rgb_storage(workspace)
     workspace._build_act_observation_frontends()
     dataset = OfflineDataset(
         buffer=workspace.buffer,

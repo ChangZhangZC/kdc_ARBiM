@@ -74,18 +74,25 @@ def run_mode(workspace, batch: dict, chunk_mode: bool) -> None:
     if reward.shape[0] != batch_size or terminal.shape[0] != batch_size:
         raise AssertionError("Dynamics step returned invalid batch dimensions")
 
-    label = "chunk transition s_t,a[t:t+H]->s_t+H" if chunk_mode else "single-step transition s_t,a_t->s_t+1"
+    label = (
+        "chunk transition s_t,a[t:t+H]->s_t+H"
+        if chunk_mode
+        else "single-step transition s_t,a_t->s_t+1"
+    )
     print_pass(f"{label}: shape, delta target, optimizer update and frozen encoder are correct")
 
 
 def main() -> None:
     parser = add_common_args(
-        argparse.ArgumentParser(description="Smoke 04: token dynamics in chunk and single-step modes"),
+        argparse.ArgumentParser(
+            description="Smoke 04: JPEG-backed real data -> token dynamics in chunk and single-step modes"
+        ),
     )
     args = parser.parse_args()
     cfg = load_cfg(args)
     workspace = make_workspace(cfg, make_work_dir(args, "smoke_04_dynamics"))
     _, batch = build_real_batch(workspace, args.batch_size)
+    print_pass("latest JPEG-backed current/next observations are available to Dynamics")
 
     for chunk_mode in (True, False):
         print_section(f"chunk_as_single_action={str(chunk_mode).lower()}")

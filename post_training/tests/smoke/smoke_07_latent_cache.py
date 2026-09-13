@@ -9,6 +9,7 @@ import torch
 from _common import (
     add_common_args,
     assert_finite,
+    assert_latest_rgb_storage,
     load_cfg,
     make_work_dir,
     make_workspace,
@@ -95,7 +96,9 @@ def _assert_latent_consistent(
 def main() -> None:
     parser = add_common_args(
         argparse.ArgumentParser(
-            description="Smoke 07: endpoint sampling + frozen ACT latent cache"
+            description=(
+                "Smoke 07: JPEG-backed endpoint sampling + frozen ACT latent cache"
+            )
         )
     )
     parser.add_argument("--cache-batch-size", type=int, default=64)
@@ -107,6 +110,8 @@ def main() -> None:
 
     workspace = make_workspace(cfg, make_work_dir(args, "smoke_07_latent_cache"))
     workspace.buffer = workspace._load_buffer()
+    assert_latest_rgb_storage(workspace)
+    print_pass("latent-cache smoke uses the latest JPEG-backed current/next RGB views")
     workspace._build_main_dataloaders()
 
     print_section("build/reuse frozen latent cache")
@@ -138,7 +143,7 @@ def main() -> None:
         raise AssertionError("Endpoint dataset should expose latent-only observations")
 
     _assert_endpoint_alignment(workspace, raw, workspace.dataset, 0)
-    print_pass("raw current/next endpoint indices match the cache transition mapping")
+    print_pass("JPEG-backed raw current/next endpoint indices match the cache transition mapping")
 
     raw_obs = dict_apply(raw["obs"], lambda x: x.unsqueeze(0).to(workspace.device))
     raw_next_obs = dict_apply(

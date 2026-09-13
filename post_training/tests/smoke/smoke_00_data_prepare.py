@@ -18,7 +18,7 @@ for path in (REPO_ROOT, POST_RL_SRC, LEROBOT_SRC):
         sys.path.insert(0, path_str)
 
 from post_rl.data import data_prepare as dp
-from post_rl.data.offline_buffer import OfflineBuffer
+from post_rl.data.offline_buffer import LazyJpegZarrArray, OfflineBuffer
 
 
 def _make_work_dir(path: str | None) -> pathlib.Path:
@@ -99,6 +99,12 @@ def _validate_zarr(
     missing = sorted(required.difference(data.keys()))
     assert not missing, f"missing zarr fields: {missing}"
 
+    for name in dp.RGB_FEATURE_TO_BUFFER.values():
+        assert name not in data, f"dense RGB field must not exist in compressed Zarr: {name}"
+        assert f"next_{name}" not in data, (
+            f"duplicate dense next RGB field must not exist in compressed Zarr: next_{name}"
+        )
+
     for key in (
         "state",
         "next_state",
@@ -141,15 +147,24 @@ def _validate_zarr(
     expected_return = dp.compute_return(reward, not_done, gamma=dp.RETURN_GAMMA)
     np.testing.assert_allclose(stored_return, expected_return, rtol=1e-6, atol=1e-6)
 
-    buffer = OfflineBuffer(device=torch.device("cpu"), gamma=dp.RETURN_GAMMA, use_depth=use_depth)
+    buffer = OfflineBuffer(
+        device=torch.device("cpu"), gamma=dp.RETURN_GAMMA, use_depth=use_depth
+    )
     buffer.load_zarr(str(path))
     for name in dp.RGB_FEATURE_TO_BUFFER.values():
-        current = buffer[name][0]
-        nxt = buffer[f"next_{name}"][0]
-        assert current.dtype == np.uint8
-        assert nxt.dtype == np.uint8
-        assert current.shape == tuple(root.attrs["rgb_shapes"][name])
-        assert nxt.shape == current.shape
+        assert isinstance(buffer[name], LazyJpegZarrArray)
+        assert isinstance(buffer[f"next_{name}"], LazyJpegZarrArray)
+        for index in (0, expected_frames - 1):
+            current = buffer[name][index]
+            nxt = buffer[f"next_{name}"][index]
+            assert current.dtype == np.uint8
+            assert nxt.dtype == np.uint8
+            assert current.shape == tuple(root.attrs["rgb_shapes"][name])
+            assert nxt.shape == current.shape
+        np.testing.assert_array_equal(
+            buffer[name][expected_frames - 1],
+            buffer[f"next_{name}"][expected_frames - 1],
+        )
 
 
 def main() -> None:
@@ -210,7 +225,7 @@ def main() -> None:
     assert result_zarr["num_frames"] == expected_frames
     assert result_zarr["num_episodes"] == expected_episodes
     _validate_zarr(zarr_path, expected_frames, expected_episodes, bool(args.use_depth))
-    print("[PASS] build_db compressed Offline RL Zarr contract")
+    print("[PASS] build_db JPEG Zarr + logical current/next RGB contract")
 
     print(f"\nGenerated NPY: {npy_path}")
     print(f"Generated Zarr: {zarr_path}")

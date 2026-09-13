@@ -9,6 +9,7 @@ import torch
 
 from _common import (
     add_common_args,
+    assert_latest_rgb_storage,
     load_cfg,
     make_work_dir,
     make_workspace,
@@ -57,7 +58,10 @@ def require_path(path: str) -> None:
 def main() -> None:
     parser = add_common_args(
         argparse.ArgumentParser(
-            description="Smoke 06: tiny Critic->Dynamics->Offline PPO E2E + exact resume"
+            description=(
+                "Smoke 06: JPEG-backed dataset -> tiny Critic->Dynamics->Offline PPO E2E "
+                "+ exact resume"
+            )
         ),
     )
     args = parser.parse_args()
@@ -73,6 +77,8 @@ def main() -> None:
     print_section("tiny full post-RL run")
     workspace = make_workspace(cfg, str(first_dir))
     workspace.run()
+    assert_latest_rgb_storage(workspace)
+    print_pass("tiny full run consumed the latest JPEG-backed Offline RL dataset")
     if workspace.global_step != 2:
         raise AssertionError(f"Expected Offline PPO global_step=2, got {workspace.global_step}")
 
@@ -110,6 +116,7 @@ def main() -> None:
     resume_cfg.resume.checkpoint_dir = str(ppo_step1)
     resumed = make_workspace(resume_cfg, str(resume_dir))
     resumed.run()
+    assert_latest_rgb_storage(resumed)
     if resumed.global_step != 2:
         raise AssertionError(f"Resumed run did not continue to step 2: {resumed.global_step}")
     if resumed.unio4 is None:

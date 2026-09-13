@@ -32,7 +32,9 @@ CASES = {
 
 def main() -> None:
     parser = add_common_args(
-        argparse.ArgumentParser(description="Smoke 05: Offline PPO ratio/advantage/update"),
+        argparse.ArgumentParser(
+            description="Smoke 05: JPEG-backed real data -> Offline PPO ratio/advantage/update"
+        ),
     )
     parser.add_argument("--case", choices=sorted(CASES), default="chunk_scalar")
     args = parser.parse_args()
@@ -50,6 +52,7 @@ def main() -> None:
     cfg.ppo.monitor_every_updates = 1
     workspace = make_workspace(cfg, make_work_dir(args, f"smoke_05_{args.case}"))
     _, batch = build_real_batch(workspace, max(args.batch_size, 2))
+    print_pass("latest JPEG-backed observations reach Offline PPO through the normal dataset path")
 
     workspace._build_critic()
     q_loss, v_loss = workspace.critic.update(batch)

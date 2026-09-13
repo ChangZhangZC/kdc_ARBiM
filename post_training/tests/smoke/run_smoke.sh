@@ -31,4 +31,7 @@ done
 python "$SCRIPT_DIR/smoke_06_e2e.py" \
   --checkpoint "$CHECKPOINT" --dataset "$DATASET" --device "$DEVICE"
 
+python "$SCRIPT_DIR/smoke_07_latent_cache.py" \
+  --checkpoint "$CHECKPOINT" --dataset "$DATASET" --device "$DEVICE"
+
 echo "ALL ARBiM POST-RL SMOKE TESTS PASSED"
