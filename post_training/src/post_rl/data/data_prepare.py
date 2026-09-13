@@ -179,6 +179,150 @@ def _frame_arrays(frame, frame_index, use_depth):
     return item
 
 
+def _batch_column(dataset, key, indices):
+    """Read one HF column for several indices without invoking LeRobot __getitem__."""
+    hf_dataset = getattr(dataset, "hf_dataset", None)
+    if hf_dataset is None:
+        raise AttributeError("LeRobot dataset does not expose hf_dataset")
+
+    try:
+        values = hf_dataset[key][indices]
+    except (KeyError, TypeError, IndexError):
+        values = hf_dataset[indices][key]
+
+    if not isinstance(values, (list, tuple)):
+        values = [values]
+    return values
+
+
+def _stack_video_batch(frames, count, feature_name):
+    """Normalize LeRobot batched video output to a leading batch dimension."""
+    if count == 1 and getattr(frames, "ndim", None) == 3:
+        frames = frames.unsqueeze(0)
+    if len(frames) != count:
+        raise RuntimeError(
+            f"batched video decode for {feature_name!r} returned {len(frames)} "
+            f"frames, expected {count}"
+        )
+    return frames
+
+
+def _load_lerobot_frame_batch(dataset, episode_id, frame_indices, use_depth):
+    """Load a contiguous episode slice, decoding each video camera once per batch.
+
+    This bypasses LeRobotDataset.__getitem__ for the hot raw_to_npy loop. The
+    standard __getitem__ path seeks/decodes every camera independently for every
+    frame; here one timestamp list is sent to each video decoder so sequential
+    frames are decoded in a single batch while keeping RAM bounded by
+    stream_batch_size.
+    """
+    if not frame_indices:
+        return []
+
+    count = len(frame_indices)
+    state_values = _batch_column(dataset, "observation.state", frame_indices)
+    action_values = _batch_column(dataset, "action", frame_indices)
+
+    items = [
+        {
+            "agent_pos": _as_numpy(
+                state_values[i], "observation.state", frame_indices[i]
+            ),
+            "action": _as_numpy(action_values[i], "action", frame_indices[i]),
+            "rgb": {},
+        }
+        for i in range(count)
+    ]
+    if use_depth:
+        for item in items:
+            item["depth"] = {}
+
+    video_keys = set(getattr(dataset.meta, "video_keys", []))
+    requested_video_keys = [
+        key
+        for key in [
+            *RGB_FEATURE_TO_BUFFER.keys(),
+            *(DEPTH_FEATURE_TO_BUFFER.keys() if use_depth else []),
+        ]
+        if key in video_keys
+    ]
+
+    if requested_video_keys:
+        timestamp_values = _batch_column(dataset, "timestamp", frame_indices)
+        timestamps = [
+            float(value.item() if hasattr(value, "item") else value)
+            for value in timestamp_values
+        ]
+        query_timestamps = {
+            key: timestamps for key in requested_video_keys
+        }
+        video_batch = dataset._query_videos(query_timestamps, episode_id)
+
+        for key in requested_video_keys:
+            frames = _stack_video_batch(video_batch[key], count, key)
+            target = "rgb" if key in RGB_FEATURE_TO_BUFFER else "depth"
+            for i in range(count):
+                items[i][target][key] = _as_numpy(
+                    frames[i], key, frame_indices[i]
+                )
+
+    non_video_rgb = [
+        key for key in RGB_FEATURE_TO_BUFFER if key not in video_keys
+    ]
+    for key in non_video_rgb:
+        values = _batch_column(dataset, key, frame_indices)
+        if len(values) != count:
+            raise RuntimeError(
+                f"batched column read for {key!r} returned {len(values)} "
+                f"frames, expected {count}"
+            )
+        for i, value in enumerate(values):
+            items[i]["rgb"][key] = _as_numpy(
+                value, key, frame_indices[i]
+            )
+
+    if use_depth:
+        non_video_depth = [
+            key for key in DEPTH_FEATURE_TO_BUFFER if key not in video_keys
+        ]
+        for key in non_video_depth:
+            values = _batch_column(dataset, key, frame_indices)
+            if len(values) != count:
+                raise RuntimeError(
+                    f"batched column read for {key!r} returned {len(values)} "
+                    f"frames, expected {count}"
+                )
+            for i, value in enumerate(values):
+                items[i]["depth"][key] = _as_numpy(
+                    value, key, frame_indices[i]
+                )
+
+    for i, item in enumerate(items):
+        missing_rgb = [key for key in RGB_FEATURE_TO_BUFFER if key not in item["rgb"]]
+        if missing_rgb:
+            raise KeyError(
+                f"frame {frame_indices[i]} is missing RGB feature(s): {missing_rgb}"
+            )
+        if use_depth:
+            missing_depth = [
+                key for key in DEPTH_FEATURE_TO_BUFFER if key not in item["depth"]
+            ]
+            if missing_depth:
+                raise KeyError(
+                    f"frame {frame_indices[i]} is missing depth feature(s): "
+                    f"{missing_depth}"
+                )
+
+    return items
+
+
+def _can_batch_decode(dataset):
+    return (
+        getattr(dataset, "hf_dataset", None) is not None
+        and hasattr(dataset, "_query_videos")
+    )
+
+
 def _new_processed_chunk(use_depth):
     chunk = {
         "agent_pos": [],
@@ -348,10 +492,29 @@ def process_raw_teleop_to_npy(config):
     if not episodes:
         raise RuntimeError("LeRobot dataset contains no episodes")
 
-    first_index = next(iter(episodes.values()))[0]
-    first_frame = dataset[first_index]
-    first = _frame_arrays(first_frame, first_index, use_depth)
-    del first_frame
+    batch_decode = _can_batch_decode(dataset)
+    if batch_decode:
+        cprint(
+            f"raw_to_npy: batched LeRobot decode enabled "
+            f"(batch_size={batch_size}, backend={getattr(dataset, 'video_backend', 'unknown')})",
+            "cyan",
+        )
+    else:
+        cprint(
+            "raw_to_npy: batched decode unavailable; falling back to per-frame __getitem__",
+            "yellow",
+        )
+
+    first_episode_id, first_episode_frames = next(iter(episodes.items()))
+    first_index = first_episode_frames[0]
+    if batch_decode:
+        first = _load_lerobot_frame_batch(
+            dataset, first_episode_id, [first_index], use_depth
+        )[0]
+    else:
+        first_frame = dataset[first_index]
+        first = _frame_arrays(first_frame, first_index, use_depth)
+        del first_frame
 
     manifest = {
         "__format__": STREAM_NPY_FORMAT,
@@ -397,58 +560,75 @@ def process_raw_teleop_to_npy(config):
             desc="Streaming raw_to_npy",
         )
 
-        for episode_frames in episodes.values():
+        for episode_id, episode_frames in episodes.items():
             episode_length = len(episode_frames)
             previous_action = None
 
-            for t, frame_index in enumerate(episode_frames):
-                frame = dataset[frame_index]
-                item = _frame_arrays(
-                    frame,
-                    frame_index,
-                    use_depth,
-                )
-                del frame
-
-                terminal = t == episode_length - 1
-                reward = float(terminal)
-
-                if terminal:
-                    reward -= (
-                        lambda_penalty
-                        * episode_length
-                        / max_episode_len
-                    )
-
-                if previous_action is not None:
-                    reward -= smooth_penalty * np.linalg.norm(
-                        item["action"] - previous_action
-                    )
-
-                chunk["agent_pos"].append(item["agent_pos"])
-                chunk["action"].append(item["action"])
-                chunk["rgb"].append(item["rgb"])
-                if use_depth:
-                    chunk["depth"].append(item["depth"])
-                chunk["reward"].append(float(reward))
-                chunk["done"].append(bool(terminal))
-                chunk["timeout"].append(bool(terminal))
-
-                previous_action = np.array(
-                    item["action"],
-                    copy=True,
-                )
-                processed += 1
-                progress.update(1)
-
-                if len(chunk["action"]) >= batch_size:
-                    chunk_index = _flush_processed_npy_chunk(
-                        handle,
-                        chunk,
+            for batch_start in range(0, episode_length, batch_size):
+                batch_indices = episode_frames[
+                    batch_start:batch_start + batch_size
+                ]
+                if batch_decode:
+                    batch_items = _load_lerobot_frame_batch(
+                        dataset,
+                        episode_id,
+                        batch_indices,
                         use_depth,
-                        chunk_index,
                     )
-                    chunk = _new_processed_chunk(use_depth)
+                else:
+                    batch_items = []
+                    for frame_index in batch_indices:
+                        frame = dataset[frame_index]
+                        batch_items.append(
+                            _frame_arrays(frame, frame_index, use_depth)
+                        )
+                        del frame
+
+                for batch_offset, (frame_index, item) in enumerate(
+                    zip(batch_indices, batch_items, strict=True)
+                ):
+                    t = batch_start + batch_offset
+                    terminal = t == episode_length - 1
+                    reward = float(terminal)
+
+                    if terminal:
+                        reward -= (
+                            lambda_penalty
+                            * episode_length
+                            / max_episode_len
+                        )
+
+                    if previous_action is not None:
+                        reward -= smooth_penalty * np.linalg.norm(
+                            item["action"] - previous_action
+                        )
+
+                    chunk["agent_pos"].append(item["agent_pos"])
+                    chunk["action"].append(item["action"])
+                    chunk["rgb"].append(item["rgb"])
+                    if use_depth:
+                        chunk["depth"].append(item["depth"])
+                    chunk["reward"].append(float(reward))
+                    chunk["done"].append(bool(terminal))
+                    chunk["timeout"].append(bool(terminal))
+
+                    previous_action = np.array(
+                        item["action"],
+                        copy=True,
+                    )
+                    processed += 1
+                    progress.update(1)
+
+                    if len(chunk["action"]) >= batch_size:
+                        chunk_index = _flush_processed_npy_chunk(
+                            handle,
+                            chunk,
+                            use_depth,
+                            chunk_index,
+                        )
+                        chunk = _new_processed_chunk(use_depth)
+
+                del batch_items
 
         chunk_index = _flush_processed_npy_chunk(
             handle,
