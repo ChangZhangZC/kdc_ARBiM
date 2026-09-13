@@ -1,13 +1,16 @@
 import os
 
+import cv2
 import numpy as np
 import torch
 import zarr
 from tqdm import tqdm
 
+RGB_ZARR_STORAGE = "jpeg_bytes_v1"
+
 
 class LazyZarrArray:
-    """Process-safe lazy handle for a single array under Zarr data/."""
+    """Process-safe lazy handle for one dense array under Zarr data/."""
 
     def __init__(self, zarr_path: str, key: str, shape, dtype) -> None:
         self.zarr_path = str(zarr_path)
@@ -38,6 +41,129 @@ class LazyZarrArray:
     def __getstate__(self):
         state = self.__dict__.copy()
         state["_array"] = None
+        state["_pid"] = None
+        return state
+
+
+class LazyJpegZarrArray:
+    """Logical dense RGB array backed by JPEG bytes + offsets in Zarr."""
+
+    def __init__(
+        self,
+        zarr_path: str,
+        key: str,
+        shape,
+        next_view: bool = False,
+    ) -> None:
+        self.zarr_path = str(zarr_path)
+        self.key = str(key)
+        self.shape = tuple(shape)
+        self.dtype = np.dtype(np.uint8)
+        self.next_view = bool(next_view)
+        self._data = None
+        self._offsets = None
+        self._next_index = None
+        self._pid = None
+
+    def _open(self):
+        pid = os.getpid()
+        if self._data is None or self._pid != pid:
+            root = zarr.open_group(self.zarr_path, mode="r")
+            group = root["data"]
+            self._data = group[f"{self.key}_jpeg_data"]
+            self._offsets = group[f"{self.key}_jpeg_offsets"]
+            self._next_index = group["next_index"] if self.next_view else None
+            self._pid = pid
+
+    def _normalize_indices(self, index):
+        size = self.shape[0]
+        scalar = isinstance(index, (int, np.integer))
+        if scalar:
+            value = int(index)
+            if value < 0:
+                value += size
+            if value < 0 or value >= size:
+                raise IndexError(value)
+            indices = np.asarray([value], dtype=np.int64)
+        elif isinstance(index, slice):
+            start, stop, step = index.indices(size)
+            indices = np.arange(start, stop, step, dtype=np.int64)
+        else:
+            values = np.asarray(index)
+            if values.dtype == bool:
+                if values.ndim != 1 or len(values) != size:
+                    raise IndexError("boolean index must match RGB array length")
+                indices = np.flatnonzero(values).astype(np.int64)
+            else:
+                indices = values.astype(np.int64, copy=False).reshape(-1)
+                indices = np.where(indices < 0, indices + size, indices)
+                if np.any((indices < 0) | (indices >= size)):
+                    raise IndexError("RGB index out of bounds")
+        return indices, scalar
+
+    def _take_zarr(self, array, indices):
+        if len(indices) == 0:
+            return np.empty((0,), dtype=array.dtype)
+        try:
+            return np.asarray(array.oindex[indices])
+        except (AttributeError, IndexError, TypeError):
+            return np.asarray([array[int(i)] for i in indices])
+
+    @staticmethod
+    def _decode(payload):
+        image = cv2.imdecode(np.frombuffer(payload, dtype=np.uint8), cv2.IMREAD_COLOR)
+        if image is None:
+            raise ValueError("failed to decode JPEG from Offline RL Zarr")
+        image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+        return np.ascontiguousarray(np.moveaxis(image, -1, 0))
+
+    def _decode_indices(self, indices):
+        if len(indices) == 0:
+            return np.empty((0, *self.shape[1:]), dtype=np.uint8)
+        if self.next_view:
+            indices = self._take_zarr(self._next_index, indices).astype(np.int64, copy=False)
+
+        images = []
+        contiguous = len(indices) == 1 or np.all(np.diff(indices) == 1)
+        if contiguous:
+            first = int(indices[0])
+            last = int(indices[-1])
+            offsets = np.asarray(self._offsets[first:last + 2], dtype=np.int64)
+            byte_start = int(offsets[0])
+            byte_end = int(offsets[-1])
+            raw = np.asarray(self._data[byte_start:byte_end], dtype=np.uint8)
+            for i in range(len(indices)):
+                start = int(offsets[i] - byte_start)
+                end = int(offsets[i + 1] - byte_start)
+                images.append(self._decode(raw[start:end].tobytes()))
+        else:
+            offsets_start = self._take_zarr(self._offsets, indices).astype(np.int64)
+            offsets_end = self._take_zarr(self._offsets, indices + 1).astype(np.int64)
+            for start, end in zip(offsets_start, offsets_end, strict=True):
+                raw = np.asarray(self._data[int(start):int(end)], dtype=np.uint8)
+                images.append(self._decode(raw.tobytes()))
+
+        result = np.stack(images, axis=0)
+        if result.shape[1:] != self.shape[1:]:
+            raise ValueError(
+                f"decoded {self.key} shape {result.shape[1:]} != stored shape {self.shape[1:]}"
+            )
+        return result
+
+    def __getitem__(self, index):
+        self._open()
+        indices, scalar = self._normalize_indices(index)
+        result = self._decode_indices(indices)
+        return result[0] if scalar else result
+
+    def __len__(self) -> int:
+        return self.shape[0]
+
+    def __getstate__(self):
+        state = self.__dict__.copy()
+        state["_data"] = None
+        state["_offsets"] = None
+        state["_next_index"] = None
         state["_pid"] = None
         return state
 
@@ -76,42 +202,9 @@ class OfflineBuffer:
             keys |= set(self.DEPTH_KEYS) | {f"next_{key}" for key in self.DEPTH_KEYS}
         return keys
 
-    def load_zarr(self, zarr_path: str) -> None:
-        root = zarr.open_group(zarr_path, mode="r")
-        if "data" not in root or "meta" not in root:
-            raise KeyError("Zarr dataset must contain 'data' and 'meta' groups.")
-
-        data_group = root["data"]
-        meta_group = root["meta"]
+    def _validate_episode_ends(self, meta_group, size):
         if "episode_ends" not in meta_group:
             raise KeyError("Zarr meta group is missing 'episode_ends'.")
-
-        core_keys = (
-            "state",
-            "action",
-            "reward",
-            "next_state",
-            "next_action",
-            "done",
-            "timeout",
-        )
-        modal_keys = self._modal_keys()
-        required = set(core_keys) | modal_keys
-        missing = sorted(key for key in required if key not in data_group)
-        if missing:
-            raise KeyError(f"Dataset is missing required field(s): {missing}")
-
-        size = int(data_group["reward"].shape[0])
-        invalid_lengths = {
-            key: int(data_group[key].shape[0])
-            for key in required
-            if int(data_group[key].shape[0]) != size
-        }
-        if invalid_lengths:
-            raise ValueError(
-                f"Dataset fields must have equal length {size}, got {invalid_lengths}"
-            )
-
         episode_ends = np.asarray(meta_group["episode_ends"][:], dtype=np.int64)
         if episode_ends.ndim != 1 or len(episode_ends) == 0:
             raise ValueError("episode_ends must be a non-empty 1D array.")
@@ -121,7 +214,9 @@ class OfflineBuffer:
             raise ValueError(
                 f"Last episode_end must equal dataset size {size}, got {episode_ends[-1]}."
             )
+        return episode_ends
 
+    def _load_core(self, data_group, episode_ends):
         self._state = np.asarray(data_group["state"][:])
         self._action = np.asarray(data_group["action"][:])
         self._reward = np.asarray(data_group["reward"][:], dtype=np.float32).reshape(-1, 1)
@@ -131,31 +226,112 @@ class OfflineBuffer:
         self._timeout = np.asarray(data_group["timeout"][:], dtype=np.float32).reshape(-1, 1)
         self._not_done = 1.0 - self._done
         self._episode_ends = episode_ends
-        self._size = size
-
+        self._size = len(self._reward)
         if "return" in data_group:
             self._return = np.asarray(data_group["return"][:], dtype=np.float32).reshape(-1, 1)
         else:
             self._return = np.zeros((self._size, 1), dtype=np.float32)
 
-        depth_keys = set(self.DEPTH_KEYS) | {f"next_{key}" for key in self.DEPTH_KEYS}
-        reserved = set(core_keys) | {"return", "not_done"}
+    def _load_jpeg_rgb(self, root, data_group, zarr_path, size):
+        if "next_index" not in data_group:
+            raise KeyError("JPEG RGB Zarr is missing data/next_index")
+        if int(data_group["next_index"].shape[0]) != size:
+            raise ValueError("data/next_index length must match dataset size")
+        shapes = dict(root.attrs.get("rgb_shapes", {}))
         self._extra_data = {}
-        for key in data_group.keys():
-            if key in reserved:
-                continue
-            if not self._use_depth and key in depth_keys:
-                continue
+        for key in self.RGB_KEYS:
+            data_key = f"{key}_jpeg_data"
+            offsets_key = f"{key}_jpeg_offsets"
+            missing = [name for name in (data_key, offsets_key) if name not in data_group]
+            if missing:
+                raise KeyError(f"JPEG RGB Zarr is missing field(s): {missing}")
+            if key not in shapes:
+                raise KeyError(f"JPEG RGB Zarr attrs.rgb_shapes is missing {key!r}")
+            image_shape = tuple(int(value) for value in shapes[key])
+            if len(image_shape) != 3:
+                raise ValueError(f"RGB shape for {key} must be CHW, got {image_shape}")
+            if int(data_group[offsets_key].shape[0]) != size + 1:
+                raise ValueError(f"{offsets_key} length must be dataset size + 1")
+            logical_shape = (size, *image_shape)
+            self._extra_data[key] = LazyJpegZarrArray(
+                zarr_path=zarr_path,
+                key=key,
+                shape=logical_shape,
+                next_view=False,
+            )
+            self._extra_data[f"next_{key}"] = LazyJpegZarrArray(
+                zarr_path=zarr_path,
+                key=key,
+                shape=logical_shape,
+                next_view=True,
+            )
+
+        if self._use_depth:
+            for key in self.DEPTH_KEYS:
+                for logical_key in (key, f"next_{key}"):
+                    if logical_key not in data_group:
+                        raise KeyError(f"Dataset is missing required field {logical_key!r}")
+                    array = data_group[logical_key]
+                    if int(array.shape[0]) != size:
+                        raise ValueError(f"{logical_key} length must match dataset size")
+                    self._extra_data[logical_key] = LazyZarrArray(
+                        zarr_path=zarr_path,
+                        key=logical_key,
+                        shape=array.shape,
+                        dtype=array.dtype,
+                    )
+
+    def _load_dense_modalities(self, data_group, zarr_path, size):
+        modal_keys = self._modal_keys()
+        missing = sorted(key for key in modal_keys if key not in data_group)
+        if missing:
+            raise KeyError(f"Dataset is missing required field(s): {missing}")
+        self._extra_data = {}
+        for key in modal_keys:
             array = data_group[key]
-            if key in modal_keys:
-                self._extra_data[key] = LazyZarrArray(
-                    zarr_path=zarr_path,
-                    key=key,
-                    shape=array.shape,
-                    dtype=array.dtype,
-                )
-            else:
-                self._extra_data[key] = np.asarray(array[:])
+            if int(array.shape[0]) != size:
+                raise ValueError(f"{key} length must match dataset size")
+            self._extra_data[key] = LazyZarrArray(
+                zarr_path=zarr_path,
+                key=key,
+                shape=array.shape,
+                dtype=array.dtype,
+            )
+
+    def load_zarr(self, zarr_path: str) -> None:
+        root = zarr.open_group(zarr_path, mode="r")
+        if "data" not in root or "meta" not in root:
+            raise KeyError("Zarr dataset must contain 'data' and 'meta' groups.")
+        data_group = root["data"]
+        meta_group = root["meta"]
+        core_keys = (
+            "state",
+            "action",
+            "reward",
+            "next_state",
+            "next_action",
+            "done",
+            "timeout",
+        )
+        missing = sorted(key for key in core_keys if key not in data_group)
+        if missing:
+            raise KeyError(f"Dataset is missing required field(s): {missing}")
+        size = int(data_group["reward"].shape[0])
+        invalid_lengths = {
+            key: int(data_group[key].shape[0])
+            for key in core_keys
+            if int(data_group[key].shape[0]) != size
+        }
+        if invalid_lengths:
+            raise ValueError(
+                f"Dataset fields must have equal length {size}, got {invalid_lengths}"
+            )
+        episode_ends = self._validate_episode_ends(meta_group, size)
+        self._load_core(data_group, episode_ends)
+        if root.attrs.get("rgb_storage") == RGB_ZARR_STORAGE:
+            self._load_jpeg_rgb(root, data_group, zarr_path, size)
+        else:
+            self._load_dense_modalities(data_group, zarr_path, size)
 
     def load_dataset(self, dataset: dict[str, np.ndarray]) -> None:
         self._validate_dataset(dataset)
@@ -169,8 +345,10 @@ class OfflineBuffer:
         self._not_done = 1.0 - self._done
         self._episode_ends = np.asarray(dataset["episode_ends"], dtype=np.int64)
         self._size = len(self._reward)
-        self._return = np.zeros((self._size, 1), dtype=np.float32)
-
+        self._return = np.asarray(
+            dataset.get("return", np.zeros((self._size, 1), dtype=np.float32)),
+            dtype=np.float32,
+        ).reshape(-1, 1)
         reserved = {
             "state",
             "action",
@@ -200,10 +378,7 @@ class OfflineBuffer:
         for episode_end in tqdm(self._episode_ends, desc="Computing returns"):
             running_return = 0.0
             for i in reversed(range(episode_start, episode_end)):
-                running_return = (
-                    self._reward[i]
-                    + self._gamma * running_return * self._not_done[i]
-                )
+                running_return = self._reward[i] + self._gamma * running_return * self._not_done[i]
                 self._return[i] = running_return
             episode_start = episode_end
 
@@ -244,11 +419,7 @@ class OfflineBuffer:
             raise ValueError(f"Unknown reward scaling mode: {scaling}")
         self.compute_return()
 
-    def load_filter_dataset(
-        self,
-        dataset: dict[str, np.ndarray],
-        min_return: float = 0.0,
-    ) -> None:
+    def load_filter_dataset(self, dataset: dict[str, np.ndarray], min_return: float = 0.0) -> None:
         self.load_dataset(dataset)
         self.compute_return()
         keep_indices = []
@@ -317,7 +488,7 @@ class OfflineBuffer:
             "episode_ends": self._episode_ends.copy(),
         }
         for key, value in self._extra_data.items():
-            if isinstance(value, LazyZarrArray):
+            if isinstance(value, (LazyZarrArray, LazyJpegZarrArray)):
                 data[key] = np.asarray(value[:]).copy()
             else:
                 data[key] = np.asarray(value).copy()

@@ -8,6 +8,10 @@ use_depth: false
 # Streaming batch size for both stages. This bounds peak RAM usage.
 stream_batch_size: 50
 
+# RGB is JPEG-compressed in the processed NPY and remains JPEG-compressed in Zarr.
+# Higher quality increases disk usage. Recommended V1 default: 95.
+jpeg_quality: 95
+
 # raw_to_npy: LeRobot -> processed .npy
 lerobot_root: /path/to/lerobot_dataset
 processed_npy_output: /path/to/processed/teleop.npy
@@ -16,7 +20,7 @@ max_episode_len: 2000  # episode 长度归一化参考值
 lambda_penalty: 0.05   # episode length penalty 系数
 smooth_penalty: 0.01   # action smoothness penalty 系数
 
-# build_db: processed .npy -> Offline RL Zarr
+# build_db: one or more processed .npy -> Offline RL Zarr
 overwrite: true
 zarr_output_path: /path/to/output/offline_rl.zarr
 
@@ -27,5 +31,5 @@ teleop_sources:
   # 多批数据可继续添加：
   # - name: original_demo
   #   path: /path/to/processed/original_demo.npy
-  # - name: left_arm_special
-  #   path: /path/to/processed/left_arm_special.npy
+  # - name: rollout_round_01
+  #   path: /path/to/processed/rollout_round_01.npy

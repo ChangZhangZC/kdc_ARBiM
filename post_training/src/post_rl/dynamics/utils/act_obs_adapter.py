@@ -9,13 +9,11 @@ RGB_BUFFER_TO_FEATURE = {
     "wrist_left_rgb": "observation.images.wrist_cam_l",
     "wrist_right_rgb": "observation.images.wrist_cam_r",
 }
-
 DEPTH_BUFFER_TO_FEATURE = {
     "head_depth": "observation.depth_h",
     "wrist_left_depth": "observation.depth_l",
     "wrist_right_depth": "observation.depth_r",
 }
-
 ACTION_FEATURE = "action"
 
 
@@ -31,17 +29,13 @@ class ACTObservationAdapter:
         if n_obs_steps < 1:
             raise ValueError("n_obs_steps must be >= 1")
         if not fix_encoder:
-            raise ValueError(
-                "ACT Scheme C requires a frozen transformer state encoder."
-            )
-
+            raise ValueError("ACT Scheme C requires a frozen transformer state encoder.")
         self.encoder = encoder
         self.stats = stats
         self.n_obs_steps = n_obs_steps
         self.device = torch.device(device)
         self.fix_encoder = True
         self.feature_dim = encoder.output_dim
-
         self.encoder.to(self.device)
         self.encoder.eval()
         for param in self.encoder.parameters():
@@ -54,12 +48,7 @@ class ACTObservationAdapter:
             return data.to(self.device, non_blocking=True)
         return data
 
-    def _get_stat(
-        self,
-        feature: str,
-        name: str,
-        ref: torch.Tensor,
-    ) -> torch.Tensor:
+    def _get_stat(self, feature: str, name: str, ref: torch.Tensor) -> torch.Tensor:
         if feature not in self.stats:
             raise KeyError(f"Missing stats for {feature}")
         if name not in self.stats[feature]:
@@ -74,81 +63,59 @@ class ACTObservationAdapter:
         self,
         x: torch.Tensor,
         feature: str,
+        scale_uint8: bool = False,
     ) -> torch.Tensor:
+        was_integer = not torch.is_floating_point(x)
         x = x.float()
+        if scale_uint8 and was_integer:
+            x = x / 255.0
         mean = self._get_stat(feature, "mean", x)
         std = self._get_stat(feature, "std", x)
-
         if x.ndim >= 4 and mean.ndim == 1:
             shape = [1] * x.ndim
             shape[-3] = mean.shape[0]
             mean = mean.view(*shape)
             std = std.view(*shape)
-
         return (x - mean) / (std + 1e-8)
 
-    def _normalize_min_max(
-        self,
-        x: torch.Tensor,
-        feature: str,
-    ) -> torch.Tensor:
+    def _normalize_min_max(self, x: torch.Tensor, feature: str) -> torch.Tensor:
         x = x.float()
         min_v = self._get_stat(feature, "min", x)
         max_v = self._get_stat(feature, "max", x)
-
         if x.ndim >= 4 and min_v.ndim == 1:
             shape = [1] * x.ndim
             shape[-3] = min_v.shape[0]
             min_v = min_v.view(*shape)
             max_v = max_v.view(*shape)
-
         denom = max_v - min_v
-        denom = torch.where(
-            denom == 0,
-            torch.full_like(denom, 1e-8),
-            denom,
-        )
+        denom = torch.where(denom == 0, torch.full_like(denom, 1e-8), denom)
         return 2.0 * (x - min_v) / denom - 1.0
 
-    def normalize_obs(
-        self,
-        obs: dict[str, torch.Tensor],
-    ) -> dict[str, torch.Tensor]:
+    def normalize_obs(self, obs: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
         obs = self._to_device(obs)
         if "latent" in obs:
             if set(obs) != {"latent"}:
-                raise ValueError(
-                    "Cached ACT observations must contain only the latent field."
-                )
+                raise ValueError("Cached ACT observations must contain only the latent field.")
             return {"latent": obs["latent"].float()}
 
         normalized = {
-            OBS_STATE: self._normalize_mean_std(
-                obs["state"],
-                OBS_STATE,
-            )
+            OBS_STATE: self._normalize_mean_std(obs["state"], OBS_STATE)
         }
-
         for buffer_key, feature_key in RGB_BUFFER_TO_FEATURE.items():
             if buffer_key in obs:
                 normalized[feature_key] = self._normalize_mean_std(
                     obs[buffer_key],
                     feature_key,
+                    scale_uint8=True,
                 )
-
         for buffer_key, feature_key in DEPTH_BUFFER_TO_FEATURE.items():
             if buffer_key in obs:
                 normalized[feature_key] = self._normalize_min_max(
-                    obs[buffer_key],
-                    feature_key,
+                    obs[buffer_key], feature_key
                 )
-
         return normalized
 
-    def normalize_action(
-        self,
-        action: torch.Tensor,
-    ) -> torch.Tensor:
+    def normalize_action(self, action: torch.Tensor) -> torch.Tensor:
         action = action.to(self.device, non_blocking=True)
         return self._normalize_mean_std(action, ACTION_FEATURE)
 
@@ -161,18 +128,14 @@ class ACTObservationAdapter:
         batch_size = next(iter(obs.values())).shape[0]
         end = start + self.n_obs_steps
         prepared = {}
-
         for key, value in obs.items():
             if value.shape[1] < end:
-                raise ValueError(
-                    f"{key} needs at least {end} steps, got {value.shape[1]}"
-                )
+                raise ValueError(f"{key} needs at least {end} steps, got {value.shape[1]}")
             value = value[:, start:end]
             prepared[key] = value.reshape(
                 batch_size * self.n_obs_steps,
                 *value.shape[2:],
             )
-
         return prepared, batch_size
 
     def encode(
@@ -204,12 +167,10 @@ class ACTObservationAdapter:
         encode_fn = getattr(self.encoder, "encode_tokens", self.encoder)
         with torch.no_grad():
             features = encode_fn(obs)
-
         if features.ndim != 3:
             raise ValueError(
                 f"ACT state encoder must return [B,S,D], got {tuple(features.shape)}"
             )
-
         token_count = features.shape[1]
         return features.reshape(
             batch_size,
