@@ -1,5 +1,4 @@
 import argparse
-import gc
 import os
 import shutil
 import sys
@@ -33,621 +32,1126 @@ DEFAULT_CONFIG_PATH = str(
 )
 
 RGB_FEATURE_TO_BUFFER = {
-    'observation.images.head_cam_h': 'head_rgb',
-    'observation.images.wrist_cam_l': 'wrist_left_rgb',
-    'observation.images.wrist_cam_r': 'wrist_right_rgb',
+    "observation.images.head_cam_h": "head_rgb",
+    "observation.images.wrist_cam_l": "wrist_left_rgb",
+    "observation.images.wrist_cam_r": "wrist_right_rgb",
 }
 
 DEPTH_FEATURE_TO_BUFFER = {
-    'observation.depth_h': 'head_depth',
-    'observation.depth_l': 'wrist_left_depth',
-    'observation.depth_r': 'wrist_right_depth',
+    "observation.depth_h": "head_depth",
+    "observation.depth_l": "wrist_left_depth",
+    "observation.depth_r": "wrist_right_depth",
 }
 
 RETURN_GAMMA = 0.99
 ZARR_CHUNK_LEAD = 50
+STREAM_NPY_FORMAT = "arbim_processed_npy_stream_v1"
 
 
 def load_config(path):
-    with open(path, 'r') as f:
-        cfg = yaml.safe_load(f) or {}
+    with open(path, "r") as file:
+        cfg = yaml.safe_load(file) or {}
 
-    cfg.setdefault('lambda_penalty', 0.05)
-    cfg.setdefault('smooth_penalty', 0.01)
-    cfg.setdefault('max_episode_len', 2000)
+    cfg.setdefault("lambda_penalty", 0.05)
+    cfg.setdefault("smooth_penalty", 0.01)
+    cfg.setdefault("max_episode_len", 2000)
     cfg.setdefault("use_depth", False)
-    cfg.setdefault('overwrite', True)
-    cfg.setdefault('teleop_sources', [])
-
+    cfg.setdefault("overwrite", True)
+    cfg.setdefault("teleop_sources", [])
+    cfg.setdefault("stream_batch_size", ZARR_CHUNK_LEAD)
     return cfg
 
 
 def load_lerobot_dataset(root):
     root = Path(root).expanduser().resolve()
-
     if not root.exists():
         raise FileNotFoundError(f"LeRobot dataset root does not exist: {root}")
-
     if not root.is_dir():
         raise NotADirectoryError(f"LeRobot dataset root is not a directory: {root}")
-
     if not (root / "meta").exists():
         raise FileNotFoundError(f"LeRobot dataset metadata not found: {root / 'meta'}")
 
-    repo_id = root.name
-
-    return LeRobotDataset(
-        repo_id=repo_id,
-        root=root,
-    )
+    return LeRobotDataset(repo_id=root.name, root=root)
 
 
-def extract_rgb(frame):
-    return {
-        key: frame[key]
-        for key in RGB_FEATURE_TO_BUFFER
-        if key in frame
-    }
+def _as_numpy(value, feature_name, frame_index):
+    if hasattr(value, "detach"):
+        value = value.detach()
+    if hasattr(value, "cpu"):
+        value = value.cpu()
+    if hasattr(value, "numpy"):
+        value = value.numpy()
 
-
-def extract_depth(frame):
-    return {
-        key: frame[key]
-        for key in DEPTH_FEATURE_TO_BUFFER
-        if key in frame
-    }
-
-
-def _validate_processed_data(data, use_depth, context):
-    """Validate the frame-aligned processed LeRobot data contract."""
-    required_keys = (
-        'agent_pos',
-        'action',
-        'rgb',
-        'reward',
-        'done',
-        'timeout',
-    )
-    if use_depth:
-        required_keys = required_keys + ('depth',)
-
-    missing = [key for key in required_keys if key not in data]
-    if missing:
-        raise KeyError(f'{context} is missing required key(s): {missing}')
-
-    lengths = {key: len(data[key]) for key in required_keys}
-    if len(set(lengths.values())) != 1:
+    array = np.asarray(value)
+    if (
+        array.size == 0
+        or array.dtype == object
+        or not np.issubdtype(array.dtype, np.number)
+    ):
         raise ValueError(
-            f'{context} fields must have equal lengths, got {lengths}'
+            f"frame {frame_index} has an invalid {feature_name!r} value "
+            f"(shape={array.shape}, dtype={array.dtype})"
         )
+    return array
 
-    done = list(data['done'])
-    timeout = list(data['timeout'])
-    for index, (done_value, timeout_value) in enumerate(zip(done, timeout)):
-        if bool(done_value) != bool(timeout_value):
-            raise ValueError(
-                f'{context} frame {index} has done != timeout '
-                f'({done_value!r} != {timeout_value!r})'
-            )
 
-    if timeout and not bool(timeout[-1]):
-        raise ValueError(
-            f'{context} must end with timeout=True so the final episode is closed'
-        )
+def _episode_id(value):
+    if hasattr(value, "item"):
+        return value.item()
+    return value
 
-    for index, rgb in enumerate(data['rgb']):
-        if not isinstance(rgb, dict):
-            raise TypeError(f'{context} frame {index} rgb must be a dict')
-        missing_rgb = [
-            key for key in RGB_FEATURE_TO_BUFFER if key not in rgb
-        ]
-        if missing_rgb:
+
+def _group_episode_indices(dataset):
+    """Group frame indices by episode without decoding RGB whenever possible."""
+    episodes = {}
+    hf_dataset = getattr(dataset, "hf_dataset", None)
+
+    if hf_dataset is not None:
+        try:
+            episode_column = hf_dataset["episode_index"]
+            for frame_index, value in enumerate(
+                tqdm(episode_column, desc="Grouping episode indices")
+            ):
+                episodes.setdefault(_episode_id(value), []).append(frame_index)
+            if episodes:
+                return episodes
+        except (KeyError, TypeError, AttributeError):
+            episodes.clear()
+
+    for frame_index in tqdm(
+        range(len(dataset)), desc="Grouping episode indices"
+    ):
+        frame = dataset[frame_index]
+        if "episode_index" not in frame:
             raise KeyError(
-                f'{context} frame {index} is missing RGB feature(s): {missing_rgb}'
+                f"frame {frame_index} is missing required key 'episode_index'"
             )
+        episodes.setdefault(
+            _episode_id(frame["episode_index"]), []
+        ).append(frame_index)
+        del frame
 
+    return episodes
+
+
+def _validate_frame(frame, frame_index, use_depth):
+    required = [
+        "observation.state",
+        "action",
+        *RGB_FEATURE_TO_BUFFER.keys(),
+    ]
     if use_depth:
-        for index, depth in enumerate(data['depth']):
-            if not isinstance(depth, dict):
-                raise TypeError(f'{context} frame {index} depth must be a dict')
-            missing_depth = [
-                key for key in DEPTH_FEATURE_TO_BUFFER if key not in depth
-            ]
-            if missing_depth:
-                raise KeyError(
-                    f'{context} frame {index} is missing depth feature(s): '
-                    f'{missing_depth}'
-                )
+        required.extend(DEPTH_FEATURE_TO_BUFFER.keys())
 
-
-def process_raw_teleop_to_npy(config):
-    lerobot_root = config.get("lerobot_root")
-    output_path = config.get("processed_npy_output")
-
-    if not lerobot_root or not output_path:
-        raise ValueError(
-            "raw_to_npy requires lerobot_root and processed_npy_output"
+    missing = [key for key in required if key not in frame]
+    if missing:
+        raise KeyError(
+            f"frame {frame_index} is missing required key(s): {missing}"
         )
 
-    dataset = load_lerobot_dataset(lerobot_root)
 
-    use_depth = config["use_depth"]
-    max_episode_len = config["max_episode_len"]
-    lambda_penalty = config["lambda_penalty"]
-    smooth_penalty = config["smooth_penalty"]
-    if max_episode_len <= 0:
-        raise ValueError("max_episode_len must be positive")
+def _frame_arrays(frame, frame_index, use_depth):
+    _validate_frame(frame, frame_index, use_depth)
 
-    data = {
-        "action": [],
+    item = {
+        "agent_pos": _as_numpy(
+            frame["observation.state"],
+            "observation.state",
+            frame_index,
+        ),
+        "action": _as_numpy(
+            frame["action"],
+            "action",
+            frame_index,
+        ),
+        "rgb": {
+            key: _as_numpy(frame[key], key, frame_index)
+            for key in RGB_FEATURE_TO_BUFFER
+        },
+    }
+
+    if use_depth:
+        item["depth"] = {
+            key: _as_numpy(frame[key], key, frame_index)
+            for key in DEPTH_FEATURE_TO_BUFFER
+        }
+
+    return item
+
+
+def _new_processed_chunk(use_depth):
+    chunk = {
         "agent_pos": [],
+        "action": [],
         "rgb": [],
         "reward": [],
         "done": [],
         "timeout": [],
     }
     if use_depth:
-        data["depth"] = []
+        chunk["depth"] = []
+    return chunk
 
-    def as_numpy(value, feature_name, frame_index):
-        if hasattr(value, "numpy"):
-            try:
-                value = value.numpy()
-            except (RuntimeError, TypeError) as exc:
-                raise ValueError(
-                    f"frame {frame_index} has a non-CPU {feature_name!r} value; "
-                    "data preparation expects NumPy arrays or CPU tensors"
-                ) from exc
-        array = np.asarray(value)
-        if array.size == 0 or array.dtype == object or not np.issubdtype(array.dtype, np.number):
+
+def _validate_processed_chunk(
+    data,
+    use_depth,
+    context,
+    require_terminal=False,
+):
+    required = [
+        "agent_pos",
+        "action",
+        "rgb",
+        "reward",
+        "done",
+        "timeout",
+    ]
+    if use_depth:
+        required.append("depth")
+
+    missing = [key for key in required if key not in data]
+    if missing:
+        raise KeyError(f"{context} is missing required key(s): {missing}")
+
+    lengths = {key: len(data[key]) for key in required}
+    if len(set(lengths.values())) != 1:
+        raise ValueError(
+            f"{context} fields must have equal lengths, got {lengths}"
+        )
+
+    for index, (done, timeout) in enumerate(
+        zip(data["done"], data["timeout"])
+    ):
+        if bool(done) != bool(timeout):
             raise ValueError(
-                f"frame {frame_index} has an invalid {feature_name!r} value "
-                f"(shape={array.shape}, dtype={array.dtype})"
+                f"{context} frame {index} has done != timeout "
+                f"({done!r} != {timeout!r})"
             )
-        return array
 
-    # Keep only lightweight frame indices during episode grouping. Caching full
-    # LeRobot frames here retains decoded RGB tensors for the whole dataset and
-    # can exhaust host memory on real datasets.
-    episodes = {}
-    for frame_index in tqdm(range(len(dataset)), desc="Grouping frames by episode"):
-        frame = dataset[frame_index]
-        if "episode_index" not in frame:
-            raise KeyError(f"frame {frame_index} is missing required key 'episode_index'")
-        episode_id = frame["episode_index"]
-        if hasattr(episode_id, "item"):
-            episode_id = episode_id.item()
-        episodes.setdefault(episode_id, []).append(frame_index)
-        del frame
+    if (
+        require_terminal
+        and len(data["timeout"])
+        and not bool(data["timeout"][-1])
+    ):
+        raise ValueError(f"{context} must end with timeout=True")
 
-    if not episodes:
+    for index, rgb in enumerate(data["rgb"]):
+        if not isinstance(rgb, dict):
+            raise TypeError(
+                f"{context} frame {index} rgb must be a dict"
+            )
+        missing_rgb = [
+            key for key in RGB_FEATURE_TO_BUFFER if key not in rgb
+        ]
+        if missing_rgb:
+            raise KeyError(
+                f"{context} frame {index} is missing RGB feature(s): "
+                f"{missing_rgb}"
+            )
+
+    if use_depth:
+        for index, depth in enumerate(data["depth"]):
+            if not isinstance(depth, dict):
+                raise TypeError(
+                    f"{context} frame {index} depth must be a dict"
+                )
+            missing_depth = [
+                key for key in DEPTH_FEATURE_TO_BUFFER if key not in depth
+            ]
+            if missing_depth:
+                raise KeyError(
+                    f"{context} frame {index} is missing depth feature(s): "
+                    f"{missing_depth}"
+                )
+
+
+def _prepare_file(path, overwrite):
+    path = Path(path).expanduser().resolve()
+    if path.exists():
+        if not overwrite:
+            raise FileExistsError(
+                f"output already exists and overwrite=false: {path}"
+            )
+        if path.is_dir():
+            shutil.rmtree(path)
+        else:
+            path.unlink()
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def _prepare_dir(path, overwrite):
+    path = Path(path).expanduser().resolve()
+    if path.exists():
+        if not overwrite:
+            raise FileExistsError(
+                f"output already exists and overwrite=false: {path}"
+            )
+        if path.is_dir():
+            shutil.rmtree(path)
+        else:
+            path.unlink()
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def _flush_processed_npy_chunk(
+    handle,
+    chunk,
+    use_depth,
+    chunk_index,
+):
+    if not chunk["action"]:
+        return chunk_index
+
+    _validate_processed_chunk(
+        chunk,
+        use_depth,
+        f"processed npy chunk {chunk_index}",
+        require_terminal=False,
+    )
+    np.save(handle, chunk, allow_pickle=True)
+    return chunk_index + 1
+
+
+def process_raw_teleop_to_npy(config):
+    """raw_to_npy: stream LeRobot frames into one processed NPY file."""
+    lerobot_root = config.get("lerobot_root")
+    output_path = config.get("processed_npy_output")
+    if not lerobot_root or not output_path:
+        raise ValueError(
+            "raw_to_npy requires lerobot_root and processed_npy_output"
+        )
+
+    use_depth = bool(config.get("use_depth", False))
+    max_episode_len = int(config.get("max_episode_len", 2000))
+    lambda_penalty = float(config.get("lambda_penalty", 0.05))
+    smooth_penalty = float(config.get("smooth_penalty", 0.01))
+    batch_size = int(
+        config.get("stream_batch_size", ZARR_CHUNK_LEAD)
+    )
+    overwrite = bool(config.get("overwrite", True))
+
+    if max_episode_len <= 0:
+        raise ValueError("max_episode_len must be positive")
+    if batch_size <= 0:
+        raise ValueError("stream_batch_size must be positive")
+
+    dataset = load_lerobot_dataset(lerobot_root)
+    if len(dataset) == 0:
         raise RuntimeError("LeRobot dataset contains no frames")
 
-    print(f"Processing {len(episodes)} episodes")
+    episodes = _group_episode_indices(dataset)
+    if not episodes:
+        raise RuntimeError("LeRobot dataset contains no episodes")
 
-    for episode_frames in tqdm(episodes.values(), total=len(episodes), desc="Processing episodes"):
-        episode_length = len(episode_frames)
-        previous_action = None
+    first_index = next(iter(episodes.values()))[0]
+    first_frame = dataset[first_index]
+    first = _frame_arrays(first_frame, first_index, use_depth)
+    del first_frame
 
-        for t, frame_index in enumerate(episode_frames):
-            frame = dataset[frame_index]
-            if "observation.state" not in frame or "action" not in frame:
-                missing = [
-                    key for key in ("observation.state", "action") if key not in frame
-                ]
-                raise KeyError(f"frame {frame_index} is missing required key(s): {missing}")
-
-            state = as_numpy(frame["observation.state"], "observation.state", frame_index)
-            action = as_numpy(frame["action"], "action", frame_index)
-            rgb = {
-                key: as_numpy(value, key, frame_index)
-                for key, value in extract_rgb(frame).items()
-            }
-            missing_rgb = [
-                key for key in RGB_FEATURE_TO_BUFFER if key not in rgb
-            ]
-            if missing_rgb:
-                raise KeyError(
-                    f"frame {frame_index} is missing RGB feature(s): {missing_rgb}"
-                )
-            depth = None
-            if use_depth:
-                depth = {
-                    key: as_numpy(value, key, frame_index)
-                    for key, value in extract_depth(frame).items()
-                }
-                missing_depth = [
-                    key for key in DEPTH_FEATURE_TO_BUFFER if key not in depth
-                ]
-                if missing_depth:
-                    raise KeyError(
-                        f"frame {frame_index} is missing depth feature(s): "
-                        f"{missing_depth}"
-                    )
-            reward = float(t == episode_length - 1)
-
-            if reward == 1.0:
-                reward -= lambda_penalty * episode_length / max_episode_len
-
-            if previous_action is not None:
-                reward -= smooth_penalty * np.linalg.norm(action - previous_action)
-
-            previous_action = action
-            done = t == episode_length - 1
-            timeout = done
-
-            data["agent_pos"].append(state)
-            data["action"].append(action)
-            data["rgb"].append(rgb)
-            if use_depth:
-                data["depth"].append(depth)
-            data["reward"].append(reward)
-            data["done"].append(done)
-            data["timeout"].append(timeout)
-            del frame
-
-    _validate_processed_data(data, use_depth, 'processed LeRobot output')
-
-    out_dir = os.path.dirname(output_path)
-    if out_dir:
-        os.makedirs(out_dir, exist_ok=True)
-    np.save(output_path, data)
-    cprint(f"Saved processed LeRobot npy to {output_path}", "green")
-
-
-def make_buffers(use_depth=False):
-    """Create the in-memory single-step RL transition buffers."""
-    buffers = {
-        'state': [],
-        'next_state': [],
-        'action': [],
-        'next_action': [],
-        'reward': [],
-        'done': [],
-        'timeout': [],
-        'episode_ends': [],
-        'source_manifest': [],
-        '_total_count': 0,
+    manifest = {
+        "__format__": STREAM_NPY_FORMAT,
+        "num_frames": int(len(dataset)),
+        "num_episodes": int(len(episodes)),
+        "use_depth": use_depth,
+        "state_shape": tuple(first["agent_pos"].shape),
+        "action_shape": tuple(first["action"].shape),
+        "rgb_shapes": {
+            key: tuple(first["rgb"][key].shape)
+            for key in RGB_FEATURE_TO_BUFFER
+        },
+        "rgb_dtypes": {
+            key: str(first["rgb"][key].dtype)
+            for key in RGB_FEATURE_TO_BUFFER
+        },
+        "source_root": str(
+            Path(lerobot_root).expanduser().resolve()
+        ),
     }
 
-    for buffer_name in RGB_FEATURE_TO_BUFFER.values():
-        buffers[buffer_name] = []
-        buffers[f'next_{buffer_name}'] = []
-
     if use_depth:
-        for buffer_name in DEPTH_FEATURE_TO_BUFFER.values():
-            buffers[buffer_name] = []
-            buffers[f'next_{buffer_name}'] = []
+        manifest["depth_shapes"] = {
+            key: tuple(first["depth"][key].shape)
+            for key in DEPTH_FEATURE_TO_BUFFER
+        }
+        manifest["depth_dtypes"] = {
+            key: str(first["depth"][key].dtype)
+            for key in DEPTH_FEATURE_TO_BUFFER
+        }
 
-    return buffers
+    del first
 
+    output_path = _prepare_file(output_path, overwrite)
+    chunk = _new_processed_chunk(use_depth)
+    chunk_index = 0
+    processed = 0
 
-def load_processed_npy(path):
-    return np.load(path, allow_pickle=True).item()
-
-
-def _push_episode_end(buffers, total_count_sub):
-    buffers['_total_count'] += total_count_sub
-    buffers['episode_ends'].append(buffers['_total_count'])
-
-
-def append_processed_transitions(data, buffers, source_name, config):
-    """Append processed LeRobot frames as single-step RL transitions."""
-    config = config or {}
-    use_depth = bool(config.get('use_depth', False))
-    _validate_processed_data(data, use_depth, f'[teleop:{source_name}]')
-
-    expected_buffer_names = [
-        'state',
-        'next_state',
-        'action',
-        'next_action',
-        'reward',
-        'done',
-        'timeout',
-    ]
-    expected_buffer_names.extend(RGB_FEATURE_TO_BUFFER.values())
-    expected_buffer_names.extend(
-        f'next_{name}' for name in RGB_FEATURE_TO_BUFFER.values()
-    )
-    if use_depth:
-        expected_buffer_names.extend(DEPTH_FEATURE_TO_BUFFER.values())
-        expected_buffer_names.extend(
-            f'next_{name}' for name in DEPTH_FEATURE_TO_BUFFER.values()
-        )
-    missing_buffers = [
-        name for name in expected_buffer_names if name not in buffers
-    ]
-    if missing_buffers:
-        raise KeyError(
-            f'[teleop:{source_name}] buffers missing required field(s): '
-            f'{missing_buffers}; create them with make_buffers(use_depth={use_depth})'
+    with open(output_path, "wb") as handle:
+        np.save(handle, manifest, allow_pickle=True)
+        progress = tqdm(
+            total=len(dataset),
+            desc="Streaming raw_to_npy",
         )
 
-    state = data['agent_pos']
-    action = data['action']
-    rgb_frames = data['rgb']
-    depth_frames = data.get('depth')
-    rewards = np.asarray(data['reward'], dtype=np.float32)
-    dones = list(data['done'])
-    timeouts = list(data['timeout'])
-    n = len(timeouts)
-    if n == 0:
-        print(f'[teleop:{source_name}] empty source')
-        return
+        for episode_frames in episodes.values():
+            episode_length = len(episode_frames)
+            previous_action = None
 
-    appended_episodes = 0
-    appended_transitions = 0
-    total_count_sub = 0
-    total_reward = 0.0
-    for i in range(n):
-        is_episode_end = bool(timeouts[i]) or i == n - 1
-        next_index = i if is_episode_end else i + 1
-
-        buffers['state'].append(state[i])
-        buffers['action'].append(action[i])
-        buffers['reward'].append(float(rewards[i]))
-        buffers['done'].append(bool(dones[i]))
-        buffers['timeout'].append(bool(timeouts[i]))
-        buffers['next_state'].append(state[next_index])
-        buffers['next_action'].append(action[next_index])
-
-        for feature_name, buffer_name in RGB_FEATURE_TO_BUFFER.items():
-            buffers[buffer_name].append(rgb_frames[i][feature_name])
-            buffers[f'next_{buffer_name}'].append(
-                rgb_frames[next_index][feature_name]
-            )
-
-        if use_depth:
-            for feature_name, buffer_name in DEPTH_FEATURE_TO_BUFFER.items():
-                buffers[buffer_name].append(depth_frames[i][feature_name])
-                buffers[f'next_{buffer_name}'].append(
-                    depth_frames[next_index][feature_name]
+            for t, frame_index in enumerate(episode_frames):
+                frame = dataset[frame_index]
+                item = _frame_arrays(
+                    frame,
+                    frame_index,
+                    use_depth,
                 )
+                del frame
 
-        total_count_sub += 1
-        total_reward += float(rewards[i])
-        if bool(timeouts[i]):
-            _push_episode_end(buffers, total_count_sub)
-            appended_episodes += 1
-            appended_transitions += total_count_sub
-            print(
-                f'[teleop:{source_name}] episode {appended_episodes}, '
-                f'length: {total_count_sub}, return: {total_reward:.2f}'
-            )
-            total_count_sub = 0
-            total_reward = 0.0
+                terminal = t == episode_length - 1
+                reward = float(terminal)
 
-    if total_count_sub:
-        raise ValueError(
-            f'[teleop:{source_name}] ended with an unterminated episode'
+                if terminal:
+                    reward -= (
+                        lambda_penalty
+                        * episode_length
+                        / max_episode_len
+                    )
+
+                if previous_action is not None:
+                    reward -= smooth_penalty * np.linalg.norm(
+                        item["action"] - previous_action
+                    )
+
+                chunk["agent_pos"].append(item["agent_pos"])
+                chunk["action"].append(item["action"])
+                chunk["rgb"].append(item["rgb"])
+                if use_depth:
+                    chunk["depth"].append(item["depth"])
+                chunk["reward"].append(float(reward))
+                chunk["done"].append(bool(terminal))
+                chunk["timeout"].append(bool(terminal))
+
+                previous_action = np.array(
+                    item["action"],
+                    copy=True,
+                )
+                processed += 1
+                progress.update(1)
+
+                if len(chunk["action"]) >= batch_size:
+                    chunk_index = _flush_processed_npy_chunk(
+                        handle,
+                        chunk,
+                        use_depth,
+                        chunk_index,
+                    )
+                    chunk = _new_processed_chunk(use_depth)
+
+        chunk_index = _flush_processed_npy_chunk(
+            handle,
+            chunk,
+            use_depth,
+            chunk_index,
+        )
+        progress.close()
+
+    if processed != len(dataset):
+        raise RuntimeError(
+            f"processed {processed} frames, expected {len(dataset)}"
         )
 
-    print(
-        f'[teleop:{source_name}] episodes: {appended_episodes}, '
-        f'transitions: {appended_transitions}'
+    cprint(
+        f"Saved processed NPY: {output_path} "
+        f"(frames={processed}, episodes={len(episodes)}, "
+        f"chunks={chunk_index})",
+        "green",
     )
 
+    return {
+        "npy_path": str(output_path),
+        "num_frames": processed,
+        "num_episodes": len(episodes),
+        "num_chunks": chunk_index,
+    }
 
-def safe_prepare_output_dir(path, overwrite):
-    if os.path.exists(path):
-        if not overwrite:
-            cprint(f'output {path} already exists and overwrite=false', 'red')
-            raise SystemExit(1)
 
-        cprint(f'overwriting {path}', 'yellow')
-        shutil.rmtree(path)
+def _load_npy_record(handle):
+    try:
+        return np.load(handle, allow_pickle=True).item()
+    except EOFError:
+        return None
+    except ValueError:
+        if handle.tell() == os.fstat(handle.fileno()).st_size:
+            return None
+        raise
 
-    parent = os.path.dirname(path)
 
-    if parent:
-        os.makedirs(parent, exist_ok=True)
+def _read_source_header(path, use_depth):
+    path = Path(path).expanduser().resolve()
+    if not path.exists():
+        raise FileNotFoundError(
+            f"processed npy source does not exist: {path}"
+        )
+
+    with open(path, "rb") as handle:
+        first = _load_npy_record(handle)
+
+    if first is None:
+        raise ValueError(f"processed npy source is empty: {path}")
+
+    if first.get("__format__") == STREAM_NPY_FORMAT:
+        if bool(first["use_depth"]) != bool(use_depth):
+            raise ValueError(
+                f"{path} use_depth={first['use_depth']} does not "
+                f"match config use_depth={use_depth}"
+            )
+
+        return {
+            "path": str(path),
+            "streamed": True,
+            "num_frames": int(first["num_frames"]),
+            "num_episodes": int(first["num_episodes"]),
+            "state_shape": tuple(first["state_shape"]),
+            "action_shape": tuple(first["action_shape"]),
+            "rgb_shapes": {
+                key: tuple(value)
+                for key, value in first["rgb_shapes"].items()
+            },
+            "rgb_dtypes": {
+                key: np.dtype(value)
+                for key, value in first["rgb_dtypes"].items()
+            },
+            "depth_shapes": {
+                key: tuple(value)
+                for key, value in first.get(
+                    "depth_shapes", {}
+                ).items()
+            },
+            "depth_dtypes": {
+                key: np.dtype(value)
+                for key, value in first.get(
+                    "depth_dtypes", {}
+                ).items()
+            },
+        }
+
+    _validate_processed_chunk(
+        first,
+        use_depth,
+        f"legacy processed npy {path}",
+        require_terminal=True,
+    )
+
+    num_frames = len(first["action"])
+    num_episodes = int(
+        np.count_nonzero(
+            np.asarray(first["timeout"], dtype=bool)
+        )
+    )
+    first_rgb = first["rgb"][0]
+
+    info = {
+        "path": str(path),
+        "streamed": False,
+        "num_frames": num_frames,
+        "num_episodes": num_episodes,
+        "state_shape": tuple(
+            np.asarray(first["agent_pos"][0]).shape
+        ),
+        "action_shape": tuple(
+            np.asarray(first["action"][0]).shape
+        ),
+        "rgb_shapes": {
+            key: tuple(np.asarray(first_rgb[key]).shape)
+            for key in RGB_FEATURE_TO_BUFFER
+        },
+        "rgb_dtypes": {
+            key: np.asarray(first_rgb[key]).dtype
+            for key in RGB_FEATURE_TO_BUFFER
+        },
+        "depth_shapes": {},
+        "depth_dtypes": {},
+    }
+
+    if use_depth:
+        first_depth = first["depth"][0]
+        info["depth_shapes"] = {
+            key: tuple(np.asarray(first_depth[key]).shape)
+            for key in DEPTH_FEATURE_TO_BUFFER
+        }
+        info["depth_dtypes"] = {
+            key: np.asarray(first_depth[key]).dtype
+            for key in DEPTH_FEATURE_TO_BUFFER
+        }
+
+    return info
+
+
+def _iter_processed_chunks(path, use_depth):
+    path = Path(path).expanduser().resolve()
+
+    with open(path, "rb") as handle:
+        first = _load_npy_record(handle)
+        if first is None:
+            return
+
+        if first.get("__format__") != STREAM_NPY_FORMAT:
+            _validate_processed_chunk(
+                first,
+                use_depth,
+                f"legacy processed npy {path}",
+                require_terminal=True,
+            )
+            yield first
+            return
+
+        chunk_index = 0
+        while True:
+            chunk = _load_npy_record(handle)
+            if chunk is None:
+                break
+
+            _validate_processed_chunk(
+                chunk,
+                use_depth,
+                f"processed npy {path} chunk {chunk_index}",
+                require_terminal=False,
+            )
+            yield chunk
+            chunk_index += 1
+
+
+def _iter_processed_frames(path, use_depth):
+    for chunk in _iter_processed_chunks(path, use_depth):
+        count = len(chunk["action"])
+        for index in range(count):
+            frame = {
+                "agent_pos": np.asarray(
+                    chunk["agent_pos"][index]
+                ),
+                "action": np.asarray(chunk["action"][index]),
+                "rgb": chunk["rgb"][index],
+                "reward": float(chunk["reward"][index]),
+                "done": bool(chunk["done"][index]),
+                "timeout": bool(chunk["timeout"][index]),
+            }
+            if use_depth:
+                frame["depth"] = chunk["depth"][index]
+            yield frame
+        del chunk
+
+
+def _make_compressor():
+    try:
+        from numcodecs import Blosc
+        return Blosc(cname="zstd", clevel=3, shuffle=1)
+    except Exception:
+        return None
+
+
+def _create_zarr_array(
+    group,
+    name,
+    shape,
+    dtype,
+    compressor,
+):
+    chunks = (
+        min(ZARR_CHUNK_LEAD, shape[0]),
+        *shape[1:],
+    )
+    kwargs = {
+        "shape": shape,
+        "chunks": chunks,
+        "dtype": dtype,
+        "overwrite": True,
+    }
+    if compressor is not None:
+        kwargs["compressor"] = compressor
+    return group.create_dataset(name, **kwargs)
+
+
+def _write_block(array, start, values, dtype=None):
+    block = np.stack(values, axis=0)
+    if dtype is not None:
+        block = block.astype(dtype, copy=False)
+    array[start:start + len(values)] = block
+
+
+def _flush_transition_batch(
+    arrays,
+    batch,
+    start,
+    use_depth,
+):
+    if not batch:
+        return start
+
+    end = start + len(batch)
+
+    _write_block(
+        arrays["state"],
+        start,
+        [item["state"] for item in batch],
+        np.float32,
+    )
+    _write_block(
+        arrays["next_state"],
+        start,
+        [item["next_state"] for item in batch],
+        np.float32,
+    )
+    _write_block(
+        arrays["action"],
+        start,
+        [item["action"] for item in batch],
+        np.float32,
+    )
+    _write_block(
+        arrays["next_action"],
+        start,
+        [item["next_action"] for item in batch],
+        np.float32,
+    )
+
+    arrays["reward"][start:end, 0] = np.asarray(
+        [item["reward"] for item in batch],
+        dtype=np.float32,
+    )
+
+    terminal = np.asarray(
+        [item["done"] for item in batch],
+        dtype=bool,
+    )
+    arrays["done"][start:end, 0] = terminal
+    arrays["timeout"][start:end, 0] = terminal
+
+    for feature_name, buffer_name in RGB_FEATURE_TO_BUFFER.items():
+        _write_block(
+            arrays[buffer_name],
+            start,
+            [item["rgb"][feature_name] for item in batch],
+        )
+        _write_block(
+            arrays[f"next_{buffer_name}"],
+            start,
+            [item["next_rgb"][feature_name] for item in batch],
+        )
+
+    if use_depth:
+        for feature_name, buffer_name in DEPTH_FEATURE_TO_BUFFER.items():
+            _write_block(
+                arrays[buffer_name],
+                start,
+                [item["depth"][feature_name] for item in batch],
+            )
+            _write_block(
+                arrays[f"next_{buffer_name}"],
+                start,
+                [
+                    item["next_depth"][feature_name]
+                    for item in batch
+                ],
+            )
+
+    batch.clear()
+    return end
 
 
 def compute_return(reward, not_done, gamma=RETURN_GAMMA):
-    size_ = len(reward)
-    return_ = np.zeros((size_, 1), dtype=np.float32)
-    pre_return = 0.0
+    size = len(reward)
+    returns = np.zeros((size, 1), dtype=np.float32)
+    running = 0.0
 
-    for i in tqdm(reversed(range(size_)), total=size_, desc='Computing returns'):
-        return_[i] = (
-            reward[i]
-            + gamma
-            * pre_return
-            * not_done[i]
+    for index in tqdm(
+        reversed(range(size)),
+        total=size,
+        desc="Computing returns",
+    ):
+        returns[index] = (
+            reward[index]
+            + gamma * running * not_done[index]
+        )
+        running = returns[index]
+
+    return returns
+
+
+def _validate_source_shapes(infos, use_depth):
+    if not infos:
+        raise ValueError(
+            "build_db requires at least one teleop_source"
         )
 
-        pre_return = return_[i]
+    reference = infos[0]
+    keys = ["state_shape", "action_shape", "rgb_shapes"]
+    if use_depth:
+        keys.append("depth_shapes")
 
-    return return_
+    for info in infos[1:]:
+        mismatches = {
+            key: (reference[key], info[key])
+            for key in keys
+            if reference[key] != info[key]
+        }
+        if mismatches:
+            raise ValueError(
+                f"processed npy source shape mismatch for "
+                f"{info['path']}: {mismatches}"
+            )
 
 
-def write_zarr(buffers, output_path, overwrite):
-    """Write multimodal RL transition buffers to a Zarr dataset."""
-    if not output_path:
-        raise ValueError('zarr_output_path is required')
+def _build_zarr_arrays(
+    output_path,
+    total_frames,
+    info,
+    use_depth,
+    overwrite,
+):
+    output_path = _prepare_dir(output_path, overwrite)
+    root = zarr.group(str(output_path))
+    data = root.create_group("data")
+    meta = root.create_group("meta")
+    compressor = _make_compressor()
 
-    if len(buffers['state']) == 0:
-        raise RuntimeError('no transitions collected, refusing to write empty zarr')
+    state_shape = info["state_shape"]
+    action_shape = info["action_shape"]
 
-    depth_buffer_names = list(DEPTH_FEATURE_TO_BUFFER.values())
-    depth_presence = [name in buffers for name in depth_buffer_names]
+    arrays = {
+        "state": _create_zarr_array(
+            data,
+            "state",
+            (total_frames, *state_shape),
+            "float32",
+            compressor,
+        ),
+        "next_state": _create_zarr_array(
+            data,
+            "next_state",
+            (total_frames, *state_shape),
+            "float32",
+            compressor,
+        ),
+        "action": _create_zarr_array(
+            data,
+            "action",
+            (total_frames, *action_shape),
+            "float32",
+            compressor,
+        ),
+        "next_action": _create_zarr_array(
+            data,
+            "next_action",
+            (total_frames, *action_shape),
+            "float32",
+            compressor,
+        ),
+        "reward": _create_zarr_array(
+            data,
+            "reward",
+            (total_frames, 1),
+            "float32",
+            compressor,
+        ),
+        "return": _create_zarr_array(
+            data,
+            "return",
+            (total_frames, 1),
+            "float32",
+            compressor,
+        ),
+        "done": _create_zarr_array(
+            data,
+            "done",
+            (total_frames, 1),
+            "bool",
+            compressor,
+        ),
+        "timeout": _create_zarr_array(
+            data,
+            "timeout",
+            (total_frames, 1),
+            "bool",
+            compressor,
+        ),
+    }
 
-    if any(depth_presence) and not all(depth_presence):
-        missing = [name for name in depth_buffer_names if name not in buffers]
-        raise KeyError(f'incomplete depth buffers, missing: {missing}')
-
-    use_depth = all(depth_presence)
-
-    safe_prepare_output_dir(output_path, overwrite)
-    os.makedirs(output_path, exist_ok=True)
-
-    root = zarr.group(output_path)
-    data = root.create_group('data')
-    meta = root.create_group('meta')
-    root.attrs['source_manifest'] = buffers.get('source_manifest', [])
-
-    try:
-        from numcodecs import Blosc
-        compressor = Blosc(cname='zstd', clevel=3, shuffle=1)
-    except Exception:
-        compressor = None
-
-    def create_array(group, name, array, chunks=None, dtype=None):
-        """Create Zarr arrays while keeping compatibility with original RL-100 v2/v3 handling."""
-        if hasattr(group, 'create_dataset'):
-            kwargs = {'data': array, 'overwrite': True}
-            if dtype is not None:
-                kwargs['dtype'] = dtype
-            if chunks is not None:
-                kwargs['chunks'] = chunks
-            if compressor is not None:
-                kwargs['compressor'] = compressor
-            return group.create_dataset(name, **kwargs)
-
-        kwargs = {'data': array, 'overwrite': True}
-        if chunks is not None:
-            kwargs['chunks'] = chunks
-        return group.create_array(name, **kwargs)
-
-    for buffer_name in RGB_FEATURE_TO_BUFFER.values():
-        next_buffer_name = f'next_{buffer_name}'
-        if buffer_name not in buffers:
-            raise KeyError(f'missing RGB buffer: {buffer_name}')
-        if next_buffer_name not in buffers:
-            raise KeyError(f'missing RGB buffer: {next_buffer_name}')
-
-        rgb = np.stack(buffers[buffer_name], axis=0)
-        next_rgb = np.stack(buffers[next_buffer_name], axis=0)
-
-        rgb_chunks = (ZARR_CHUNK_LEAD, *rgb.shape[1:])
-        next_rgb_chunks = (ZARR_CHUNK_LEAD, *next_rgb.shape[1:])
-
-        create_array(data, buffer_name, rgb, chunks=rgb_chunks, dtype=rgb.dtype)
-        create_array(data, next_buffer_name, next_rgb, chunks=next_rgb_chunks, dtype=next_rgb.dtype)
-
-        cprint(
-            f'{buffer_name} shape: {rgb.shape}, dtype: {rgb.dtype}, range: [{np.min(rgb)}, {np.max(rgb)}]',
-            'green',
+    for feature_name, buffer_name in RGB_FEATURE_TO_BUFFER.items():
+        shape = info["rgb_shapes"][feature_name]
+        dtype = info["rgb_dtypes"][feature_name]
+        arrays[buffer_name] = _create_zarr_array(
+            data,
+            buffer_name,
+            (total_frames, *shape),
+            dtype,
+            compressor,
         )
-        cprint(
-            f'{next_buffer_name} shape: {next_rgb.shape}, dtype: {next_rgb.dtype}, range: [{np.min(next_rgb)}, {np.max(next_rgb)}]',
-            'green',
+        arrays[f"next_{buffer_name}"] = _create_zarr_array(
+            data,
+            f"next_{buffer_name}",
+            (total_frames, *shape),
+            dtype,
+            compressor,
         )
-
-        del rgb
-        del next_rgb
-        gc.collect()
 
     if use_depth:
-        for buffer_name in DEPTH_FEATURE_TO_BUFFER.values():
-            next_buffer_name = f'next_{buffer_name}'
-            if next_buffer_name not in buffers:
-                raise KeyError(f'missing depth buffer: {next_buffer_name}')
-
-            depth = np.stack(buffers[buffer_name], axis=0)
-            next_depth = np.stack(buffers[next_buffer_name], axis=0)
-
-            depth_chunks = (ZARR_CHUNK_LEAD, *depth.shape[1:])
-            next_depth_chunks = (ZARR_CHUNK_LEAD, *next_depth.shape[1:])
-
-            create_array(data, buffer_name, depth, chunks=depth_chunks, dtype=depth.dtype)
-            create_array(data, next_buffer_name, next_depth, chunks=next_depth_chunks, dtype=next_depth.dtype)
-
-            cprint(
-                f'{buffer_name} shape: {depth.shape}, dtype: {depth.dtype}, range: [{np.min(depth)}, {np.max(depth)}]',
-                'green',
+        for feature_name, buffer_name in DEPTH_FEATURE_TO_BUFFER.items():
+            shape = info["depth_shapes"][feature_name]
+            dtype = info["depth_dtypes"][feature_name]
+            arrays[buffer_name] = _create_zarr_array(
+                data,
+                buffer_name,
+                (total_frames, *shape),
+                dtype,
+                compressor,
             )
-            cprint(
-                f'{next_buffer_name} shape: {next_depth.shape}, dtype: {next_depth.dtype}, range: [{np.min(next_depth)}, {np.max(next_depth)}]',
-                'green',
+            arrays[f"next_{buffer_name}"] = _create_zarr_array(
+                data,
+                f"next_{buffer_name}",
+                (total_frames, *shape),
+                dtype,
+                compressor,
             )
 
-            del depth
-            del next_depth
-            gc.collect()
-
-    state = np.stack(buffers['state'], axis=0).astype(np.float32)
-    next_state = np.stack(buffers['next_state'], axis=0).astype(np.float32)
-    action = np.stack(buffers['action'], axis=0).astype(np.float32)
-    next_action = np.stack(buffers['next_action'], axis=0).astype(np.float32)
-    reward = np.asarray(buffers['reward'], dtype=np.float32).reshape(-1, 1)
-    done = np.asarray(buffers['done'], dtype=bool).reshape(-1, 1)
-    timeout = np.asarray(buffers['timeout'], dtype=bool).reshape(-1, 1)
-    episode_ends = np.asarray(buffers['episode_ends'], dtype=np.int64)
-    not_done = 1.0 - (done | timeout).astype(np.float32)
-    return_ = compute_return(reward, not_done, gamma=RETURN_GAMMA).astype(np.float32)
-
-    create_array(data, 'state', state, chunks=(ZARR_CHUNK_LEAD, *state.shape[1:]), dtype='float32')
-    create_array(data, 'next_state', next_state, chunks=(ZARR_CHUNK_LEAD, *next_state.shape[1:]), dtype='float32')
-    create_array(data, 'action', action, chunks=(ZARR_CHUNK_LEAD, *action.shape[1:]), dtype='float32')
-    create_array(data, 'next_action', next_action, chunks=(ZARR_CHUNK_LEAD, *next_action.shape[1:]), dtype='float32')
-    create_array(data, 'reward', reward, chunks=(ZARR_CHUNK_LEAD, reward.shape[1]), dtype='float32')
-    create_array(data, 'return', return_, chunks=(ZARR_CHUNK_LEAD, return_.shape[1]), dtype='float32')
-    create_array(data, 'done', done, chunks=(ZARR_CHUNK_LEAD, done.shape[1]), dtype='bool')
-    create_array(data, 'timeout', timeout, chunks=(ZARR_CHUNK_LEAD, timeout.shape[1]), dtype='bool')
-    create_array(meta, 'episode_ends', episode_ends, dtype='int64')
-
-    cprint(f'state shape: {state.shape}, range: [{np.min(state)}, {np.max(state)}]', 'green')
-    cprint(f'next_state shape: {next_state.shape}, range: [{np.min(next_state)}, {np.max(next_state)}]', 'green')
-    cprint(f'action shape: {action.shape}, range: [{np.min(action)}, {np.max(action)}]', 'green')
-    cprint(f'next_action shape: {next_action.shape}, range: [{np.min(next_action)}, {np.max(next_action)}]', 'green')
-    cprint(f'reward shape: {reward.shape}, range: [{np.min(reward)}, {np.max(reward)}]', 'green')
-    cprint(f'return shape: {return_.shape}, range: [{np.min(return_)}, {np.max(return_)}]', 'green')
-    cprint(f'done shape: {done.shape}, range: [{np.min(done)}, {np.max(done)}]', 'green')
-    cprint(f'timeout shape: {timeout.shape}, range: [{np.min(timeout)}, {np.max(timeout)}]', 'green')
-    cprint(f'episode_ends shape: {episode_ends.shape}, episodes: {len(episode_ends)}', 'green')
-    cprint(f'Saved zarr file to {output_path}', 'green')
+    return output_path, root, meta, arrays
 
 
 def source_id(source):
-    return source.get('name') or source['path']
+    return source.get("name") or source["path"]
 
 
-def record_source(buffers, kind, source):
-    entry = {'kind': kind, 'name': source_id(source), 'path': source.get('path')}
-
-    if entry not in buffers['source_manifest']:
-        buffers['source_manifest'].append(entry)
-
-
-def run_build_zarr(config):
-    """
-    V1 scope:
-        - supports processed teleoperation sources only
-        - does NOT support policy rollout sources
-    """
-    output_path = config.get('zarr_output_path')
+def run_build_db(config):
+    """build_db: stream processed NPY source(s) into Offline RL Zarr."""
+    output_path = config.get("zarr_output_path")
     if not output_path:
-        raise ValueError('build_zarr requires zarr_output_path')
+        raise ValueError("build_db requires zarr_output_path")
 
-    teleop_sources = config.get('teleop_sources', [])
-    if not teleop_sources:
-        raise ValueError('build_zarr requires at least one teleop_source')
+    sources = config.get("teleop_sources", [])
+    if not sources:
+        raise ValueError(
+            "build_db requires at least one teleop_source"
+        )
 
-    use_depth = bool(config.get('use_depth', False))
-    overwrite = bool(config.get('overwrite', True))
-    buffers = make_buffers(use_depth=use_depth)
+    use_depth = bool(config.get("use_depth", False))
+    overwrite = bool(config.get("overwrite", True))
+    batch_size = int(
+        config.get("stream_batch_size", ZARR_CHUNK_LEAD)
+    )
+    if batch_size <= 0:
+        raise ValueError("stream_batch_size must be positive")
 
-    cprint(f'building Zarr from {len(teleop_sources)} teleop source(s)', 'cyan')
-    for src in teleop_sources:
-        if 'path' not in src:
-            raise ValueError(f'teleop source missing path: {src}')
-        source_path = src['path']
-        if not os.path.exists(source_path):
-            raise FileNotFoundError(f'teleop source does not exist: {source_path}')
+    infos = []
+    for source in sources:
+        if "path" not in source:
+            raise ValueError(
+                f"teleop source missing path: {source}"
+            )
 
-        name = source_id(src)
-        cprint(f'[teleop:{name}] loading {source_path}', 'cyan')
+        info = _read_source_header(
+            source["path"],
+            use_depth,
+        )
+        info["name"] = source_id(source)
+        infos.append(info)
 
-        processed_data = load_processed_npy(source_path)
-        append_processed_transitions(processed_data, buffers, name, config)
-        record_source(buffers, 'teleop_npy', src)
+    _validate_source_shapes(infos, use_depth)
 
-        del processed_data
-        gc.collect()
+    total_frames = sum(
+        info["num_frames"] for info in infos
+    )
+    total_episodes = sum(
+        info["num_episodes"] for info in infos
+    )
+    if total_frames <= 0:
+        raise RuntimeError(
+            "processed npy sources contain no frames"
+        )
 
-    write_zarr(buffers, output_path, overwrite)
+    output_path, root, meta, arrays = _build_zarr_arrays(
+        output_path,
+        total_frames,
+        infos[0],
+        use_depth,
+        overwrite,
+    )
+
+    root.attrs["source_manifest"] = [
+        {
+            "kind": "teleop_npy",
+            "name": info["name"],
+            "path": info["path"],
+            "format": (
+                STREAM_NPY_FORMAT
+                if info["streamed"]
+                else "legacy_single_record"
+            ),
+        }
+        for info in infos
+    ]
+
+    rewards = np.empty(
+        (total_frames, 1),
+        dtype=np.float32,
+    )
+    not_done = np.empty(
+        (total_frames, 1),
+        dtype=np.float32,
+    )
+    episode_ends = []
+    transition_batch = []
+    write_index = 0
+    transition_count = 0
+
+    progress = tqdm(
+        total=total_frames,
+        desc="Streaming build_db",
+    )
+
+    for info in infos:
+        pending = None
+        source_episode_count = 0
+        source_frame_count = 0
+
+        for current in _iter_processed_frames(
+            info["path"],
+            use_depth,
+        ):
+            source_frame_count += 1
+
+            if pending is None:
+                pending = current
+            else:
+                if pending["done"]:
+                    raise ValueError(
+                        f"{info['path']} contains data after terminal "
+                        "without resetting the transition stream"
+                    )
+
+                transition_batch.append(
+                    {
+                        "state": pending["agent_pos"],
+                        "next_state": current["agent_pos"],
+                        "action": pending["action"],
+                        "next_action": current["action"],
+                        "rgb": pending["rgb"],
+                        "next_rgb": current["rgb"],
+                        "depth": pending.get("depth"),
+                        "next_depth": current.get("depth"),
+                        "reward": pending["reward"],
+                        "done": False,
+                    }
+                )
+
+                rewards[transition_count, 0] = pending["reward"]
+                not_done[transition_count, 0] = 1.0
+                transition_count += 1
+                progress.update(1)
+                pending = current
+
+            if pending is not None and pending["done"]:
+                transition_batch.append(
+                    {
+                        "state": pending["agent_pos"],
+                        "next_state": pending["agent_pos"],
+                        "action": pending["action"],
+                        "next_action": pending["action"],
+                        "rgb": pending["rgb"],
+                        "next_rgb": pending["rgb"],
+                        "depth": pending.get("depth"),
+                        "next_depth": pending.get("depth"),
+                        "reward": pending["reward"],
+                        "done": True,
+                    }
+                )
+
+                rewards[transition_count, 0] = pending["reward"]
+                not_done[transition_count, 0] = 0.0
+                transition_count += 1
+                progress.update(1)
+                episode_ends.append(transition_count)
+                source_episode_count += 1
+                pending = None
+
+            if len(transition_batch) >= batch_size:
+                write_index = _flush_transition_batch(
+                    arrays,
+                    transition_batch,
+                    write_index,
+                    use_depth,
+                )
+
+        if pending is not None:
+            raise ValueError(
+                f"{info['path']} ended with an unterminated episode"
+            )
+
+        if source_frame_count != info["num_frames"]:
+            raise RuntimeError(
+                f"{info['path']} yielded {source_frame_count} "
+                f"frames, expected {info['num_frames']}"
+            )
+
+        if source_episode_count != info["num_episodes"]:
+            raise RuntimeError(
+                f"{info['path']} yielded {source_episode_count} "
+                f"episodes, expected {info['num_episodes']}"
+            )
+
+    progress.close()
+
+    write_index = _flush_transition_batch(
+        arrays,
+        transition_batch,
+        write_index,
+        use_depth,
+    )
+
+    if (
+        transition_count != total_frames
+        or write_index != total_frames
+    ):
+        raise RuntimeError(
+            f"processed={transition_count}, wrote={write_index}, "
+            f"expected={total_frames}"
+        )
+
+    if len(episode_ends) != total_episodes:
+        raise RuntimeError(
+            f"episodes={len(episode_ends)}, "
+            f"expected={total_episodes}"
+        )
+
+    returns = compute_return(
+        rewards,
+        not_done,
+        gamma=RETURN_GAMMA,
+    ).astype(np.float32)
+    arrays["return"][:] = returns
+
+    meta.create_dataset(
+        "episode_ends",
+        data=np.asarray(episode_ends, dtype=np.int64),
+        overwrite=True,
+    )
+
+    cprint(
+        f"Saved Offline RL Zarr: {output_path} "
+        f"(frames={total_frames}, episodes={len(episode_ends)})",
+        "green",
+    )
+
+    return {
+        "zarr_path": str(output_path),
+        "num_frames": total_frames,
+        "num_episodes": len(episode_ends),
+        "episode_ends": np.asarray(
+            episode_ends,
+            dtype=np.int64,
+        ),
+    }
 
 
 def parse_args():
@@ -663,15 +1167,16 @@ def parse_args():
 def main():
     args = parse_args()
     config = load_config(args.config)
-    mode = config.get('mode')
+    mode = str(config.get("mode", "")).strip()
 
-    if mode == 'raw_to_npy':
+    if mode == "raw_to_npy":
         process_raw_teleop_to_npy(config)
-    elif mode == 'build_zarr':
-        run_build_zarr(config)
+    elif mode == "build_db":
+        run_build_db(config)
     else:
         raise ValueError(
-            f"unknown mode: {mode!r}. expected 'raw_to_npy' or 'build_zarr'."
+            f"unknown mode: {mode!r}. "
+            "expected 'raw_to_npy' or 'build_db'."
         )
 
 
