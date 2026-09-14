@@ -12,7 +12,6 @@ import zarr
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[3]
 LEROBOT_SRC = REPO_ROOT / "third_party" / "lerobot" / "src"
-
 for path in (REPO_ROOT, LEROBOT_SRC):
     path_str = str(path)
     if path_str not in sys.path:
@@ -56,10 +55,21 @@ def _load_action_normalization_stats(checkpoint: str) -> tuple[np.ndarray, np.nd
     return mean, std
 
 
-def _load_episode_ends(root) -> np.ndarray:
-    if "meta" not in root or "episode_ends" not in root["meta"]:
+def _load_zarr_arrays(dataset_path: str) -> tuple[np.ndarray, np.ndarray]:
+    root = zarr.open_group(dataset_path, mode="r")
+    if "data" not in root or "meta" not in root:
+        raise KeyError("Offline RL Zarr must contain top-level 'data' and 'meta' groups.")
+
+    data = root["data"]
+    meta = root["meta"]
+    if "action" not in data:
+        raise KeyError("Offline RL Zarr does not contain data/action.")
+    if "episode_ends" not in meta:
         raise KeyError("Offline RL Zarr does not contain meta/episode_ends.")
-    return np.asarray(root["meta"]["episode_ends"][:], dtype=np.int64)
+
+    actions = np.asarray(data["action"][:], dtype=np.float64)
+    episode_ends = np.asarray(meta["episode_ends"][:], dtype=np.int64)
+    return actions, episode_ends
 
 
 def _safe_ratio(numerator: np.ndarray | float, denominator: np.ndarray) -> np.ndarray:
@@ -72,8 +82,8 @@ def _safe_ratio(numerator: np.ndarray | float, denominator: np.ndarray) -> np.nd
 def main() -> None:
     parser = argparse.ArgumentParser(
         description=(
-            "Analyze ARBiM action variation and compare it with stochastic ACT sigma "
-            "in the checkpoint-normalized action space."
+            "Analyze action variation in ARBiM Offline RL data and compare it with "
+            "stochastic ACT sigma in checkpoint-normalized action space."
         )
     )
     parser.add_argument("--dataset", required=True, help="Offline RL Zarr path")
@@ -96,12 +106,7 @@ def main() -> None:
     output_dir = pathlib.Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    root = zarr.open_group(args.dataset, mode="r")
-    if "action" not in root:
-        raise KeyError("Offline RL Zarr does not contain action.")
-    actions = np.asarray(root["action"][:], dtype=np.float64)
-    episode_ends = _load_episode_ends(root)
-
+    actions, episode_ends = _load_zarr_arrays(args.dataset)
     if actions.ndim != 2:
         raise ValueError(f"Expected action [N,D], got {actions.shape}")
     if len(actions) == 0:
@@ -121,7 +126,6 @@ def main() -> None:
         )
 
     normalized_actions = (actions - checkpoint_mean[None]) / checkpoint_std[None]
-
     raw_mean = actions.mean(axis=0)
     raw_std = actions.std(axis=0)
     raw_min = actions.min(axis=0)
@@ -139,9 +143,7 @@ def main() -> None:
     normalized_deltas = []
 
     for episode_idx, (start, end) in enumerate(zip(starts, episode_ends)):
-        start = int(start)
-        end = int(end)
-        episode = actions[start:end]
+        episode = actions[int(start):int(end)]
         if len(episode) == 0:
             continue
 
@@ -149,7 +151,6 @@ def main() -> None:
         ep_std = episode.std(axis=0)
         episode_means.append(ep_mean)
         episode_stds.append(ep_std)
-
         for joint in range(action_dim):
             episode_rows.append(
                 {
@@ -181,67 +182,33 @@ def main() -> None:
     raw_delta_abs_p95 = np.percentile(np.abs(raw_deltas), 95, axis=0)
     normalized_delta_std = normalized_deltas.std(axis=0)
     normalized_delta_abs_median = np.median(np.abs(normalized_deltas), axis=0)
-    normalized_delta_abs_p95 = np.percentile(
-        np.abs(normalized_deltas), 95, axis=0
-    )
+    normalized_delta_abs_p95 = np.percentile(np.abs(normalized_deltas), 95, axis=0)
 
     sigma_min = math.exp(args.min_log_std)
     sigma_init = math.exp(args.init_log_std)
     sigma_max = math.exp(args.max_log_std)
-
     raw_sigma_min = sigma_min * checkpoint_std
     raw_sigma_init = sigma_init * checkpoint_std
     raw_sigma_max = sigma_max * checkpoint_std
 
-    # Independent Gaussian noise at adjacent timesteps contributes
-    # sqrt(2) * sigma standard deviation to the action difference.
     init_noise_delta_std = math.sqrt(2.0) * sigma_init
     max_noise_delta_std = math.sqrt(2.0) * sigma_max
-    init_noise_vs_demo_delta = _safe_ratio(
-        init_noise_delta_std,
-        normalized_delta_std,
-    )
-    max_noise_vs_demo_delta = _safe_ratio(
-        max_noise_delta_std,
-        normalized_delta_std,
-    )
-
-    # Reference only: sigma for which independent Gaussian noise would contribute
-    # the same adjacent-step delta std as the demonstrations.
+    init_noise_vs_demo_delta = _safe_ratio(init_noise_delta_std, normalized_delta_std)
+    max_noise_vs_demo_delta = _safe_ratio(max_noise_delta_std, normalized_delta_std)
     sigma_equal_demo_delta = normalized_delta_std / math.sqrt(2.0)
     log_std_equal_demo_delta = np.log(np.maximum(sigma_equal_demo_delta, 1e-12))
 
     summary_path = output_dir / "joint_summary.csv"
     summary_fields = [
-        "joint",
-        "raw_mean",
-        "raw_std",
-        "raw_min",
-        "raw_max",
-        "raw_p01",
-        "raw_p99",
-        "checkpoint_mean",
-        "checkpoint_std",
-        "normalized_mean",
-        "normalized_std",
-        "episode_mean_std",
-        "episode_std_median",
-        "delta_std_raw",
-        "delta_abs_median_raw",
-        "delta_abs_p95_raw",
-        "delta_std_normalized",
-        "delta_abs_median_normalized",
-        "delta_abs_p95_normalized",
-        "sigma_min_normalized",
-        "sigma_init_normalized",
-        "sigma_max_normalized",
-        "sigma_min_raw",
-        "sigma_init_raw",
-        "sigma_max_raw",
-        "init_noise_delta_vs_demo_delta",
-        "max_noise_delta_vs_demo_delta",
-        "sigma_equal_demo_delta",
-        "log_std_equal_demo_delta",
+        "joint", "raw_mean", "raw_std", "raw_min", "raw_max", "raw_p01", "raw_p99",
+        "checkpoint_mean", "checkpoint_std", "normalized_mean", "normalized_std",
+        "episode_mean_std", "episode_std_median", "delta_std_raw",
+        "delta_abs_median_raw", "delta_abs_p95_raw", "delta_std_normalized",
+        "delta_abs_median_normalized", "delta_abs_p95_normalized",
+        "sigma_min_normalized", "sigma_init_normalized", "sigma_max_normalized",
+        "sigma_min_raw", "sigma_init_raw", "sigma_max_raw",
+        "init_noise_delta_vs_demo_delta", "max_noise_delta_vs_demo_delta",
+        "sigma_equal_demo_delta", "log_std_equal_demo_delta",
     ]
 
     with summary_path.open("w", newline="") as file:
@@ -307,8 +274,7 @@ def main() -> None:
     print("-" * len(header))
     for joint in range(action_dim):
         print(
-            f"{joint:5d} | "
-            f"{checkpoint_std[joint]:8.5f} | "
+            f"{joint:5d} | {checkpoint_std[joint]:8.5f} | "
             f"{normalized_delta_std[joint]:14.5f} | "
             f"{init_noise_vs_demo_delta[joint]:9.3f} | "
             f"{max_noise_vs_demo_delta[joint]:8.3f} | "
