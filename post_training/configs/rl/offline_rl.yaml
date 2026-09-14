@@ -14,6 +14,10 @@ input:
 resume:
   checkpoint_dir: null  # Full Offline PPO-state resume; overrides input.policy_checkpoint/type and restores stage-1 artifact paths.
 
+stages:
+  run_stage1: true  # true: train/load Critic + Dynamics; false: require and load existing Stage-1 artifacts.
+  run_stage2: true  # true: run Offline PPO (or evaluation); false: stop after Stage 1.
+
 # -------------------- Hard alignment contract --------------------
 # These three values define one ACT/RL action chunk contract. They are configurable,
 # but must resolve to the same value. act_chunk_size must also match the loaded ACT checkpoint.
