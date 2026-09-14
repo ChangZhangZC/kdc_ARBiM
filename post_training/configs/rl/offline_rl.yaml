@@ -53,7 +53,7 @@ policy:
   # Numeric stochastic-policy experiment parameters.
   init_log_std: -3.5
   log_std_min: -5.0
-  log_std_max: -2.3
+  log_std_max: -2.2
 
 dataset:
   use_depth: false  # Must match the loaded ACT checkpoint.
