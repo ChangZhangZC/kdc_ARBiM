@@ -465,10 +465,18 @@ def _print_report(checkpoint: dict, one_step: dict, rollout: list[dict]) -> None
     for name, passed in checks.items():
         print(f"[{'PASS' if passed else 'WARN'}] {name}")
     if rollout:
-        growth = rollout[-1]["rollout_mse"] / max(rollout[0]["rollout_mse"], 1e-12)
+        first_mse = max(rollout[0]["rollout_mse"], 1e-12)
+        growth = rollout[-1]["rollout_mse"] / first_mse
+        peak_row = max(rollout, key=lambda row: row["rollout_mse"])
+        peak_growth = peak_row["rollout_mse"] / first_mse
+        peak_over_zero = peak_row["rollout_over_zero"]
         print(f"multi-step rollout error growth (last/first): {growth:.3f}x")
-        if growth > 10.0:
-            print("[WARN] rollout error grows by >10x; inspect before using long-horizon OPE")
+        print(
+            f"peak rollout error: step={peak_row['rollout_step']} "
+            f"peak/first={peak_growth:.3f}x peak/zero={peak_over_zero:.3f}x"
+        )
+        if peak_growth > 10.0:
+            print("[WARN] peak rollout error grows by >10x; inspect before using long-horizon OPE")
 
 
 def main() -> None:
