@@ -8,7 +8,7 @@ from kuavo_train.wrapper.policy.act.ACTConfigWrapper import CustomACTConfigWrapp
 class StochasticACTConfigWrapper(CustomACTConfigWrapper):
     init_log_std: float = -3.5
     log_std_min: float = -5.0
-    log_std_max: float = -2.3
+    log_std_max: float = -2.2
     
     def __post_init__(self):
         super().__post_init__()
