@@ -26,9 +26,32 @@ def _to_numpy(value) -> np.ndarray:
     return np.asarray(value)
 
 
-def _load_action_normalization_stats(checkpoint: str) -> tuple[np.ndarray, np.ndarray]:
+def _resolve_processor_dir(checkpoint: str, processor_dir: str | None) -> pathlib.Path:
+    if processor_dir is not None:
+        candidates = [pathlib.Path(processor_dir).expanduser().resolve()]
+    else:
+        checkpoint_path = pathlib.Path(checkpoint).expanduser().resolve()
+        candidates = [checkpoint_path, checkpoint_path.parent]
+
+    checked = []
+    for candidate in candidates:
+        config_path = candidate / "policy_preprocessor.json"
+        checked.append(str(config_path))
+        if config_path.is_file():
+            return candidate
+
+    raise FileNotFoundError(
+        "Could not find policy_preprocessor.json. Checked:\n- " + "\n- ".join(checked)
+    )
+
+
+def _load_action_normalization_stats(
+    checkpoint: str,
+    processor_dir: str | None,
+) -> tuple[np.ndarray, np.ndarray, pathlib.Path]:
+    resolved_processor_dir = _resolve_processor_dir(checkpoint, processor_dir)
     preprocessor = PolicyProcessorPipeline.from_pretrained(
-        checkpoint,
+        str(resolved_processor_dir),
         config_filename="policy_preprocessor.json",
     )
     normalizers = [
@@ -52,7 +75,7 @@ def _load_action_normalization_stats(checkpoint: str) -> tuple[np.ndarray, np.nd
     std = _to_numpy(action_stats["std"]).astype(np.float64).reshape(-1)
     if np.any(std <= 0):
         raise ValueError("Checkpoint action std must be strictly positive.")
-    return mean, std
+    return mean, std, resolved_processor_dir
 
 
 def _load_zarr_arrays(dataset_path: str) -> tuple[np.ndarray, np.ndarray]:
@@ -89,6 +112,14 @@ def main() -> None:
     parser.add_argument("--dataset", required=True, help="Offline RL Zarr path")
     parser.add_argument("--checkpoint", required=True, help="ACT checkpoint directory")
     parser.add_argument(
+        "--processor-dir",
+        default=None,
+        help=(
+            "Directory containing policy_preprocessor.json. If omitted, the script "
+            "checks the checkpoint directory first and then its parent run directory."
+        ),
+    )
+    parser.add_argument(
         "--output-dir",
         default="post_training/outputs/action_sigma_analysis",
     )
@@ -117,7 +148,9 @@ def main() -> None:
         )
 
     num_frames, action_dim = actions.shape
-    checkpoint_mean, checkpoint_std = _load_action_normalization_stats(args.checkpoint)
+    checkpoint_mean, checkpoint_std, resolved_processor_dir = (
+        _load_action_normalization_stats(args.checkpoint, args.processor_dir)
+    )
     if checkpoint_mean.shape != (action_dim,) or checkpoint_std.shape != (action_dim,):
         raise ValueError(
             "Checkpoint action normalization shape mismatch: "
@@ -257,6 +290,8 @@ def main() -> None:
         writer.writerows(episode_rows)
 
     print(f"Dataset: {args.dataset}")
+    print(f"Checkpoint: {pathlib.Path(args.checkpoint).expanduser().resolve()}")
+    print(f"Processor dir: {resolved_processor_dir}")
     print(f"Frames: {num_frames}")
     print(f"Episodes: {len(episode_ends)}")
     print(f"Action dim: {action_dim}")
