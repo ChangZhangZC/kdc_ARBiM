@@ -2,28 +2,12 @@ from __future__ import annotations
 
 import argparse
 import csv
+import json
 import math
 import pathlib
-import sys
 
 import numpy as np
-import torch
 import zarr
-
-REPO_ROOT = pathlib.Path(__file__).resolve().parents[3]
-LEROBOT_SRC = REPO_ROOT / "third_party" / "lerobot" / "src"
-for path in (REPO_ROOT, LEROBOT_SRC):
-    path_str = str(path)
-    if path_str not in sys.path:
-        sys.path.insert(0, path_str)
-
-from lerobot.processor import NormalizerProcessorStep, PolicyProcessorPipeline
-
-
-def _to_numpy(value) -> np.ndarray:
-    if torch.is_tensor(value):
-        return value.detach().cpu().numpy()
-    return np.asarray(value)
 
 
 def _resolve_processor_dir(checkpoint: str, processor_dir: str | None) -> pathlib.Path:
@@ -45,34 +29,63 @@ def _resolve_processor_dir(checkpoint: str, processor_dir: str | None) -> pathli
     )
 
 
+def _find_action_stats(node):
+    if isinstance(node, dict):
+        stats = node.get("stats")
+        if isinstance(stats, dict):
+            action_stats = stats.get("action")
+            if (
+                isinstance(action_stats, dict)
+                and "mean" in action_stats
+                and "std" in action_stats
+            ):
+                return action_stats
+        for value in node.values():
+            found = _find_action_stats(value)
+            if found is not None:
+                return found
+    elif isinstance(node, list):
+        for value in node:
+            found = _find_action_stats(value)
+            if found is not None:
+                return found
+    return None
+
+
+def _as_numeric_array(value, name: str) -> np.ndarray:
+    if isinstance(value, dict):
+        for key in ("data", "values", "value"):
+            if key in value:
+                value = value[key]
+                break
+    try:
+        array = np.asarray(value, dtype=np.float64).reshape(-1)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            f"Could not decode action normalization {name} from policy_preprocessor.json"
+        ) from exc
+    if array.size == 0 or not np.all(np.isfinite(array)):
+        raise ValueError(f"Action normalization {name} must be finite and non-empty.")
+    return array
+
+
 def _load_action_normalization_stats(
     checkpoint: str,
     processor_dir: str | None,
 ) -> tuple[np.ndarray, np.ndarray, pathlib.Path]:
     resolved_processor_dir = _resolve_processor_dir(checkpoint, processor_dir)
-    preprocessor = PolicyProcessorPipeline.from_pretrained(
-        str(resolved_processor_dir),
-        config_filename="policy_preprocessor.json",
-    )
-    normalizers = [
-        step
-        for step in preprocessor.steps
-        if isinstance(step, NormalizerProcessorStep)
-    ]
-    if len(normalizers) != 1:
-        raise RuntimeError(
-            f"Expected exactly one NormalizerProcessorStep, got {len(normalizers)}"
+    config_path = resolved_processor_dir / "policy_preprocessor.json"
+    with config_path.open("r", encoding="utf-8") as file:
+        config = json.load(file)
+
+    action_stats = _find_action_stats(config)
+    if action_stats is None:
+        raise KeyError(
+            "Could not find stats.action.mean/std in policy_preprocessor.json."
         )
 
-    stats = normalizers[0].stats
-    if "action" not in stats:
-        raise KeyError("ACT checkpoint normalization stats do not contain 'action'.")
-    action_stats = stats["action"]
-    if "mean" not in action_stats or "std" not in action_stats:
-        raise KeyError("ACT action normalization stats require both mean and std.")
-
-    mean = _to_numpy(action_stats["mean"]).astype(np.float64).reshape(-1)
-    std = _to_numpy(action_stats["std"]).astype(np.float64).reshape(-1)
+    mean = _as_numeric_array(action_stats["mean"], "mean")
+    std = _as_numeric_array(action_stats["std"], "std")
     if np.any(std <= 0):
         raise ValueError("Checkpoint action std must be strictly positive.")
     return mean, std, resolved_processor_dir
