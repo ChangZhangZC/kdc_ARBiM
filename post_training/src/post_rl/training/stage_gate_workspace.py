@@ -59,11 +59,12 @@ class TrainACTWorkspace(_CheckpointCompatTrainACTWorkspace):
             )
 
     def _best_ope_step(self) -> int:
-        if not self._ope_history:
+        if not self._ope_history or self._best_mean_q is None:
             return int(self.global_step)
-        best_index = max(
+        target = float(self._best_mean_q)
+        best_index = min(
             range(len(self._ope_history)),
-            key=lambda idx: float(self._ope_history[idx]),
+            key=lambda idx: abs(float(self._ope_history[idx]) - target),
         )
         return int(best_index * int(self.cfg.unio4.eval_step))
 
