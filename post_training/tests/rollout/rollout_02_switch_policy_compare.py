@@ -98,6 +98,7 @@ class SwitchComparePolicy:
         action_mean: np.ndarray,
         action_std: np.ndarray,
         csv_path: pathlib.Path,
+        summary_path: pathlib.Path,
         log_every: int,
         switch_on_freeze: bool,
         switch_step: int | None,
@@ -132,6 +133,7 @@ class SwitchComparePolicy:
 
         csv_path.parent.mkdir(parents=True, exist_ok=True)
         self.csv_path = csv_path
+        self.summary_path = summary_path
         self._file = csv_path.open("w", newline="", buffering=1)
         self._writer = None
         self._episode = -1
@@ -140,6 +142,7 @@ class SwitchComparePolicy:
         self._control_policy = "postrl"
         self._switched = False
         self._switch_events: list[dict] = []
+        self._episode_results: list[dict] = []
         self._prev_postrl = None
         self._prev_il = None
         self._postrl_delta_window = deque(maxlen=self.freeze_window)
@@ -297,12 +300,40 @@ class SwitchComparePolicy:
         self._has_steps = True
         return executed_action
 
+    def record_episode_result(self, episode: int, result: int) -> None:
+        events = [event for event in self._switch_events if event["episode"] == episode]
+        event = events[-1] if events else None
+        end_step = self._step - 1 if self._step > 0 else -1
+        switch_step = int(event["step"]) if event is not None else -1
+        row = {
+            "episode": int(episode),
+            "switched": int(event is not None),
+            "switch_step": switch_step,
+            "switch_reason": event["reason"] if event is not None else "",
+            "episode_end_step": int(end_step),
+            "steps_after_switch": int(end_step - switch_step + 1) if event is not None else 0,
+            "task_success": int(result == 1),
+            "takeover_success": int(event is not None and result == 1),
+        }
+        self._episode_results.append(row)
+        write_header = not self.summary_path.exists()
+        with self.summary_path.open("a", newline="") as file:
+            writer = csv.DictWriter(file, fieldnames=list(row))
+            if write_header:
+                writer.writeheader()
+            writer.writerow(row)
+        print(
+            f"[episode-summary] episode={episode} switched={row['switched']} "
+            f"switch_step={switch_step} end_step={end_step} "
+            f"task_success={row['task_success']} takeover_success={row['takeover_success']}"
+        )
+
     def close(self) -> None:
-        if self._file.closed:
-            return
-        self._file.flush()
-        self._file.close()
+        if not self._file.closed:
+            self._file.flush()
+            self._file.close()
         print(f"\nSwitch comparison CSV: {self.csv_path}")
+        print(f"Episode summary CSV: {self.summary_path}")
         if self._switch_events:
             print("Switch events:")
             for event in self._switch_events:
@@ -313,6 +344,13 @@ class SwitchComparePolicy:
                 )
         else:
             print("Switch events: none")
+        switched_results = [row for row in self._episode_results if row["switched"]]
+        if switched_results:
+            successes = sum(row["takeover_success"] for row in switched_results)
+            print(
+                f"Takeover task success: {successes}/{len(switched_results)} "
+                f"({100.0 * successes / len(switched_results):.1f}%)"
+            )
 
 
 def main() -> None:
@@ -368,6 +406,7 @@ def main() -> None:
     output_dir = pathlib.Path(args.output_dir).expanduser().resolve() / stamp
     output_dir.mkdir(parents=True, exist_ok=True)
     csv_path = output_dir / "switch_action_comparison.csv"
+    summary_path = output_dir / "episode_summary.csv"
     with (output_dir / "run_meta.json").open("w", encoding="utf-8") as file:
         json.dump(
             {
@@ -392,6 +431,7 @@ def main() -> None:
 
     device = torch.device(config.inference.device)
     base_setup_policy = sim_eval.setup_policy
+    base_run_single_episode = sim_eval.run_single_episode
     postrl_policy = base_setup_policy(postrl_checkpoint, "act", config.inference, device)
     il_policy = base_setup_policy(il_checkpoint, "act", config.inference, device)
     comparator = SwitchComparePolicy(
@@ -400,6 +440,7 @@ def main() -> None:
         action_mean=action_mean,
         action_std=action_std,
         csv_path=csv_path,
+        summary_path=summary_path,
         log_every=args.log_every,
         switch_on_freeze=args.switch_on_freeze,
         switch_step=args.switch_step,
@@ -414,9 +455,24 @@ def main() -> None:
             raise ValueError("Switch comparison supports ACT only")
         return comparator
 
+    def _run_single_episode(config, policy, preprocessor, postprocessor, episode, output_directory):
+        result = base_run_single_episode(
+            config,
+            policy,
+            preprocessor,
+            postprocessor,
+            episode,
+            output_directory,
+        )
+        comparator.record_episode_result(episode, result)
+        return result
+
     sim_eval.setup_policy = _setup
+    sim_eval.run_single_episode = _run_single_episode
     try:
         print(f"Processor bundles are bit-identical: {il_fp[:12]}...")
+        print(f"Base IL checkpoint: {il_checkpoint}")
+        print(f"Post-RL checkpoint: {postrl_checkpoint}")
         if args.switch_step is not None:
             print(f"Fixed switch: Post-RL -> IL at step {args.switch_step}")
         if args.switch_on_freeze:
@@ -427,9 +483,11 @@ def main() -> None:
                 f"policy_delta>={args.freeze_policy_delta_min}"
             )
         print(f"Per-step diagnostics: {csv_path}")
+        print(f"Per-episode takeover summary: {summary_path}")
         sim_eval.kuavo_eval_autotest(config)
     finally:
         sim_eval.setup_policy = base_setup_policy
+        sim_eval.run_single_episode = base_run_single_episode
         comparator.close()
 
 
