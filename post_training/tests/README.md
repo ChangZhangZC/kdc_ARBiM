@@ -41,16 +41,20 @@ The smoke numbering follows the Post-RL data/training/export chain.
 
 ## Rollout diagnostics
 
-`rollout/rollout_01_shadow_policy_compare.py` executes one deterministic ACT policy in the normal Kuavo simulator and shadow-runs the other policy on the exact same preprocessed observations. It records per-step IL/Post-RL action differences and each policy's step-to-step action change without allowing the shadow policy to affect the robot trajectory.
+`rollout/rollout_01_shadow_policy_compare.py` always runs the original IL ACT and exported deterministic Post-RL ACT on the exact same live simulator observations. In plain shadow mode, one policy controls the robot and the other is observation-only. The CSV records Post-RL action, IL action, the actual executed action, IL/Post-RL disagreement, and each policy's step-to-step action change.
 
-The intended first diagnosis for the current Post-RL freeze issue is:
+For the current Post-RL fixed-point issue, the script also supports a switch-control recovery test. Start with Post-RL controlling the robot, then switch to IL either at an explicit rollout step (`--switch-step`) or automatically when the rolling Post-RL action change is small while IL/Post-RL disagreement stays large (`--switch-on-freeze`). Once switched, IL controls the rest of that episode while both policies continue to be evaluated and logged.
+
+The automatic detector is configurable with:
 
 ```text
-execute: Post-RL deterministic ACT
-shadow : original IL deterministic ACT
+--freeze-min-step
+--freeze-window
+--freeze-step-delta-max
+--freeze-policy-delta-min
 ```
 
-If the Post-RL step-to-step action change collapses toward zero while the IL shadow policy still produces meaningful changes on those same observations, the freeze is policy-side rather than an environment/action-execution stall.
+A recovery after the Post-RL -> IL handoff is direct evidence that the frozen simulator state is still recoverable by the original IL policy and that the Post-RL action mapping is responsible for maintaining the fixed point. Failure to recover does not by itself prove the opposite, because the robot may already have entered a state outside both policies' recoverable support.
 
 ## V1 alignment notes
 
