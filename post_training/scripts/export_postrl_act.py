@@ -279,8 +279,9 @@ def main() -> None:
         "--checkpoint",
         required=True,
         help=(
-            "Path to the Post-RL stochastic ACT checkpoint directory, normally "
-            "offline_ppo/last or offline_ppo/checkpoints/final/policy."
+            "Path to the Post-RL stochastic ACT checkpoint directory. Preferred: "
+            "stage2/offline_ppo/best_ope; alternatives: stage2/offline_ppo/last "
+            "or stage2/offline_ppo/checkpoints/final/policy."
         ),
     )
     parser.add_argument("--task", required=True, help="Output task directory name.")
