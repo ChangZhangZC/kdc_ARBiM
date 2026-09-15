@@ -8,6 +8,7 @@ import json
 import math
 import pathlib
 import sys
+from collections import deque
 
 import numpy as np
 import torch
@@ -96,115 +97,221 @@ def _group_metrics(delta: np.ndarray) -> dict[str, float]:
 
 
 class ShadowComparePolicy:
-    """Execute one deterministic ACT while shadow-running the other on identical inputs."""
+    """Run IL and Post-RL ACT together and optionally hand control from Post-RL to IL."""
 
     def __init__(
         self,
-        primary,
-        reference,
+        postrl_policy,
+        il_policy,
         *,
-        primary_name: str,
-        reference_name: str,
+        execute: str,
         action_mean: np.ndarray,
         action_std: np.ndarray,
         csv_path: pathlib.Path,
         log_every: int,
+        switch_on_freeze: bool,
+        switch_step: int | None,
+        freeze_min_step: int,
+        freeze_window: int,
+        freeze_step_delta_max: float,
+        freeze_policy_delta_min: float,
     ) -> None:
-        self.primary = primary
-        self.reference = reference
-        self.primary_name = primary_name
-        self.reference_name = reference_name
-        self.config = primary.config
+        if execute not in {"postrl", "il"}:
+            raise ValueError(f"Unsupported execute policy: {execute}")
+        if execute != "postrl" and (switch_on_freeze or switch_step is not None):
+            raise ValueError("Switch-control diagnostics require --execute postrl")
+        if freeze_window < 1:
+            raise ValueError("freeze_window must be >= 1")
+        if freeze_min_step < 0:
+            raise ValueError("freeze_min_step must be >= 0")
+        if freeze_step_delta_max < 0 or freeze_policy_delta_min < 0:
+            raise ValueError("freeze thresholds must be non-negative")
+        if switch_step is not None and switch_step < 0:
+            raise ValueError("switch_step must be >= 0")
+
+        self.postrl_policy = postrl_policy
+        self.il_policy = il_policy
+        self.config = postrl_policy.config if execute == "postrl" else il_policy.config
+        self.initial_execute = execute
+        self.control_policy = execute
         self.action_mean = np.asarray(action_mean, dtype=np.float64)
         self.action_std = np.asarray(action_std, dtype=np.float64)
         self.csv_path = csv_path
         self.csv_path.parent.mkdir(parents=True, exist_ok=True)
         self.log_every = max(int(log_every), 1)
+        self.switch_on_freeze = bool(switch_on_freeze)
+        self.switch_step = switch_step
+        self.freeze_min_step = int(freeze_min_step)
+        self.freeze_window = int(freeze_window)
+        self.freeze_step_delta_max = float(freeze_step_delta_max)
+        self.freeze_policy_delta_min = float(freeze_policy_delta_min)
+
         self._file = self.csv_path.open("w", newline="", buffering=1)
         self._writer = None
         self._episode = -1
         self._step = 0
         self._has_steps = False
-        self._prev_primary = None
-        self._prev_reference = None
+        self._switched = False
+        self._switch_events: list[dict] = []
+        self._prev_postrl = None
+        self._prev_il = None
+        self._postrl_delta_window = deque(maxlen=self.freeze_window)
+        self._policy_delta_window = deque(maxlen=self.freeze_window)
         self._policy_delta_l2 = []
-        self._primary_step_delta_l2 = []
-        self._reference_step_delta_l2 = []
+        self._postrl_step_delta_l2 = []
+        self._il_step_delta_l2 = []
 
     def eval(self):
-        self.primary.eval()
-        self.reference.eval()
+        self.postrl_policy.eval()
+        self.il_policy.eval()
         return self
 
     def to(self, device):
-        self.primary.to(device)
-        self.reference.to(device)
+        self.postrl_policy.to(device)
+        self.il_policy.to(device)
         return self
 
     def reset(self):
-        self.primary.reset()
-        self.reference.reset()
+        self.postrl_policy.reset()
+        self.il_policy.reset()
         if self._episode < 0:
             self._episode = 0
         elif self._has_steps:
             self._episode += 1
         self._step = 0
         self._has_steps = False
-        self._prev_primary = None
-        self._prev_reference = None
+        self._switched = False
+        self.control_policy = self.initial_execute
+        self._prev_postrl = None
+        self._prev_il = None
+        self._postrl_delta_window.clear()
+        self._policy_delta_window.clear()
+
+    def _maybe_switch(
+        self,
+        postrl_step_delta: float,
+        policy_delta_l2: float,
+    ) -> tuple[bool, str, float, float]:
+        if self.control_policy != "postrl" or self._switched:
+            return False, "", float("nan"), float("nan")
+
+        if math.isfinite(postrl_step_delta):
+            self._postrl_delta_window.append(postrl_step_delta)
+            self._policy_delta_window.append(policy_delta_l2)
+
+        rolling_step_delta = (
+            float(np.mean(self._postrl_delta_window))
+            if self._postrl_delta_window
+            else float("nan")
+        )
+        rolling_policy_delta = (
+            float(np.mean(self._policy_delta_window))
+            if self._policy_delta_window
+            else float("nan")
+        )
+
+        reason = ""
+        if self.switch_step is not None and self._step >= self.switch_step:
+            reason = "fixed_step"
+        elif (
+            self.switch_on_freeze
+            and self._step >= self.freeze_min_step
+            and len(self._postrl_delta_window) == self.freeze_window
+            and rolling_step_delta <= self.freeze_step_delta_max
+            and rolling_policy_delta >= self.freeze_policy_delta_min
+        ):
+            reason = "freeze_detected"
+
+        if not reason:
+            return False, "", rolling_step_delta, rolling_policy_delta
+
+        self.control_policy = "il"
+        self._switched = True
+        event = {
+            "episode": self._episode,
+            "step": self._step,
+            "reason": reason,
+            "rolling_postrl_step_delta_l2": rolling_step_delta,
+            "rolling_policy_delta_l2": rolling_policy_delta,
+        }
+        self._switch_events.append(event)
+        print(
+            "\n[SWITCH] "
+            f"episode={self._episode} step={self._step}: Post-RL -> IL "
+            f"reason={reason}, rolling_postrl_step_delta={rolling_step_delta:.6g}, "
+            f"rolling_policy_delta={rolling_policy_delta:.6g}\n"
+        )
+        return True, reason, rolling_step_delta, rolling_policy_delta
 
     @torch.inference_mode()
     def select_action(self, observation):
-        primary_action = self.primary.select_action(observation)
-        reference_action = self.reference.select_action(observation)
-        if tuple(primary_action.shape) != tuple(reference_action.shape):
+        postrl_action = self.postrl_policy.select_action(observation)
+        il_action = self.il_policy.select_action(observation)
+        if tuple(postrl_action.shape) != tuple(il_action.shape):
             raise RuntimeError(
-                "Primary/reference action shape mismatch: "
-                f"{tuple(primary_action.shape)} vs {tuple(reference_action.shape)}"
+                "Post-RL/IL action shape mismatch: "
+                f"{tuple(postrl_action.shape)} vs {tuple(il_action.shape)}"
             )
-        if primary_action.ndim != 2 or primary_action.shape[0] != 1:
+        if postrl_action.ndim != 2 or postrl_action.shape[0] != 1:
             raise RuntimeError(
-                f"Expected deployed ACT action [1,D], got {tuple(primary_action.shape)}"
+                f"Expected deployed ACT action [1,D], got {tuple(postrl_action.shape)}"
             )
 
-        primary_norm = primary_action[0].detach().float().cpu().numpy().astype(np.float64)
-        reference_norm = reference_action[0].detach().float().cpu().numpy().astype(np.float64)
-        if primary_norm.shape != self.action_mean.shape:
+        postrl_norm = postrl_action[0].detach().float().cpu().numpy().astype(np.float64)
+        il_norm = il_action[0].detach().float().cpu().numpy().astype(np.float64)
+        if postrl_norm.shape != self.action_mean.shape:
             raise RuntimeError(
-                f"Action dim {primary_norm.shape} != normalizer {self.action_mean.shape}"
+                f"Action dim {postrl_norm.shape} != normalizer {self.action_mean.shape}"
             )
-        primary_phys = primary_norm * self.action_std + self.action_mean
-        reference_phys = reference_norm * self.action_std + self.action_mean
-        policy_delta = primary_phys - reference_phys
+        postrl_phys = postrl_norm * self.action_std + self.action_mean
+        il_phys = il_norm * self.action_std + self.action_mean
+        policy_delta = postrl_phys - il_phys
         policy_delta_l2 = float(np.linalg.norm(policy_delta))
         policy_delta_mae = float(np.mean(np.abs(policy_delta)))
         policy_delta_max = float(np.max(np.abs(policy_delta)))
-        primary_step_delta = (
+        postrl_step_delta = (
             float("nan")
-            if self._prev_primary is None
-            else float(np.linalg.norm(primary_phys - self._prev_primary))
+            if self._prev_postrl is None
+            else float(np.linalg.norm(postrl_phys - self._prev_postrl))
         )
-        reference_step_delta = (
+        il_step_delta = (
             float("nan")
-            if self._prev_reference is None
-            else float(np.linalg.norm(reference_phys - self._prev_reference))
+            if self._prev_il is None
+            else float(np.linalg.norm(il_phys - self._prev_il))
         )
+
+        switched_now, switch_reason, rolling_step_delta, rolling_policy_delta = self._maybe_switch(
+            postrl_step_delta,
+            policy_delta_l2,
+        )
+        if self.control_policy == "postrl":
+            executed_action = postrl_action
+            executed_phys = postrl_phys
+        else:
+            executed_action = il_action
+            executed_phys = il_phys
+
         row = {
             "episode": self._episode,
             "step": self._step,
-            "executed_policy": self.primary_name,
-            "shadow_policy": self.reference_name,
+            "control_policy": self.control_policy,
+            "switch_event": int(switched_now),
+            "switch_reason": switch_reason,
+            "rolling_postrl_step_delta_l2": rolling_step_delta,
+            "rolling_policy_delta_l2": rolling_policy_delta,
             "policy_delta_l2": policy_delta_l2,
             "policy_delta_mae": policy_delta_mae,
             "policy_delta_max_abs": policy_delta_max,
-            "executed_step_delta_l2": primary_step_delta,
-            "shadow_step_delta_l2": reference_step_delta,
+            "postrl_step_delta_l2": postrl_step_delta,
+            "il_step_delta_l2": il_step_delta,
             **_group_metrics(policy_delta),
         }
-        for index, value in enumerate(primary_phys):
+        for index, value in enumerate(postrl_phys):
+            row[f"postrl_action_{index}"] = float(value)
+        for index, value in enumerate(il_phys):
+            row[f"il_action_{index}"] = float(value)
+        for index, value in enumerate(executed_phys):
             row[f"executed_action_{index}"] = float(value)
-        for index, value in enumerate(reference_phys):
-            row[f"shadow_action_{index}"] = float(value)
         for index, value in enumerate(policy_delta):
             row[f"policy_delta_{index}"] = float(value)
 
@@ -215,23 +322,23 @@ class ShadowComparePolicy:
         self._file.flush()
 
         self._policy_delta_l2.append(policy_delta_l2)
-        if math.isfinite(primary_step_delta):
-            self._primary_step_delta_l2.append(primary_step_delta)
-        if math.isfinite(reference_step_delta):
-            self._reference_step_delta_l2.append(reference_step_delta)
+        if math.isfinite(postrl_step_delta):
+            self._postrl_step_delta_l2.append(postrl_step_delta)
+        if math.isfinite(il_step_delta):
+            self._il_step_delta_l2.append(il_step_delta)
         if self._step % self.log_every == 0:
             print(
                 f"[shadow] episode={self._episode} step={self._step} "
-                f"policy_delta_l2={policy_delta_l2:.6g} "
-                f"{self.primary_name}_step_delta={primary_step_delta:.6g} "
-                f"{self.reference_name}_step_delta={reference_step_delta:.6g}"
+                f"control={self.control_policy} policy_delta_l2={policy_delta_l2:.6g} "
+                f"postrl_step_delta={postrl_step_delta:.6g} "
+                f"il_step_delta={il_step_delta:.6g}"
             )
 
-        self._prev_primary = primary_phys.copy()
-        self._prev_reference = reference_phys.copy()
+        self._prev_postrl = postrl_phys.copy()
+        self._prev_il = il_phys.copy()
         self._step += 1
         self._has_steps = True
-        return primary_action
+        return executed_action
 
     def close(self) -> None:
         if self._file.closed:
@@ -241,28 +348,39 @@ class ShadowComparePolicy:
         print(f"\nShadow comparison CSV: {self.csv_path}")
         if self._policy_delta_l2:
             print(
-                "Mean executed-vs-shadow policy L2: "
+                "Mean Post-RL-vs-IL policy L2: "
                 f"{float(np.mean(self._policy_delta_l2)):.6g}"
             )
-        if self._primary_step_delta_l2:
+        if self._postrl_step_delta_l2:
             print(
-                f"Mean {self.primary_name} step-to-step L2: "
-                f"{float(np.mean(self._primary_step_delta_l2)):.6g}"
+                "Mean Post-RL step-to-step L2: "
+                f"{float(np.mean(self._postrl_step_delta_l2)):.6g}"
             )
-        if self._reference_step_delta_l2:
+        if self._il_step_delta_l2:
             print(
-                f"Mean {self.reference_name} step-to-step L2: "
-                f"{float(np.mean(self._reference_step_delta_l2)):.6g}"
+                "Mean IL step-to-step L2: "
+                f"{float(np.mean(self._il_step_delta_l2)):.6g}"
             )
+        if self._switch_events:
+            print("Switch events:")
+            for event in self._switch_events:
+                print(
+                    f"  episode={event['episode']} step={event['step']} "
+                    f"reason={event['reason']} "
+                    f"postrl_delta={event['rolling_postrl_step_delta_l2']:.6g} "
+                    f"policy_delta={event['rolling_policy_delta_l2']:.6g}"
+                )
+        else:
+            print("Switch events: none")
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(
         description=(
-            "Run the normal Kuavo simulator rollout with one deterministic ACT policy "
-            "executed and the other shadow-run on the exact same preprocessed observations. "
-            "Use this to diagnose Post-RL fixed-point/OOD behavior without letting the shadow "
-            "policy affect the robot trajectory."
+            "Run IL and Post-RL deterministic ACT on identical live simulator observations. "
+            "By default one policy controls the robot and the other is shadow-only. For the "
+            "causal recovery test, start with Post-RL and hand control to IL at a fixed step "
+            "or when a configurable fixed-point detector fires."
         )
     )
     parser.add_argument("--config", required=True, help="Kuavo deployment YAML")
@@ -276,8 +394,26 @@ def main() -> None:
         "--execute",
         choices=("postrl", "il"),
         default="postrl",
-        help="Policy that controls the simulator; the other policy is shadow-only.",
+        help="Initial policy controlling the simulator.",
     )
+    parser.add_argument(
+        "--switch-on-freeze",
+        action="store_true",
+        help=(
+            "When executing Post-RL, switch control to IL once the rolling Post-RL action "
+            "change is small while IL/Post-RL disagreement remains large."
+        ),
+    )
+    parser.add_argument(
+        "--switch-step",
+        type=int,
+        default=None,
+        help="Optional deterministic diagnostic: switch Post-RL -> IL at this rollout step.",
+    )
+    parser.add_argument("--freeze-min-step", type=int, default=80)
+    parser.add_argument("--freeze-window", type=int, default=10)
+    parser.add_argument("--freeze-step-delta-max", type=float, default=0.02)
+    parser.add_argument("--freeze-policy-delta-min", type=float, default=0.04)
     parser.add_argument("--device", default=None)
     parser.add_argument("--episodes", type=int, default=None)
     parser.add_argument(
@@ -314,21 +450,16 @@ def main() -> None:
     config.inference.policy_type = "act"
 
     if args.execute == "postrl":
-        primary_checkpoint = postrl_checkpoint
-        reference_checkpoint = il_checkpoint
-        primary_name = "postrl"
-        reference_name = "il"
+        initial_checkpoint = postrl_checkpoint
     else:
-        primary_checkpoint = il_checkpoint
-        reference_checkpoint = postrl_checkpoint
-        primary_name = "il"
-        reference_name = "postrl"
-    config.inference.pretrained_path = str(primary_checkpoint)
+        initial_checkpoint = il_checkpoint
+    config.inference.pretrained_path = str(initial_checkpoint)
 
     stamp = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
     original_method = str(config.inference.method)
     original_timestamp = str(config.inference.timestamp)
-    config.inference.method = f"{original_method}_shadow_compare"
+    mode = "switch" if args.switch_on_freeze or args.switch_step is not None else "shadow"
+    config.inference.method = f"{original_method}_{mode}_compare"
     config.inference.timestamp = f"{original_timestamp}_{stamp}"
 
     output_dir = pathlib.Path(args.output_dir).expanduser().resolve() / stamp
@@ -337,7 +468,13 @@ def main() -> None:
     metadata = {
         "il_checkpoint": str(il_checkpoint),
         "postrl_checkpoint": str(postrl_checkpoint),
-        "execute": args.execute,
+        "initial_execute": args.execute,
+        "switch_on_freeze": bool(args.switch_on_freeze),
+        "switch_step": args.switch_step,
+        "freeze_min_step": int(args.freeze_min_step),
+        "freeze_window": int(args.freeze_window),
+        "freeze_step_delta_max": float(args.freeze_step_delta_max),
+        "freeze_policy_delta_min": float(args.freeze_policy_delta_min),
         "processor_fingerprint": il_fp,
         "config": str(pathlib.Path(args.config).expanduser().resolve()),
         "device": str(config.inference.device),
@@ -353,17 +490,22 @@ def main() -> None:
 
     device = torch.device(config.inference.device)
     base_setup_policy = sim_eval.setup_policy
-    primary = base_setup_policy(primary_checkpoint, "act", config.inference, device)
-    reference = base_setup_policy(reference_checkpoint, "act", config.inference, device)
+    postrl_policy = base_setup_policy(postrl_checkpoint, "act", config.inference, device)
+    il_policy = base_setup_policy(il_checkpoint, "act", config.inference, device)
     comparator = ShadowComparePolicy(
-        primary,
-        reference,
-        primary_name=primary_name,
-        reference_name=reference_name,
+        postrl_policy,
+        il_policy,
+        execute=args.execute,
         action_mean=action_mean,
         action_std=action_std,
         csv_path=csv_path,
         log_every=args.log_every,
+        switch_on_freeze=args.switch_on_freeze,
+        switch_step=args.switch_step,
+        freeze_min_step=args.freeze_min_step,
+        freeze_window=args.freeze_window,
+        freeze_step_delta_max=args.freeze_step_delta_max,
+        freeze_policy_delta_min=args.freeze_policy_delta_min,
     ).eval().to(device)
 
     def _shadow_setup_policy(_pretrained_path, policy_type, cfg, device=device):
@@ -374,7 +516,16 @@ def main() -> None:
     sim_eval.setup_policy = _shadow_setup_policy
     try:
         print(f"Processor bundles are bit-identical: {il_fp[:12]}...")
-        print(f"Executing {primary_name}; shadow-running {reference_name}")
+        print(f"Initial control policy: {args.execute}")
+        if args.switch_step is not None:
+            print(f"Fixed switch enabled: Post-RL -> IL at step {args.switch_step}")
+        if args.switch_on_freeze:
+            print(
+                "Freeze switch enabled: "
+                f"min_step={args.freeze_min_step}, window={args.freeze_window}, "
+                f"postrl_step_delta<={args.freeze_step_delta_max}, "
+                f"policy_delta>={args.freeze_policy_delta_min}"
+            )
         print(f"Per-step diagnostics: {csv_path}")
         sim_eval.kuavo_eval_autotest(config)
     finally:
