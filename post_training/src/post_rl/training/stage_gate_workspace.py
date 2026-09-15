@@ -79,8 +79,30 @@ class TrainACTWorkspace(_CheckpointCompatTrainACTWorkspace):
         if self.rank != 0:
             return
 
+        state = policy.state_dict()
+        if "raw_log_std" not in state:
+            raise RuntimeError(
+                "best_ope must be saved as a stochastic Post-RL ACT policy "
+                "containing raw_log_std."
+            )
+
         directory = os.path.join(self.get_ppo_artifact_dir(), "best_ope")
         self._save_policy_bundle(policy, directory)
+
+        required = (
+            "config.json",
+            "model.safetensors",
+            "policy_preprocessor.json",
+            "policy_postprocessor.json",
+        )
+        missing = [
+            name for name in required if not os.path.isfile(os.path.join(directory, name))
+        ]
+        if missing:
+            raise RuntimeError(
+                "Incomplete best_ope pretrained bundle; missing files: "
+                f"{missing}"
+            )
 
         with open(os.path.join(directory, "best_ope_score.csv"), "w", newline="") as file:
             writer = csv.writer(file)
@@ -88,6 +110,11 @@ class TrainACTWorkspace(_CheckpointCompatTrainACTWorkspace):
             writer.writerow([int(best_step), f"{float(best_mean_q):.6f}"])
 
         metadata = {
+            "artifact_type": "postrl_best_ope_policy",
+            "policy_kind": "stochastic_act_postrl",
+            "model_format": "safetensors",
+            "contains_raw_log_std": True,
+            "processors_included": True,
             "best_ope_step": int(best_step),
             "best_mean_q": float(best_mean_q),
             "global_step_at_export": int(self.global_step),
