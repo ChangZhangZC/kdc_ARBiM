@@ -68,28 +68,58 @@ class TrainACTWorkspace(_CheckpointCompatTrainACTWorkspace):
         )
         return int(best_index * int(self.cfg.unio4.eval_step))
 
-    def _save_best_ope_policy(self) -> None:
-        if self.rank != 0 or self.unio4 is None or self._best_mean_q is None:
+    def _write_best_ope_policy(
+        self,
+        policy,
+        *,
+        best_mean_q: float,
+        best_step: int,
+        policy_source: str,
+    ) -> None:
+        if self.rank != 0:
             return
 
         directory = os.path.join(self.get_ppo_artifact_dir(), "best_ope")
-        self._save_policy_bundle(self.unio4._old_policy, directory)
+        self._save_policy_bundle(policy, directory)
 
-        best_step = self._best_ope_step()
-        best_mean_q = float(self._best_mean_q)
         with open(os.path.join(directory, "best_ope_score.csv"), "w", newline="") as file:
             writer = csv.writer(file)
             writer.writerow(["step", "mean_q"])
-            writer.writerow([best_step, f"{best_mean_q:.6f}"])
+            writer.writerow([int(best_step), f"{float(best_mean_q):.6f}"])
 
         metadata = {
-            "best_ope_step": best_step,
-            "best_mean_q": best_mean_q,
+            "best_ope_step": int(best_step),
+            "best_mean_q": float(best_mean_q),
             "global_step_at_export": int(self.global_step),
-            "policy_source": "ppo.old_policy",
+            "policy_source": policy_source,
         }
         with open(os.path.join(directory, "best_ope_meta.json"), "w") as file:
             json.dump(metadata, file, indent=2, sort_keys=True)
+
+    def _save_best_ope_policy(self) -> None:
+        if self.unio4 is None or self._best_mean_q is None:
+            return
+        self._write_best_ope_policy(
+            self.unio4._old_policy,
+            best_mean_q=float(self._best_mean_q),
+            best_step=self._best_ope_step(),
+            policy_source="ppo.old_policy",
+        )
+
+    def _evaluate_dynamics_ope(self) -> tuple[float, float]:
+        mean_q, mean_reward = super()._evaluate_dynamics_ope()
+        accepted = self._best_mean_q is None or (
+            mean_q > float(self._best_mean_q)
+            and bool(self.cfg.unio4.is_update_old_policy)
+        )
+        if accepted:
+            self._write_best_ope_policy(
+                self.unio4._policy,
+                best_mean_q=mean_q,
+                best_step=int(self.global_step),
+                policy_source="ppo.current_policy",
+            )
+        return mean_q, mean_reward
 
     def _save_resume_checkpoint(self, name: str) -> None:
         super()._save_resume_checkpoint(name)
