@@ -34,7 +34,7 @@ The smoke numbering follows the Post-RL data/training/export chain.
 
 | Order | Script | Purpose | V1 status |
 | --- | --- | --- | --- |
-| 01 | `analysis/analysis_01_action_sigma.py` | estimate ACT residual scale for stochastic-policy sigma design | retained; design diagnostic, not a regression gate |
+| 01 | `analysis/analysis_01_action_sigma.py` | estimate ACT residual scale for stochastic-policy sigma design | retained historical design diagnostic; for current V1 use `--max-log-std -2.2` |
 | 02 | `analysis/analysis_02_dynamics_eval.py` | evaluate trained dynamics one-step/multi-step behavior and uncertainty | retained; Stage-1 model diagnostic |
 | 03 | `analysis/analysis_03_policy_drift.py` | compare IL vs exported Post-RL deterministic weights and same-observation actions | new; primary policy-drift diagnostic |
 | 04 | `analysis/analysis_04_rgb_storage_estimate.py` | estimate JPEG RGB storage before full data conversion | retained; moved out of smoke because it is capacity analysis rather than pass/fail testing |
@@ -56,5 +56,6 @@ If the Post-RL step-to-step action change collapses toward zero while the IL sha
 
 - Current formal Post-RL artifacts use a complete stochastic `best_ope/` bundle and a separate deterministic exported `epochbest/` bundle.
 - `smoke_09_checkpoint_export.py` tests the stochastic -> deterministic export contract directly.
+- Current V1 stochastic-policy bounds are `init_log_std=-3.5`, `log_std_min=-5.0`, `log_std_max=-2.2`. `analysis_01_action_sigma.py` predates the final max bound, so pass `--max-log-std -2.2` when reproducing the V1 sigma analysis.
 - Chunk size is checkpoint/config dependent. `run_smoke.sh` accepts an optional chunk-size argument so the suite can validate the current 32-step experiment as well as other aligned ACT checkpoints without changing production YAML defaults.
 - The current Post-RL training/release branches are not modified by this test-suite work; changes are developed on a GPT branch and are intended to be squash-merged only into the dedicated test branch after review.
