@@ -138,7 +138,7 @@ def main():
     )
     print("[PASS] full PPO resume cannot bypass the Stage-2 gate")
 
-    print("SMOKE 08 PASSED")
+    print("SMOKE 07 PASSED")
 
 
 if __name__ == "__main__":

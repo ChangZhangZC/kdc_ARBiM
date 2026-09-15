@@ -38,7 +38,7 @@ def _print_pass(message: str) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Smoke 08: stochastic Post-RL ACT -> deterministic Kuavo ACT export"
+        description="Smoke 09: stochastic Post-RL ACT -> deterministic Kuavo ACT export"
     )
     parser.add_argument(
         "--checkpoint",
@@ -66,14 +66,14 @@ def main() -> None:
         output_root = pathlib.Path(args.work_dir).expanduser().resolve()
         output_root.mkdir(parents=True, exist_ok=True)
     else:
-        output_root = pathlib.Path(tempfile.mkdtemp(prefix="arbim_smoke08_export_"))
+        output_root = pathlib.Path(tempfile.mkdtemp(prefix="arbim_smoke09_export_"))
 
     result = export_postrl_checkpoint(
         checkpoint=checkpoint,
         task="smoke_task",
         method="smoke_postrl",
         output_root=output_root,
-        run_name="run_smoke08",
+        run_name="run_smoke09",
         device=args.device,
     )
 
@@ -138,7 +138,7 @@ def main() -> None:
         f"mean_abs_diff={mean_abs_diff:.6g}"
     )
 
-    print("\nSMOKE 08 PASSED")
+    print("\nSMOKE 09 PASSED")
 
 
 if __name__ == "__main__":
