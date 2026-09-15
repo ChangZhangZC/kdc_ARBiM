@@ -104,6 +104,8 @@ def main() -> None:
         ppo_final / "training_state.pt",
         best_ope / "config.json",
         best_ope / "model.safetensors",
+        best_ope / "policy_preprocessor.json",
+        best_ope / "policy_postprocessor.json",
         best_ope / "best_ope_score.csv",
         best_ope / "best_ope_meta.json",
     ):
@@ -113,8 +115,19 @@ def main() -> None:
 
     with open(best_ope / "best_ope_meta.json", "r") as file:
         best_meta = json.load(file)
-    if best_meta.get("policy_source") != "ppo.old_policy":
-        raise AssertionError(f"Unexpected best OPE policy source: {best_meta}")
+    expected_meta = {
+        "artifact_type": "postrl_best_ope_policy",
+        "policy_kind": "stochastic_act_postrl",
+        "model_format": "safetensors",
+        "contains_raw_log_std": True,
+        "processors_included": True,
+        "policy_source": "ppo.old_policy",
+    }
+    for key, expected in expected_meta.items():
+        if best_meta.get(key) != expected:
+            raise AssertionError(
+                f"Unexpected best OPE metadata {key}: {best_meta.get(key)!r} != {expected!r}"
+            )
     if workspace._best_mean_q is None:
         raise AssertionError("Offline PPO did not record a best Dynamics OPE score")
     if abs(float(best_meta["best_mean_q"]) - float(workspace._best_mean_q)) > 1e-6:
@@ -126,7 +139,7 @@ def main() -> None:
         raise AssertionError("Offline PPO object was not built in the E2E run")
     first_trainable = snapshot_params(workspace.unio4._policy, trainable_only=True)
     print_pass(
-        "Stage 1, Stage 2, best OPE policy and exact-resume artifacts were produced"
+        "Stage 1, Stage 2, stochastic best-OPE bundle and exact-resume artifacts were produced"
     )
 
     del workspace
