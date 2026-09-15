@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # Fill these three values before running.
-POSTRL_CHECKPOINT="/path/to/post_training/outputs/experiment_YYYYMMDD_HHMMSS/offline_ppo/last"
+POSTRL_CHECKPOINT="/path/to/post_training/outputs/experiment_YYYYMMDD_HHMMSS/stage2/offline_ppo/best_ope"
 TASK="your_task"
 METHOD="your_method"
 
