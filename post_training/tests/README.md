@@ -8,7 +8,7 @@ This directory is intentionally split by purpose. Test/diagnostic code lives her
 post_training/tests/
 ├── smoke/      # pass/fail regression tests for executable V1 contracts
 ├── analysis/   # offline measurement/report scripts; no pass/fail claim implied
-└── rollout/    # simulator/robot shadow diagnostics on live rollout observations
+└── rollout/    # simulator/robot diagnostics on live rollout observations
 ```
 
 ## Smoke sequence
@@ -36,25 +36,44 @@ The smoke numbering follows the Post-RL data/training/export chain.
 | --- | --- | --- | --- |
 | 01 | `analysis/analysis_01_action_sigma.py` | estimate ACT residual scale for stochastic-policy sigma design | retained historical design diagnostic; for current V1 use `--max-log-std -2.2` |
 | 02 | `analysis/analysis_02_dynamics_eval.py` | evaluate trained dynamics one-step/multi-step behavior and uncertainty | retained; Stage-1 model diagnostic |
-| 03 | `analysis/analysis_03_policy_drift.py` | compare IL vs exported Post-RL deterministic weights and same-observation actions | new; primary policy-drift diagnostic |
+| 03 | `analysis/analysis_03_policy_drift.py` | compare IL vs exported Post-RL deterministic weights and same-observation actions | current; primary policy-drift diagnostic |
 | 04 | `analysis/analysis_04_rgb_storage_estimate.py` | estimate JPEG RGB storage before full data conversion | retained; moved out of smoke because it is capacity analysis rather than pass/fail testing |
 
 ## Rollout diagnostics
 
-`rollout/rollout_01_shadow_policy_compare.py` always runs the original IL ACT and exported deterministic Post-RL ACT on the exact same live simulator observations. In plain shadow mode, one policy controls the robot and the other is observation-only. The CSV records Post-RL action, IL action, the actual executed action, IL/Post-RL disagreement, and each policy's step-to-step action change.
+| Order | Script | Purpose |
+| --- | --- | --- |
+| 01 | `rollout/rollout_01_shadow_policy_compare.py` | IL controls the simulator for the whole episode; Post-RL is shadow-only on the exact same observations. Measures whether PPO action output drifts on an IL-generated trajectory. No control switch is allowed. |
+| 02 | `rollout/rollout_02_switch_policy_compare.py` | Post-RL controls first while IL runs in shadow, then control switches once from Post-RL to IL either at a fixed step or after fixed-point detection. Tests whether the state is still recoverable by IL. |
+| 03 | `rollout/rollout_03_latent_ood.py` | Scores each live rollout observation against the already-built demonstration ACT latent cache. Uses the V1 critic representation: ACT encoder tokens followed by mean-token readout, then standardized kNN distance calibrated on held-out demonstration latents. |
 
-For the current Post-RL fixed-point issue, the script also supports a switch-control recovery test. Start with Post-RL controlling the robot, then switch to IL either at an explicit rollout step (`--switch-step`) or automatically when the rolling Post-RL action change is small while IL/Post-RL disagreement stays large (`--switch-on-freeze`). Once switched, IL controls the rest of that episode while both policies continue to be evaluated and logged.
+### Rollout 01: IL trajectory / Post-RL shadow
 
-The automatic detector is configurable with:
+This is intentionally a no-switch baseline. The original deterministic IL ACT always supplies the executed action. The exported deterministic Post-RL ACT sees the identical preprocessed observation and only contributes diagnostic actions. The CSV records IL/Post-RL disagreement and each policy's step-to-step action change.
+
+### Rollout 02: switch-control recovery
+
+This is the causal recovery experiment. Post-RL initially controls the robot. With `--switch-step`, control moves to IL at a specified step. With `--switch-on-freeze`, the handoff occurs when the rolling Post-RL action change is small while IL/Post-RL disagreement remains large. After the handoff, IL controls the rest of the episode and Post-RL becomes shadow-only.
+
+A recovery after the handoff shows that the state was still recoverable by the original IL policy. Failure to recover does not prove that IL and Post-RL are equivalent: Post-RL may already have moved the robot outside IL's recoverable support.
+
+### Rollout 03: latent-space distribution shift
+
+This diagnostic reuses the existing frozen latent cache instead of re-encoding the demonstration images. `obs_latent.npy` stores ACT encoder token latents for the demonstration/offline dataset. The script mean-pools those tokens exactly like `ACTCriticEncoder.forward`, forms a random reference/calibration split, standardizes each latent feature using the reference split, and computes k-nearest-neighbor distance.
+
+For each live rollout observation it records:
 
 ```text
---freeze-min-step
---freeze-window
---freeze-step-delta-max
---freeze-policy-delta-min
+latent_knn_distance
+latent_demo_percentile
+latent_above_demo_p95
+latent_above_demo_p99
+executed_step_delta_l2
 ```
 
-A recovery after the Post-RL -> IL handoff is direct evidence that the frozen simulator state is still recoverable by the original IL policy and that the Post-RL action mapping is responsible for maintaining the fixed point. Failure to recover does not by itself prove the opposite, because the robot may already have entered a state outside both policies' recoverable support.
+`latent_demo_percentile` is a rank relative to held-out demonstration samples, not an OOD probability. A value near 99 means the live observation is farther from the demonstration reference than about 99% of held-out demonstration observations under this representation/metric.
+
+The cache contract is checked before rollout: the live ACT encoder fingerprint must exactly match the `encoder_sha256` stored in the cache metadata. This is important because the distance is only meaningful when rollout and demonstration latents share the same frozen coordinate system.
 
 ## V1 alignment notes
 
