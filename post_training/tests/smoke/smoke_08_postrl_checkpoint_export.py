@@ -45,7 +45,8 @@ def main() -> None:
         required=True,
         help=(
             "Path to a stochastic Post-RL ACT checkpoint, normally "
-            "offline_ppo/last or offline_ppo/checkpoints/final/policy."
+            "stage2/offline_ppo/best_ope, stage2/offline_ppo/last, or "
+            "stage2/offline_ppo/checkpoints/final/policy."
         ),
     )
     parser.add_argument(

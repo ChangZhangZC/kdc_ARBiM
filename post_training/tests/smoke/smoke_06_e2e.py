@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import copy
+import json
 import os
 import pathlib
 
@@ -82,12 +83,15 @@ def main() -> None:
     if workspace.global_step != 2:
         raise AssertionError(f"Expected Offline PPO global_step=2, got {workspace.global_step}")
 
-    critic_final = first_dir / "critic" / "checkpoints" / "final"
-    dynamics_dir = first_dir / "dynamics"
+    stage1_dir = first_dir / "stage1"
+    critic_final = stage1_dir / "critic" / "checkpoints" / "final"
+    dynamics_dir = stage1_dir / "dynamics"
     dynamics_final = dynamics_dir / "checkpoints" / "final"
     dynamics_logs = dynamics_dir / "logs"
-    ppo_step1 = first_dir / "offline_ppo" / "checkpoints" / "step_00000001"
-    ppo_final = first_dir / "offline_ppo" / "checkpoints" / "final"
+    ppo_dir = first_dir / "stage2" / "offline_ppo"
+    ppo_step1 = ppo_dir / "checkpoints" / "step_00000001"
+    ppo_final = ppo_dir / "checkpoints" / "final"
+    best_ope = ppo_dir / "best_ope"
     for path in (
         critic_final / "Q.pt",
         critic_final / "value.pt",
@@ -98,14 +102,32 @@ def main() -> None:
         ppo_step1 / "resume_meta.json",
         ppo_step1 / "contract.json",
         ppo_final / "training_state.pt",
+        best_ope / "config.json",
+        best_ope / "model.safetensors",
+        best_ope / "best_ope_score.csv",
+        best_ope / "best_ope_meta.json",
     ):
         require_path(str(path))
     if not any(path.is_dir() for path in dynamics_logs.iterdir()):
         raise AssertionError("Dynamics logs directory does not contain a run subdirectory")
+
+    with open(best_ope / "best_ope_meta.json", "r") as file:
+        best_meta = json.load(file)
+    if best_meta.get("policy_source") != "ppo.old_policy":
+        raise AssertionError(f"Unexpected best OPE policy source: {best_meta}")
+    if workspace._best_mean_q is None:
+        raise AssertionError("Offline PPO did not record a best Dynamics OPE score")
+    if abs(float(best_meta["best_mean_q"]) - float(workspace._best_mean_q)) > 1e-6:
+        raise AssertionError(
+            "best_ope metadata does not match the workspace best Dynamics OPE score"
+        )
+
     if workspace.unio4 is None:
         raise AssertionError("Offline PPO object was not built in the E2E run")
     first_trainable = snapshot_params(workspace.unio4._policy, trainable_only=True)
-    print_pass("Critic, Dynamics, Offline PPO, local Dynamics logs and resume artifacts were produced")
+    print_pass(
+        "Stage 1, Stage 2, best OPE policy and exact-resume artifacts were produced"
+    )
 
     del workspace
     if torch.cuda.is_available():
