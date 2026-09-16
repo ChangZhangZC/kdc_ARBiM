@@ -88,7 +88,7 @@ def _group_metrics(delta: np.ndarray) -> dict[str, float]:
 
 
 class SwitchComparePolicy:
-    """Start under Post-RL control, shadow IL, then hand control to IL once."""
+    """Start under Post-RL control, then hand the current observation to a freshly reset IL ACT."""
 
     def __init__(
         self,
@@ -215,14 +215,10 @@ class SwitchComparePolicy:
             "reason": reason,
             "rolling_postrl_step_delta_l2": rolling_step_delta,
             "rolling_policy_delta_l2": rolling_policy_delta,
+            "fresh_replan": True,
+            "fresh_replan_jump_l2": float("nan"),
         }
         self._switch_events.append(event)
-        print(
-            "\n[SWITCH] "
-            f"episode={self._episode} step={self._step}: Post-RL -> IL "
-            f"reason={reason}, rolling_postrl_step_delta={rolling_step_delta:.6g}, "
-            f"rolling_policy_delta={rolling_policy_delta:.6g}\n"
-        )
         return True, reason, rolling_step_delta, rolling_policy_delta
 
     @torch.inference_mode()
@@ -233,26 +229,55 @@ class SwitchComparePolicy:
             raise RuntimeError(
                 f"Post-RL/IL action shape mismatch: {tuple(postrl_action.shape)} vs {tuple(il_action.shape)}"
             )
+
         postrl_norm = postrl_action[0].detach().float().cpu().numpy().astype(np.float64)
         il_norm = il_action[0].detach().float().cpu().numpy().astype(np.float64)
         postrl_phys = postrl_norm * self.action_std + self.action_mean
         il_phys = il_norm * self.action_std + self.action_mean
-        policy_delta = postrl_phys - il_phys
-        policy_delta_l2 = float(np.linalg.norm(policy_delta))
+
+        detector_policy_delta = postrl_phys - il_phys
+        detector_policy_delta_l2 = float(np.linalg.norm(detector_policy_delta))
         postrl_step_delta = (
             float("nan")
             if self._prev_postrl is None
             else float(np.linalg.norm(postrl_phys - self._prev_postrl))
         )
+
+        switched_now, reason, rolling_step_delta, rolling_policy_delta = self._maybe_switch(
+            postrl_step_delta, detector_policy_delta_l2
+        )
+
+        fresh_replan_jump_l2 = float("nan")
+        if switched_now:
+            stale_il_phys = il_phys.copy()
+            self.il_policy.reset()
+            il_action = self.il_policy.select_action(observation)
+            if tuple(postrl_action.shape) != tuple(il_action.shape):
+                raise RuntimeError(
+                    "Fresh-replanned IL/Post-RL action shape mismatch: "
+                    f"{tuple(il_action.shape)} vs {tuple(postrl_action.shape)}"
+                )
+            il_norm = il_action[0].detach().float().cpu().numpy().astype(np.float64)
+            il_phys = il_norm * self.action_std + self.action_mean
+            fresh_replan_jump_l2 = float(np.linalg.norm(il_phys - stale_il_phys))
+            self._switch_events[-1]["fresh_replan_jump_l2"] = fresh_replan_jump_l2
+            print(
+                "\n[SWITCH] "
+                f"episode={self._episode} step={self._step}: Post-RL -> IL "
+                f"reason={reason}, fresh Base-ACT replan=true, "
+                f"fresh_replan_jump={fresh_replan_jump_l2:.6g}, "
+                f"rolling_postrl_step_delta={rolling_step_delta:.6g}, "
+                f"rolling_policy_delta={rolling_policy_delta:.6g}\n"
+            )
+
+        policy_delta = postrl_phys - il_phys
+        policy_delta_l2 = float(np.linalg.norm(policy_delta))
         il_step_delta = (
             float("nan")
             if self._prev_il is None
             else float(np.linalg.norm(il_phys - self._prev_il))
         )
 
-        switched_now, reason, rolling_step_delta, rolling_policy_delta = self._maybe_switch(
-            postrl_step_delta, policy_delta_l2
-        )
         if self._control_policy == "postrl":
             executed_action, executed_phys = postrl_action, postrl_phys
         else:
@@ -264,8 +289,11 @@ class SwitchComparePolicy:
             "control_policy": self._control_policy,
             "switch_event": int(switched_now),
             "switch_reason": reason,
+            "fresh_replan_event": int(switched_now),
+            "fresh_replan_jump_l2": fresh_replan_jump_l2,
             "rolling_postrl_step_delta_l2": rolling_step_delta,
             "rolling_policy_delta_l2": rolling_policy_delta,
+            "detector_policy_delta_l2": detector_policy_delta_l2,
             "policy_delta_l2": policy_delta_l2,
             "policy_delta_mae": float(np.mean(np.abs(policy_delta))),
             "policy_delta_max_abs": float(np.max(np.abs(policy_delta))),
@@ -310,6 +338,12 @@ class SwitchComparePolicy:
             "switched": int(event is not None),
             "switch_step": switch_step,
             "switch_reason": event["reason"] if event is not None else "",
+            "fresh_replan": int(event is not None and event.get("fresh_replan", False)),
+            "fresh_replan_jump_l2": (
+                event.get("fresh_replan_jump_l2", float("nan"))
+                if event is not None
+                else float("nan")
+            ),
             "episode_end_step": int(end_step),
             "steps_after_switch": int(end_step - switch_step + 1) if event is not None else 0,
             "task_success": int(result == 1),
@@ -324,8 +358,9 @@ class SwitchComparePolicy:
             writer.writerow(row)
         print(
             f"[episode-summary] episode={episode} switched={row['switched']} "
-            f"switch_step={switch_step} end_step={end_step} "
-            f"task_success={row['task_success']} takeover_success={row['takeover_success']}"
+            f"switch_step={switch_step} fresh_replan={row['fresh_replan']} "
+            f"end_step={end_step} task_success={row['task_success']} "
+            f"takeover_success={row['takeover_success']}"
         )
 
     def close(self) -> None:
@@ -339,6 +374,7 @@ class SwitchComparePolicy:
             for event in self._switch_events:
                 print(
                     f"  episode={event['episode']} step={event['step']} reason={event['reason']} "
+                    f"fresh_replan_jump={event.get('fresh_replan_jump_l2', float('nan')):.6g} "
                     f"postrl_delta={event['rolling_postrl_step_delta_l2']:.6g} "
                     f"policy_delta={event['rolling_policy_delta_l2']:.6g}"
                 )
@@ -356,8 +392,9 @@ class SwitchComparePolicy:
 def main() -> None:
     parser = argparse.ArgumentParser(
         description=(
-            "Causal recovery test: Post-RL controls first while IL runs in shadow; "
-            "then control switches once to IL at a fixed step or after freeze detection."
+            "Causal recovery test: Post-RL controls first while IL runs in shadow. At the "
+            "switch step the Base ACT queue is discarded, Base ACT is reset, and the current "
+            "observation is immediately replanned into a fresh action chunk before takeover."
         )
     )
     parser.add_argument("--config", required=True)
@@ -416,6 +453,7 @@ def main() -> None:
                 "processor_fingerprint": il_fp,
                 "switch_on_freeze": bool(args.switch_on_freeze),
                 "switch_step": args.switch_step,
+                "switch_il_fresh_replan": True,
                 "freeze_min_step": args.freeze_min_step,
                 "freeze_window": args.freeze_window,
                 "freeze_step_delta_max": args.freeze_step_delta_max,
@@ -473,6 +511,7 @@ def main() -> None:
         print(f"Processor bundles are bit-identical: {il_fp[:12]}...")
         print(f"Base IL checkpoint: {il_checkpoint}")
         print(f"Post-RL checkpoint: {postrl_checkpoint}")
+        print("Switch takeover mode: reset Base ACT queue and fresh-replan from current observation")
         if args.switch_step is not None:
             print(f"Fixed switch: Post-RL -> IL at step {args.switch_step}")
         if args.switch_on_freeze:
