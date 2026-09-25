@@ -56,6 +56,8 @@ For each valid observation anchor it compares:
 
 The primary outputs are `terminal_window_coverage.csv`, `episode_action_motion.csv`, `qva_per_anchor.csv`, phase/progress summaries, plots, and `summary.json`. The key quantities are `Q`, `V`, `A=Q-V`, and whether Post-RL/hold/terminal-template actions outrank the Base ACT continuation action during the second half of the episode.
 
+The expanded counterfactuals test three more links in the hypothesis. First, the terminal action is replaced by the next episode's terminal chunk while the current state is fixed, and the current episode's terminal action is also evaluated on a progress-matched state from the next episode. This separates same-episode compatibility from a generic terminal-action shortcut. Second, the normalized action-chunk RMSE from Base ACT and Post-RL to the same terminal template is compared; a negative `postrl_terminal_delta_rmse` means Post-RL moved closer to the terminal-action manifold. Third, for the 16D bimanual contract `[left7, left_gripper, right7, right_gripper]`, terminal components are injected into the Base ACT chunk one arm / joint group / gripper at a time to localize which side drives any Q overvaluation.
+
 ## Rollout diagnostics
 
 | Order | Script | Purpose |
