@@ -509,6 +509,13 @@ def _evaluate_qva(
         raise RuntimeError(
             "Terminal action shuffle requires at least two episodes."
         )
+    episode_lengths = all_episode_ends - all_episode_starts
+    if np.any(episode_lengths < chunk_size):
+        short_ids = np.flatnonzero(episode_lengths < chunk_size).tolist()
+        raise RuntimeError(
+            "Terminal template requires every analyzed episode to contain one full "
+            f"chunk; short episode ids={short_ids[:10]}"
+        )
     terminal_bank_raw = np.stack(
         [
             np.asarray(
