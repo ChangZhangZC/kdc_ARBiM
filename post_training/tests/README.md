@@ -40,6 +40,7 @@ The smoke numbering follows the Post-RL data/training/export chain.
 | 04 | `analysis/analysis_04_rgb_storage_estimate.py` | estimate JPEG RGB storage before full data conversion | retained; moved out of smoke because it is capacity analysis rather than pass/fail testing |
 | 05 | `analysis/analysis_05_terminal_advantage.py` | test whether late/terminal-like actions are overvalued before true episode end using cached latents and trained IQL Q/V | current; offline diagnostic only, no training changes |
 | 06 | `analysis/analysis_06_ppo_local_advantage.py` | test whether terminal-directed perturbations inside the actual PPO Gaussian sampling neighborhood receive higher IQL advantage | current; uses PPO finetune stride and no training updates |
+| 07 | `analysis/analysis_07_ppo_gradient_alignment.py` | estimate the Gaussian PPO score-function mean gradient and compare it with terminal direction and observed IL-to-Post-RL action drift | current; first-order action-mean diagnostic only, no training updates |
 
 ### Analysis 05: Terminal / Advantage diagnostic
 
@@ -66,6 +67,19 @@ This diagnostic tests the missing causal link left by Analysis 05. Analysis 05 c
 For each sampled chunk it computes raw IQL advantage `Q(s,a)-V(s)`, applies the same optional PPO temperature transform used before advantage normalization, and measures the signed projection of the sampled perturbation toward the same-episode terminal action template. Correlations are computed within each state across local samples before being averaged, so state-to-state value differences do not create a false terminal correlation.
 
 The diagnostic runs on both the initial stochastic Base ACT neighborhood and the final `best_ope` Post-RL neighborhood by default. It reports whole-action and bimanual component projections for left/right joints and grippers. Positive local correlation, positive top-score-minus-bottom-score terminal projection, and positive best-score projection mean that PPO-accessible perturbations toward the terminal manifold are systematically preferred by the Critic. Near-zero or negative values mean the far terminal-template Q anomaly from Analysis 05 is not locally reachable through PPO sampling and is less likely to explain policy drift.
+
+### Analysis 07: PPO gradient alignment
+
+This diagnostic turns the local correlations from Analysis 06 into a first-order mean-space PPO update estimate. For a Gaussian policy it Monte-Carlo estimates `E[score * (a-mu) / sigma^2]` on the real PPO finetune anchors, where `score` matches the Offline PPO pre-normalization advantage transform. The primary estimator subtracts the within-state sample-score mean as a control variate; because an action-independent baseline has zero expected score-function gradient, this reduces Monte-Carlo variance without changing the expected direction.
+
+The estimated action-mean gradient is compared with two directions on the exact same cached observations:
+
+- the same-episode terminal direction, `terminal_chunk - current_policy_mean`;
+- the observed deterministic policy drift, `PostRL_mean - BaseIL_mean`.
+
+The comparison is reported for the full chunk and separately for left/right joints and grippers. Positive `cos(g, terminal)` means the local PPO update points terminal-ward. Positive `cos(g, PostRL-drift)` means the estimated update is aligned with the final deterministic action drift actually observed after Post-RL. `cos(terminal, PostRL-drift)` checks whether that observed drift itself is terminal-ward.
+
+This is deliberately not a full optimizer replay. It estimates the score-function direction with respect to the action mean when samples are drawn from the old/reference policy, where the PPO ratio starts at one and clipping is inactive. It does not reconstruct the Transformer parameter Jacobian, repeated clipped epochs on the same samples, or intermediate old-policy snapshots after OPE reference refreshes.
 
 ## Rollout diagnostics
 
