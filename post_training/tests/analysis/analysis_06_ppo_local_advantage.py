@@ -299,9 +299,16 @@ def _plot_summaries(
         current.sort(key=lambda row: int(row["progress_bin"]))
         if not current:
             continue
-        x = (
-            np.arange(len(current), dtype=np.float64) + 0.5
-        ) / len(current)
+        bin_count = max(
+            int(row["progress_bin"]) for row in current
+        ) + 1
+        x = np.asarray(
+            [
+                (int(row["progress_bin"]) + 0.5) / max(bin_count, 1)
+                for row in current
+            ],
+            dtype=np.float64,
+        )
 
         plt.figure(figsize=(10, 5))
         plt.plot(
@@ -819,6 +826,11 @@ def main() -> None:
             "std_min": float(std.min()),
             "std_max": float(std.max()),
         }
+        # Reuse the same Gaussian epsilon stream for each policy so IL/Post-RL
+        # comparisons are paired rather than dominated by Monte-Carlo seed noise.
+        torch.manual_seed(seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(seed)
         rows = _evaluate_policy(
             workspace=workspace,
             policy=policy,
