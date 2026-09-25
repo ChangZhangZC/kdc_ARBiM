@@ -90,7 +90,7 @@ def estimate(dataset, episodes, selected, batch_size, jpeg_quality, label):
 def main() -> None:
     parser = argparse.ArgumentParser(
         description=(
-            "Grey test: sample LeRobot timesteps, encode them with the production "
+            "Analysis 04: sample LeRobot timesteps, encode them with the production "
             "JPEG path, and estimate full processed-NPY/Zarr RGB storage."
         )
     )

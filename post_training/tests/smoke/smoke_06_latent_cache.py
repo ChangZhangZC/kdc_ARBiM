@@ -97,7 +97,7 @@ def main() -> None:
     parser = add_common_args(
         argparse.ArgumentParser(
             description=(
-                "Smoke 07: JPEG-backed endpoint sampling + frozen ACT latent cache"
+                "Smoke 06: JPEG-backed endpoint sampling + frozen ACT latent cache"
             )
         )
     )
@@ -108,7 +108,7 @@ def main() -> None:
     cfg.dataset.use_latent_cache = True
     cfg.dataset.latent_cache_batch_size = int(args.cache_batch_size)
 
-    workspace = make_workspace(cfg, make_work_dir(args, "smoke_07_latent_cache"))
+    workspace = make_workspace(cfg, make_work_dir(args, "smoke_06_latent_cache"))
     workspace.buffer = workspace._load_buffer()
     assert_latest_rgb_storage(workspace)
     print_pass("latent-cache smoke uses the latest JPEG-backed current/next RGB views")
@@ -231,7 +231,7 @@ def main() -> None:
         )
     print_pass("PPO update and Dynamics OPE reuse frozen ACT latents")
 
-    print("\nSMOKE 07 PASSED")
+    print("\nSMOKE 06 PASSED")
 
 
 if __name__ == "__main__":
