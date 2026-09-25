@@ -38,6 +38,23 @@ The smoke numbering follows the Post-RL data/training/export chain.
 | 02 | `analysis/analysis_02_dynamics_eval.py` | evaluate trained dynamics one-step/multi-step behavior and uncertainty | retained; Stage-1 model diagnostic |
 | 03 | `analysis/analysis_03_policy_drift.py` | compare IL vs exported Post-RL deterministic weights and same-observation actions | current; primary policy-drift diagnostic |
 | 04 | `analysis/analysis_04_rgb_storage_estimate.py` | estimate JPEG RGB storage before full data conversion | retained; moved out of smoke because it is capacity analysis rather than pass/fail testing |
+| 05 | `analysis/analysis_05_terminal_advantage.py` | test whether late/terminal-like actions are overvalued before true episode end using cached latents and trained IQL Q/V | current; offline diagnostic only, no training changes |
+
+### Analysis 05: Terminal / Advantage diagnostic
+
+This diagnostic targets the hypothesis that Post-RL may enter a premature terminal-like fixed point during the second half of the task. It does not assume that ACT receives an explicit done flag. Instead it tests whether the trained critic assigns excessive value or positive advantage to hold-like or true terminal-tail action chunks before the real episode end.
+
+It reuses the existing Offline RL Zarr, frozen ACT latent cache, Stage-1 IQL Q/V checkpoint, Base ACT checkpoint, and a Post-RL checkpoint. The analysis always scans valid chunk anchors at diagnostic stride 1, while separately reporting the configured dataset, critic, and PPO-finetune strides so sampler coverage is not silently conflated.
+
+For each valid observation anchor it compares:
+
+- demonstration action chunk;
+- Base ACT deterministic mean;
+- Post-RL deterministic mean;
+- a hold proxy that repeats the first demonstration action across the chunk;
+- the final H-action terminal template from the same episode.
+
+The primary outputs are `terminal_window_coverage.csv`, `episode_action_motion.csv`, `qva_per_anchor.csv`, phase/progress summaries, plots, and `summary.json`. The key quantities are `Q`, `V`, `A=Q-V`, and whether Post-RL/hold/terminal-template actions outrank the Base ACT continuation action during the second half of the episode.
 
 ## Rollout diagnostics
 
