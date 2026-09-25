@@ -37,19 +37,47 @@ QVA_METRICS = (
     "q_postrl",
     "q_hold",
     "q_terminal_template",
+    "q_terminal_shuffled",
+    "q_terminal_on_other_state",
+    "v_other_state",
     "adv_demo",
     "adv_il",
     "adv_postrl",
     "adv_hold",
     "adv_terminal_template",
+    "adv_terminal_shuffled",
+    "adv_terminal_on_other_state",
     "q_postrl_minus_il",
     "q_hold_minus_il",
     "q_terminal_template_minus_il",
+    "q_terminal_shuffled_minus_il",
+    "q_terminal_same_minus_shuffled",
     "postrl_il_action_l2",
+    "il_terminal_rmse",
+    "postrl_terminal_rmse",
+    "postrl_terminal_delta_rmse",
     "demo_motion_l2",
     "il_motion_l2",
     "postrl_motion_l2",
     "terminal_template_motion_l2",
+    "q_hybrid_terminal_left_il_right",
+    "q_hybrid_il_left_terminal_right",
+    "q_hybrid_terminal_left_joints",
+    "q_hybrid_terminal_left_gripper",
+    "q_hybrid_terminal_right_joints",
+    "q_hybrid_terminal_right_gripper",
+    "adv_hybrid_terminal_left_il_right",
+    "adv_hybrid_il_left_terminal_right",
+    "adv_hybrid_terminal_left_joints",
+    "adv_hybrid_terminal_left_gripper",
+    "adv_hybrid_terminal_right_joints",
+    "adv_hybrid_terminal_right_gripper",
+    "q_hybrid_terminal_left_il_right_minus_il",
+    "q_hybrid_il_left_terminal_right_minus_il",
+    "q_hybrid_terminal_left_joints_minus_il",
+    "q_hybrid_terminal_left_gripper_minus_il",
+    "q_hybrid_terminal_right_joints_minus_il",
+    "q_hybrid_terminal_right_gripper_minus_il",
 )
 
 
@@ -260,8 +288,19 @@ def _motion_l2(action: torch.Tensor) -> torch.Tensor:
     return torch.linalg.vector_norm(delta, dim=-1).mean(dim=-1)
 
 
-def _q_components(critic, latent: torch.Tensor, action: torch.Tensor):
-    state = latent.float().mean(dim=1)
+def _chunk_rmse(left: torch.Tensor, right: torch.Tensor) -> torch.Tensor:
+    if left.shape != right.shape:
+        raise ValueError(
+            f"Chunk shapes must match, got {tuple(left.shape)} vs {tuple(right.shape)}"
+        )
+    return torch.sqrt((left - right).pow(2).mean(dim=(1, 2)))
+
+
+def _q_components_state(
+    critic,
+    state: torch.Tensor,
+    action: torch.Tensor,
+):
     prepared_action = critic._prepare_action(action)
     if critic._is_double_q:
         q1, q2 = critic._Q(state, prepared_action)
@@ -273,6 +312,49 @@ def _q_components(critic, latent: torch.Tensor, action: torch.Tensor):
         q2 = q
         gap = torch.zeros_like(q)
     return q.reshape(-1), q1.reshape(-1), q2.reshape(-1), gap.reshape(-1)
+
+
+def _q_components(critic, latent: torch.Tensor, action: torch.Tensor):
+    state = latent.float().mean(dim=1)
+    return _q_components_state(critic, state, action)
+
+
+def _build_bimanual_hybrids(
+    il: torch.Tensor,
+    terminal: torch.Tensor,
+) -> dict[str, torch.Tensor]:
+    if il.shape != terminal.shape:
+        raise ValueError(
+            f"IL/terminal chunks must match, got {tuple(il.shape)} vs {tuple(terminal.shape)}"
+        )
+    if il.shape[-1] != 16:
+        return {}
+
+    hybrids = {}
+    left = il.clone()
+    left[:, :, 0:8] = terminal[:, :, 0:8]
+    hybrids["hybrid_terminal_left_il_right"] = left
+
+    right = il.clone()
+    right[:, :, 8:16] = terminal[:, :, 8:16]
+    hybrids["hybrid_il_left_terminal_right"] = right
+
+    left_joints = il.clone()
+    left_joints[:, :, 0:7] = terminal[:, :, 0:7]
+    hybrids["hybrid_terminal_left_joints"] = left_joints
+
+    left_gripper = il.clone()
+    left_gripper[:, :, 7:8] = terminal[:, :, 7:8]
+    hybrids["hybrid_terminal_left_gripper"] = left_gripper
+
+    right_joints = il.clone()
+    right_joints[:, :, 8:15] = terminal[:, :, 8:15]
+    hybrids["hybrid_terminal_right_joints"] = right_joints
+
+    right_gripper = il.clone()
+    right_gripper[:, :, 15:16] = terminal[:, :, 15:16]
+    hybrids["hybrid_terminal_right_gripper"] = right_gripper
+    return hybrids
 
 
 def _accumulate(
@@ -420,6 +502,24 @@ def _evaluate_qva(
     hypothesis = defaultdict(int)
     total_rows = 0
 
+    all_episode_starts, all_episode_ends = _episode_bounds(
+        workspace.buffer.episode_ends
+    )
+    if len(all_episode_ends) < 2:
+        raise RuntimeError(
+            "Terminal action shuffle requires at least two episodes."
+        )
+    terminal_bank_raw = np.stack(
+        [
+            np.asarray(
+                workspace.buffer["action"][int(end) - chunk_size:int(end)],
+                dtype=np.float32,
+            )
+            for end in all_episode_ends
+        ],
+        axis=0,
+    )
+
     fieldnames = [
         "episode",
         "anchor",
@@ -480,32 +580,55 @@ def _evaluate_qva(
                 dtype=np.float32,
             ).reshape(batch_n)
 
-            terminal_template_np = np.stack(
-                [
-                    np.asarray(
-                        workspace.buffer[
-                            "action"
-                        ][int(end) - chunk_size:int(end)],
-                        dtype=np.float32,
-                    )
-                    for end in batch_ends
-                ],
-                axis=0,
+            terminal_template_np = terminal_bank_raw[batch_episode_ids]
+            other_episode_ids = (
+                batch_episode_ids + 1
+            ) % len(all_episode_ends)
+            terminal_shuffled_np = terminal_bank_raw[other_episode_ids]
+
+            local_anchor_np = batch_anchors - batch_starts
+            valid_span_np = np.maximum(
+                batch_ends - batch_starts - chunk_size,
+                0,
             )
+            progress_np = local_anchor_np / np.maximum(valid_span_np, 1)
+            other_starts = all_episode_starts[other_episode_ids]
+            other_ends = all_episode_ends[other_episode_ids]
+            other_spans = np.maximum(
+                other_ends - other_starts - chunk_size,
+                0,
+            )
+            other_anchors = other_starts + np.rint(
+                progress_np * other_spans
+            ).astype(np.int64)
+            other_latent_np = np.asarray(
+                workspace.latent_cache.obs[other_anchors],
+                dtype=np.float32,
+            )
+            other_state = torch.from_numpy(
+                other_latent_np.mean(axis=1)
+            ).to(workspace.device)
 
             demo_raw = torch.from_numpy(demo_raw_np).to(workspace.device)
             terminal_template_raw = torch.from_numpy(
                 terminal_template_np
             ).to(workspace.device)
+            terminal_shuffled_raw = torch.from_numpy(
+                terminal_shuffled_np
+            ).to(workspace.device)
             demo = workspace.obs_adapter.normalize_action(demo_raw)
             terminal_template = workspace.obs_adapter.normalize_action(
                 terminal_template_raw
+            )
+            terminal_shuffled = workspace.obs_adapter.normalize_action(
+                terminal_shuffled_raw
             )
             hold = demo[:, :1].expand(-1, chunk_size, -1).contiguous()
 
             il = workspace.model.get_action_mean({"latent": latent})
             postrl = postrl_policy.get_action_mean({"latent": latent})
             value = workspace.critic._value(latent.mean(dim=1)).reshape(-1)
+            value_other = workspace.critic._value(other_state).reshape(-1)
 
             q_demo, _, _, gap_demo = _q_components(workspace.critic, latent, demo)
             q_il, _, _, gap_il = _q_components(workspace.critic, latent, il)
@@ -520,6 +643,29 @@ def _evaluate_qva(
                 latent,
                 terminal_template,
             )
+            q_terminal_shuffled, _, _, _ = _q_components(
+                workspace.critic,
+                latent,
+                terminal_shuffled,
+            )
+            q_terminal_other_state, _, _, _ = _q_components_state(
+                workspace.critic,
+                other_state,
+                terminal_template,
+            )
+
+            hybrid_actions = _build_bimanual_hybrids(
+                il,
+                terminal_template,
+            )
+            hybrid_q = {}
+            for name, action in hybrid_actions.items():
+                q, _, _, _ = _q_components(
+                    workspace.critic,
+                    latent,
+                    action,
+                )
+                hybrid_q[name] = q
 
             chunk_reward = (
                 torch.from_numpy(reward_np).to(workspace.device) * discount
@@ -532,7 +678,16 @@ def _evaluate_qva(
                 (postrl - il).reshape(batch_n, -1),
                 dim=1,
             )
+            il_terminal_rmse = _chunk_rmse(il, terminal_template)
+            postrl_terminal_rmse = _chunk_rmse(
+                postrl,
+                terminal_template,
+            )
+            postrl_terminal_delta_rmse = (
+                postrl_terminal_rmse - il_terminal_rmse
+            )
 
+            nan_vector = torch.full_like(q_il, float("nan"))
             tensors = {
                 "v": value,
                 "q_demo": q_demo,
@@ -540,8 +695,14 @@ def _evaluate_qva(
                 "q_postrl": q_postrl,
                 "q_hold": q_hold,
                 "q_terminal_template": q_terminal,
+                "q_terminal_shuffled": q_terminal_shuffled,
+                "q_terminal_on_other_state": q_terminal_other_state,
+                "v_other_state": value_other,
                 "chunk_reward": chunk_reward,
                 "postrl_il_action_l2": postrl_il_action_l2,
+                "il_terminal_rmse": il_terminal_rmse,
+                "postrl_terminal_rmse": postrl_terminal_rmse,
+                "postrl_terminal_delta_rmse": postrl_terminal_delta_rmse,
                 "demo_motion_l2": demo_motion,
                 "il_motion_l2": il_motion,
                 "postrl_motion_l2": postrl_motion,
@@ -552,6 +713,16 @@ def _evaluate_qva(
                 "q_hold_gap": gap_hold,
                 "q_terminal_template_gap": gap_terminal,
             }
+            for name in (
+                "hybrid_terminal_left_il_right",
+                "hybrid_il_left_terminal_right",
+                "hybrid_terminal_left_joints",
+                "hybrid_terminal_left_gripper",
+                "hybrid_terminal_right_joints",
+                "hybrid_terminal_right_gripper",
+            ):
+                tensors[f"q_{name}"] = hybrid_q.get(name, nan_vector)
+
             values = {
                 key: tensor.detach().float().cpu().numpy().reshape(-1)
                 for key, tensor in tensors.items()
@@ -591,11 +762,37 @@ def _evaluate_qva(
                 row["adv_terminal_template"] = (
                     row["q_terminal_template"] - row["v"]
                 )
+                row["adv_terminal_shuffled"] = (
+                    row["q_terminal_shuffled"] - row["v"]
+                )
+                row["adv_terminal_on_other_state"] = (
+                    row["q_terminal_on_other_state"] - row["v_other_state"]
+                )
                 row["q_postrl_minus_il"] = row["q_postrl"] - row["q_il"]
                 row["q_hold_minus_il"] = row["q_hold"] - row["q_il"]
                 row["q_terminal_template_minus_il"] = (
                     row["q_terminal_template"] - row["q_il"]
                 )
+                row["q_terminal_shuffled_minus_il"] = (
+                    row["q_terminal_shuffled"] - row["q_il"]
+                )
+                row["q_terminal_same_minus_shuffled"] = (
+                    row["q_terminal_template"] - row["q_terminal_shuffled"]
+                )
+
+                for hybrid_name in (
+                    "hybrid_terminal_left_il_right",
+                    "hybrid_il_left_terminal_right",
+                    "hybrid_terminal_left_joints",
+                    "hybrid_terminal_left_gripper",
+                    "hybrid_terminal_right_joints",
+                    "hybrid_terminal_right_gripper",
+                ):
+                    q_key = f"q_{hybrid_name}"
+                    adv_key = f"adv_{hybrid_name}"
+                    delta_key = f"q_{hybrid_name}_minus_il"
+                    row[adv_key] = row[q_key] - row["v"]
+                    row[delta_key] = row[q_key] - row["q_il"]
 
                 writer.writerow(row)
                 _accumulate(phase_totals, phase, row)
@@ -626,6 +823,35 @@ def _evaluate_qva(
                     hypothesis["second_half_terminal_adv_positive"] += int(
                         row["adv_terminal_template"] > 0
                     )
+                    hypothesis["second_half_terminal_shuffled_q_gt_il"] += int(
+                        row["q_terminal_shuffled"] > row["q_il"]
+                    )
+                    hypothesis["second_half_terminal_shuffled_adv_positive"] += int(
+                        row["adv_terminal_shuffled"] > 0
+                    )
+                    hypothesis["second_half_terminal_same_q_gt_shuffled"] += int(
+                        row["q_terminal_template"] > row["q_terminal_shuffled"]
+                    )
+                    hypothesis["second_half_terminal_other_state_adv_positive"] += int(
+                        row["adv_terminal_on_other_state"] > 0
+                    )
+                    hypothesis["second_half_postrl_closer_terminal"] += int(
+                        row["postrl_terminal_delta_rmse"] < 0
+                    )
+
+                    for hybrid_name in (
+                        "hybrid_terminal_left_il_right",
+                        "hybrid_il_left_terminal_right",
+                        "hybrid_terminal_left_joints",
+                        "hybrid_terminal_left_gripper",
+                        "hybrid_terminal_right_joints",
+                        "hybrid_terminal_right_gripper",
+                    ):
+                        q_value = row[f"q_{hybrid_name}"]
+                        if np.isfinite(q_value):
+                            hypothesis[f"second_half_{hybrid_name}_q_gt_il"] += int(
+                                q_value > row["q_il"]
+                            )
 
     return (
         _mean_rows(phase_totals, "phase"),
@@ -707,6 +933,69 @@ def _plot_progress(path: pathlib.Path, progress_rows: list[dict]) -> None:
     plt.savefig(path / "action_motion_vs_progress.png", dpi=160)
     plt.close()
 
+    plt.figure(figsize=(10, 5))
+    for key in (
+        "q_terminal_template_minus_il",
+        "q_terminal_shuffled_minus_il",
+        "q_postrl_minus_il",
+    ):
+        plt.plot(x, [row[key] for row in progress_rows], label=key)
+    plt.axhline(0.0, linewidth=1)
+    plt.xlabel("episode frame progress")
+    plt.ylabel("Q difference relative to IL")
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(path / "terminal_shuffle_q_vs_progress.png", dpi=160)
+    plt.close()
+
+    plt.figure(figsize=(10, 5))
+    plt.plot(
+        x,
+        [row["il_terminal_rmse"] for row in progress_rows],
+        label="IL -> terminal RMSE",
+    )
+    plt.plot(
+        x,
+        [row["postrl_terminal_rmse"] for row in progress_rows],
+        label="Post-RL -> terminal RMSE",
+    )
+    plt.plot(
+        x,
+        [row["postrl_terminal_delta_rmse"] for row in progress_rows],
+        label="Post-RL minus IL terminal RMSE",
+    )
+    plt.axhline(0.0, linewidth=1)
+    plt.xlabel("episode frame progress")
+    plt.ylabel("normalized action chunk RMSE")
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(path / "terminal_manifold_distance_vs_progress.png", dpi=160)
+    plt.close()
+
+    hybrid_keys = (
+        "q_hybrid_terminal_left_il_right_minus_il",
+        "q_hybrid_il_left_terminal_right_minus_il",
+        "q_hybrid_terminal_left_joints_minus_il",
+        "q_hybrid_terminal_left_gripper_minus_il",
+        "q_hybrid_terminal_right_joints_minus_il",
+        "q_hybrid_terminal_right_gripper_minus_il",
+    )
+    if any(
+        np.isfinite(row[key])
+        for row in progress_rows
+        for key in hybrid_keys
+    ):
+        plt.figure(figsize=(10, 5))
+        for key in hybrid_keys:
+            plt.plot(x, [row[key] for row in progress_rows], label=key)
+        plt.axhline(0.0, linewidth=1)
+        plt.xlabel("episode frame progress")
+        plt.ylabel("hybrid Q - IL Q")
+        plt.legend(ncol=2, fontsize=8)
+        plt.tight_layout()
+        plt.savefig(path / "bimanual_hybrid_q_vs_progress.png", dpi=160)
+        plt.close()
+
 
 def _print_report(summary: dict) -> None:
     print("\n=== Terminal / Advantage Diagnostic ===")
@@ -747,6 +1036,63 @@ def _print_report(summary: dict) -> None:
         count = int(h.get(key, 0))
         print(f"  {label:32s}: {count}/{n} ({100.0 * count / n:.1f}%)")
 
+    print("\nTerminal action shuffle / state-shuffle:")
+    for label, key in (
+        ("Shuffled terminal Q > IL Q", "second_half_terminal_shuffled_q_gt_il"),
+        (
+            "Shuffled terminal advantage > 0",
+            "second_half_terminal_shuffled_adv_positive",
+        ),
+        (
+            "Same terminal Q > shuffled terminal Q",
+            "second_half_terminal_same_q_gt_shuffled",
+        ),
+        (
+            "Terminal action advantage > 0 on other state",
+            "second_half_terminal_other_state_adv_positive",
+        ),
+    ):
+        count = int(h.get(key, 0))
+        print(f"  {label:42s}: {count}/{n} ({100.0 * count / n:.1f}%)")
+
+    closer = int(h.get("second_half_postrl_closer_terminal", 0))
+    print("\nActor distance to terminal-action manifold:")
+    print(
+        "  Post-RL closer to terminal than IL: "
+        f"{closer}/{n} ({100.0 * closer / n:.1f}%)"
+    )
+
+    if summary["bimanual_hybrid_supported"]:
+        print("\nBimanual terminal-component counterfactuals (Q > IL Q):")
+        for label, key in (
+            (
+                "terminal LEFT + IL right",
+                "second_half_hybrid_terminal_left_il_right_q_gt_il",
+            ),
+            (
+                "IL left + terminal RIGHT",
+                "second_half_hybrid_il_left_terminal_right_q_gt_il",
+            ),
+            (
+                "terminal left joints only",
+                "second_half_hybrid_terminal_left_joints_q_gt_il",
+            ),
+            (
+                "terminal left gripper only",
+                "second_half_hybrid_terminal_left_gripper_q_gt_il",
+            ),
+            (
+                "terminal right joints only",
+                "second_half_hybrid_terminal_right_joints_q_gt_il",
+            ),
+            (
+                "terminal right gripper only",
+                "second_half_hybrid_terminal_right_gripper_q_gt_il",
+            ),
+        ):
+            count = int(h.get(key, 0))
+            print(f"  {label:32s}: {count}/{n} ({100.0 * count / n:.1f}%)")
+
     phase_lookup = {row["phase"]: row for row in summary["phase_summary"]}
     print("\nMean Q - IL Q by phase:")
     for phase in (
@@ -764,6 +1110,22 @@ def _print_report(summary: dict) -> None:
             f"postrl={row['q_postrl_minus_il']:+.5f} "
             f"hold={row['q_hold_minus_il']:+.5f} "
             f"terminal_template={row['q_terminal_template_minus_il']:+.5f}"
+        )
+
+    print("\nPost-RL terminal-distance delta by phase (negative = closer than IL):")
+    for phase in (
+        "early_0_25",
+        "middle_25_50",
+        "late_50_75",
+        "tail_75_100",
+        "terminal_chunk",
+    ):
+        row = phase_lookup.get(phase)
+        if row is None:
+            continue
+        print(
+            f"  {phase:16s} "
+            f"delta_rmse={row['postrl_terminal_delta_rmse']:+.6f}"
         )
 
     print(
@@ -976,6 +1338,7 @@ def main() -> None:
         "coverage": coverage,
         "motion": motion_summary,
         "hypothesis": _fractions(hypothesis),
+        "bimanual_hybrid_supported": int(workspace.action_dim) == 16,
         "phase_summary": phase_summary,
         "progress_summary": progress_summary,
         "analyzed_anchors": int(analyzed_rows),
@@ -985,6 +1348,12 @@ def main() -> None:
             "postrl": "Post-RL deterministic mean on the same cached observation latent",
             "hold": "repeat the first demonstration action across the whole chunk",
             "terminal_template": "reuse the final H-action chunk from the same episode",
+            "terminal_shuffled": "reuse the final H-action chunk from the next episode while keeping the current state",
+            "terminal_on_other_state": "apply the current episode terminal chunk to a progress-matched state from the next episode",
+            "bimanual_hybrids": (
+                "for 16D [left7,left_gripper,right7,right_gripper], replace one arm, "
+                "one arm's joints, or one gripper in the Base ACT chunk with the terminal template"
+            ),
         },
     }
     with (output_dir / "summary.json").open("w") as file:
