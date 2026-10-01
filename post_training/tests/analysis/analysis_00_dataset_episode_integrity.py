@@ -297,6 +297,18 @@ def _gripper_semantics(
     }
 
 
+def _paired_event_lag(
+    action_result: dict,
+    state_result: dict,
+    event_key: str,
+) -> int | None:
+    action_events = action_result[event_key]
+    state_events = state_result[event_key]
+    if len(action_events) != 1 or len(state_events) != 1:
+        return None
+    return int(state_events[0]["frame_offset"] - action_events[0]["frame_offset"])
+
+
 def _episode_structural_row(
     *,
     ep_id: int,
@@ -607,15 +619,31 @@ def _print_summary(summary: dict) -> None:
         f"{summary['counts']['zarr_valid']} / {summary['lerobot']['episodes']}"
     )
     print(
-        "Left grasp+release valid: "
+        "Action command - left grasp+release valid: "
         f"{summary['counts']['left_gripper_valid']} / {summary['lerobot']['episodes']}"
     )
     print(
-        "Right grasp+release valid: "
+        "Action command - right grasp+release valid: "
         f"{summary['counts']['right_gripper_valid']} / {summary['lerobot']['episodes']}"
     )
     print(
-        "Both arms task-semantic valid: "
+        "Observed state - left grasp+release valid: "
+        f"{summary['counts']['left_state_gripper_valid']} / {summary['lerobot']['episodes']}"
+    )
+    print(
+        "Observed state - right grasp+release valid: "
+        f"{summary['counts']['right_state_gripper_valid']} / {summary['lerobot']['episodes']}"
+    )
+    print(
+        "Both arms command-semantic valid: "
+        f"{summary['counts']['command_semantic_valid']} / {summary['lerobot']['episodes']}"
+    )
+    print(
+        "Both arms observed-state semantic valid: "
+        f"{summary['counts']['execution_semantic_valid']} / {summary['lerobot']['episodes']}"
+    )
+    print(
+        "Both command+state task-semantic valid: "
         f"{summary['counts']['task_semantic_valid']} / {summary['lerobot']['episodes']}"
     )
     print(
@@ -623,14 +651,24 @@ def _print_summary(summary: dict) -> None:
         f"{summary['counts']['fully_valid']} / {summary['lerobot']['episodes']}"
     )
 
-    for side in ("left", "right"):
-        thresholds = summary["gripper_thresholds"][side]
-        print(
-            f"{side.capitalize()} gripper: open_side={thresholds['open_side']} "
-            f"q10/q90={thresholds['q10']:.5f}/{thresholds['q90']:.5f} "
-            f"low/high thresholds={thresholds['low']:.5f}/{thresholds['high']:.5f} "
-            f"start_median={thresholds['start_median']:.5f}"
-        )
+    for source_name, key in (("Action", "gripper_thresholds"), ("State", "state_gripper_thresholds")):
+        for side in ("left", "right"):
+            thresholds = summary[key][side]
+            print(
+                f"{source_name} {side} gripper: open_side={thresholds['open_side']} "
+                f"q10/q90={thresholds['q10']:.5f}/{thresholds['q90']:.5f} "
+                f"low/high thresholds={thresholds['low']:.5f}/{thresholds['high']:.5f} "
+                f"start_median={thresholds['start_median']:.5f}"
+            )
+
+    lag = summary["action_state_event_lag_frames"]
+    print(
+        "Action->state gripper event lag frames mean/median: "
+        f"L-close={lag['left_close']['mean']:.2f}/{lag['left_close']['median']:.2f}, "
+        f"L-open={lag['left_reopen']['mean']:.2f}/{lag['left_reopen']['median']:.2f}, "
+        f"R-close={lag['right_close']['mean']:.2f}/{lag['right_close']['median']:.2f}, "
+        f"R-open={lag['right_reopen']['mean']:.2f}/{lag['right_reopen']['median']:.2f}"
+    )
 
     print("\nSampler checks:")
     for row in summary["sampler_checks"]:
@@ -662,6 +700,8 @@ def main() -> None:
     )
     parser.add_argument("--left-gripper-index", type=int, default=7)
     parser.add_argument("--right-gripper-index", type=int, default=15)
+    parser.add_argument("--left-state-gripper-index", type=int, default=7)
+    parser.add_argument("--right-state-gripper-index", type=int, default=15)
     parser.add_argument(
         "--left-open-side",
         choices=("auto", "low", "high"),
@@ -676,6 +716,20 @@ def main() -> None:
     parser.add_argument("--left-high-threshold", type=float, default=None)
     parser.add_argument("--right-low-threshold", type=float, default=None)
     parser.add_argument("--right-high-threshold", type=float, default=None)
+    parser.add_argument(
+        "--left-state-open-side",
+        choices=("auto", "low", "high"),
+        default="auto",
+    )
+    parser.add_argument(
+        "--right-state-open-side",
+        choices=("auto", "low", "high"),
+        default="auto",
+    )
+    parser.add_argument("--left-state-low-threshold", type=float, default=None)
+    parser.add_argument("--left-state-high-threshold", type=float, default=None)
+    parser.add_argument("--right-state-low-threshold", type=float, default=None)
+    parser.add_argument("--right-state-high-threshold", type=float, default=None)
     parser.add_argument("--open-infer-frames", type=int, default=5)
     parser.add_argument("--min-dwell", type=int, default=3)
     parser.add_argument("--expected-cycles", type=int, default=1)
@@ -720,6 +774,14 @@ def main() -> None:
         raise ValueError(
             f"Action dim={action.shape[1]} cannot access gripper index {max_index}"
         )
+    max_state_index = max(
+        args.left_state_gripper_index,
+        args.right_state_gripper_index,
+    )
+    if state.ndim != 2 or state.shape[1] <= max_state_index:
+        raise ValueError(
+            f"State shape={state.shape} cannot access gripper index {max_state_index}"
+        )
 
     episode_order = _appearance_order(episode_index)
     positions_by_episode = _positions_by_episode(episode_index, episode_order)
@@ -742,6 +804,8 @@ def main() -> None:
 
     left_values = action[:, args.left_gripper_index]
     right_values = action[:, args.right_gripper_index]
+    left_state_values = state[:, args.left_state_gripper_index]
+    right_state_values = state[:, args.right_state_gripper_index]
     left_thresholds = _infer_thresholds(
         left_values,
         episode_positions,
@@ -758,6 +822,22 @@ def main() -> None:
         low_threshold=args.right_low_threshold,
         high_threshold=args.right_high_threshold,
     )
+    left_state_thresholds = _infer_thresholds(
+        left_state_values,
+        episode_positions,
+        open_side=args.left_state_open_side,
+        start_frames=args.open_infer_frames,
+        low_threshold=args.left_state_low_threshold,
+        high_threshold=args.left_state_high_threshold,
+    )
+    right_state_thresholds = _infer_thresholds(
+        right_state_values,
+        episode_positions,
+        open_side=args.right_state_open_side,
+        start_frames=args.open_infer_frames,
+        low_threshold=args.right_state_low_threshold,
+        high_threshold=args.right_state_high_threshold,
+    )
 
     gripper_rows = []
     gripper_event_rows = []
@@ -773,6 +853,26 @@ def main() -> None:
             right_thresholds,
             args.min_dwell,
             args.expected_cycles,
+        )
+        left_state_result = _gripper_semantics(
+            left_state_values[positions],
+            left_state_thresholds,
+            args.min_dwell,
+            args.expected_cycles,
+        )
+        right_state_result = _gripper_semantics(
+            right_state_values[positions],
+            right_state_thresholds,
+            args.min_dwell,
+            args.expected_cycles,
+        )
+        left_close_lag = _paired_event_lag(left, left_state_result, "close_events")
+        left_reopen_lag = _paired_event_lag(left, left_state_result, "reopen_events")
+        right_close_lag = _paired_event_lag(right, right_state_result, "close_events")
+        right_reopen_lag = _paired_event_lag(right, right_state_result, "reopen_events")
+        command_semantic_valid = bool(left["valid"] and right["valid"])
+        execution_semantic_valid = bool(
+            left_state_result["valid"] and right_state_result["valid"]
         )
         gripper_rows.append(
             {
@@ -791,14 +891,42 @@ def main() -> None:
                 "right_reopen_events": len(right["reopen_events"]),
                 "right_valid": right["valid"],
                 "right_reasons": ";".join(right["reasons"]),
-                "task_semantic_valid": bool(left["valid"] and right["valid"]),
+                "left_state_initial": left_state_result["initial_state"],
+                "left_state_final": left_state_result["final_state"],
+                "left_state_sequence": left_state_result["sequence"],
+                "left_state_close_events": len(left_state_result["close_events"]),
+                "left_state_reopen_events": len(left_state_result["reopen_events"]),
+                "left_state_valid": left_state_result["valid"],
+                "left_state_reasons": ";".join(left_state_result["reasons"]),
+                "right_state_initial": right_state_result["initial_state"],
+                "right_state_final": right_state_result["final_state"],
+                "right_state_sequence": right_state_result["sequence"],
+                "right_state_close_events": len(right_state_result["close_events"]),
+                "right_state_reopen_events": len(right_state_result["reopen_events"]),
+                "right_state_valid": right_state_result["valid"],
+                "right_state_reasons": ";".join(right_state_result["reasons"]),
+                "left_close_action_to_state_lag_frames": left_close_lag,
+                "left_reopen_action_to_state_lag_frames": left_reopen_lag,
+                "right_close_action_to_state_lag_frames": right_close_lag,
+                "right_reopen_action_to_state_lag_frames": right_reopen_lag,
+                "command_semantic_valid": command_semantic_valid,
+                "execution_semantic_valid": execution_semantic_valid,
+                "task_semantic_valid": bool(
+                    command_semantic_valid and execution_semantic_valid
+                ),
             }
         )
-        for side, result in (("left", left), ("right", right)):
+        for source, side, result in (
+            ("action", "left", left),
+            ("action", "right", right),
+            ("state", "left", left_state_result),
+            ("state", "right", right_state_result),
+        ):
             for event_index, event in enumerate(result["transitions"]):
                 gripper_event_rows.append(
                     {
                         "episode_id": int(ep_id),
+                        "source": source,
                         "side": side,
                         "event_index": event_index,
                         "frame_offset": event["frame_offset"],
@@ -900,9 +1028,13 @@ def main() -> None:
         if not row["zarr_valid"]:
             reasons.append("zarr_contract")
         if not row["left_valid"]:
-            reasons.append("left_gripper")
+            reasons.append("left_action_gripper")
         if not row["right_valid"]:
-            reasons.append("right_gripper")
+            reasons.append("right_action_gripper")
+        if not row["left_state_valid"]:
+            reasons.append("left_state_gripper")
+        if not row["right_state_valid"]:
+            reasons.append("right_state_gripper")
         row["suspicious_reasons"] = ";".join(reasons)
 
         combined_rows.append(row)
@@ -914,6 +1046,10 @@ def main() -> None:
         "zarr_valid": int(sum(row["zarr_valid"] for row in combined_rows)),
         "left_gripper_valid": int(sum(row["left_valid"] for row in combined_rows)),
         "right_gripper_valid": int(sum(row["right_valid"] for row in combined_rows)),
+        "left_state_gripper_valid": int(sum(row["left_state_valid"] for row in combined_rows)),
+        "right_state_gripper_valid": int(sum(row["right_state_valid"] for row in combined_rows)),
+        "command_semantic_valid": int(sum(row["command_semantic_valid"] for row in combined_rows)),
+        "execution_semantic_valid": int(sum(row["execution_semantic_valid"] for row in combined_rows)),
         "task_semantic_valid": int(sum(row["task_semantic_valid"] for row in combined_rows)),
         "fully_valid": int(sum(row["fully_valid"] for row in combined_rows)),
         "suspicious": int(len(suspicious_rows)),
@@ -949,6 +1085,36 @@ def main() -> None:
             "left_index": int(args.left_gripper_index),
             "right_index": int(args.right_gripper_index),
         },
+        "state_gripper_thresholds": {
+            "left": vars(left_state_thresholds),
+            "right": vars(right_state_thresholds),
+            "min_dwell": int(args.min_dwell),
+            "expected_cycles": int(args.expected_cycles),
+            "left_index": int(args.left_state_gripper_index),
+            "right_index": int(args.right_state_gripper_index),
+        },
+        "action_state_event_lag_frames": {
+            "left_close": _stats([
+                row["left_close_action_to_state_lag_frames"]
+                for row in combined_rows
+                if row["left_close_action_to_state_lag_frames"] is not None
+            ]),
+            "left_reopen": _stats([
+                row["left_reopen_action_to_state_lag_frames"]
+                for row in combined_rows
+                if row["left_reopen_action_to_state_lag_frames"] is not None
+            ]),
+            "right_close": _stats([
+                row["right_close_action_to_state_lag_frames"]
+                for row in combined_rows
+                if row["right_close_action_to_state_lag_frames"] is not None
+            ]),
+            "right_reopen": _stats([
+                row["right_reopen_action_to_state_lag_frames"]
+                for row in combined_rows
+                if row["right_reopen_action_to_state_lag_frames"] is not None
+            ]),
+        },
         "counts": counts,
         "transition_contract": transition_summary,
         "sampler_checks": sampler_checks,
@@ -959,8 +1125,9 @@ def main() -> None:
             "to one LeRobot episode unless a bag fails and is skipped."
         ),
         "semantic_contract": (
-            "Expected sim_task1 episode: both left and right grippers each complete exactly "
-            "one debounced open->closed->open cycle, corresponding to one grasp and one release."
+            "Expected sim_task1 episode: both left and right gripper commands and observed "
+            "gripper states each complete exactly one debounced open->closed->open cycle, "
+            "corresponding to one commanded and executed grasp/release sequence per hand."
         ),
     }
 
