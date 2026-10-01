@@ -42,6 +42,7 @@ The smoke numbering follows the Post-RL data/training/export chain.
 | 06 | `analysis/analysis_06_ppo_local_advantage.py` | test whether terminal-directed perturbations inside the actual PPO Gaussian sampling neighborhood receive higher IQL advantage | current; uses PPO finetune stride and no training updates |
 | 07 | `analysis/analysis_07_ppo_gradient_alignment.py` | estimate the Gaussian PPO score-function mean gradient and compare it with terminal direction and observed IL-to-Post-RL action drift | current; first-order action-mean diagnostic only, no training updates |
 | 08 | `analysis/analysis_08_one_step_ppo_replay.py` | replay one production Offline PPO optimizer step from Base ACT and measure the resulting deterministic ACT output drift on fixed probe states | current; mutates only an in-memory PPO clone and never overwrites training artifacts |
+| 09 | `analysis/analysis_09_multi_batch_one_step.py` | repeat independent one-step PPO replays from the same Base ACT over many shuffled finetune batches/seeds and estimate the expected deterministic action drift | current; isolates batch/sample variance before studying multi-step accumulation |
 
 ### Analysis 05: Terminal / Advantage diagnostic
 
@@ -91,6 +92,16 @@ Before the update it probes the deterministic Base ACT mean on all real PPO-stri
 Metrics are reported for the full 32x16 chunk and separately for left/right joints and grippers. This is the first analysis in the terminal-bias chain that includes the real ACT decoder/action-head parameter Jacobian and parameter sharing: if a gripper-driven PPO signal also creates systematic arm-joint output drift after one optimizer step, the coupling is now observable directly rather than inferred from action-space gradients.
 
 The script previews the exact stochastic batch action and IQL advantage, restores the RNG state, and then lets the production update sample the identical action chunk. It also verifies that the PPO policy clone exactly matches Base ACT before mutation. The scope is intentionally one optimizer step only; it does not reproduce the full 8000-step accumulation, OPE old-policy refreshes, EMA selection, or intermediate optimizer state.
+
+### Analysis 09: multi-batch one-step PPO expectation
+
+Analysis 08 showed that a single real PPO optimizer step can produce a complicated shared-network output drift: some gripper components may move terminal-ward while other gripper/arm components move the opposite way. Analysis 09 tests whether that pattern is systematic or just one shuffled batch / policy-sampling realization.
+
+Each repeat starts from the exact same Base ACT checkpoint with a fresh current policy, fresh old/reference policy, fresh optimizer/scheduler state, one independently shuffled production finetune batch, and one production `update_distribution()` call. The final best-OPE Post-RL policy and the fixed probe observations are held constant across repeats. The script therefore estimates the expectation of the first PPO update rather than accumulating training history.
+
+Two summaries are intentionally separated. First, every repeat gets its own phase-level alignment statistics, so the distribution and sign consistency across repeats are visible. Second, the action drift vectors are averaged per fixed probe state before cosine metrics are computed. This `E[delta action]` view answers whether there is a systematic expected network-output direction after marginalizing over one-step batch/sample noise.
+
+The output also reports an expected-drift signal-to-repeat-noise ratio: the RMSE magnitude of the across-repeat mean drift divided by the RMS standard deviation across repeats for the same action group. A stable positive terminal alignment with useful SNR would support a systematic first-step mechanism. Near-zero expected drift or low sign consistency would indicate that the Analysis 08 direction was dominated by batch/sample variance and that later debugging should focus on multi-step accumulation, optimizer state, clipping, or old-policy refresh dynamics instead.
 
 ## Rollout diagnostics
 
