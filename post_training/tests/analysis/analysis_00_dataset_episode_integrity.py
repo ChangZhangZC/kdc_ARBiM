@@ -476,10 +476,19 @@ def _transition_contract_summary(arrays: dict[str, np.ndarray], gamma: float) ->
     nonterminal = ~done
     terminal = done
 
-    # Direct vectorized checks using next_index are valid for every row, including terminal self-loops.
+    # Validate next_index before using it for vectorized transition checks.
     ni = arrays["next_index"]
-    state_by_index_error = np.abs(next_state - state[ni])
-    action_by_index_error = np.abs(next_action - action[ni])
+    next_index_in_range = bool(
+        np.all((ni >= 0) & (ni < len(state)))
+    )
+    if next_index_in_range:
+        state_by_index_error = np.abs(next_state - state[ni])
+        action_by_index_error = np.abs(next_action - action[ni])
+        state_by_index_max = float(state_by_index_error.max(initial=0.0))
+        action_by_index_max = float(action_by_index_error.max(initial=0.0))
+    else:
+        state_by_index_max = float("inf")
+        action_by_index_max = float("inf")
 
     target_return = reward.copy()
     nonterminal_indices = np.flatnonzero(nonterminal)
@@ -492,8 +501,9 @@ def _transition_contract_summary(arrays: dict[str, np.ndarray], gamma: float) ->
     terminal_action_error = np.abs(next_action[terminal] - action[terminal])
 
     return {
-        "next_state_vs_next_index_max_abs": float(state_by_index_error.max(initial=0.0)),
-        "next_action_vs_next_index_max_abs": float(action_by_index_error.max(initial=0.0)),
+        "next_index_in_range": next_index_in_range,
+        "next_state_vs_next_index_max_abs": state_by_index_max,
+        "next_action_vs_next_index_max_abs": action_by_index_max,
         "terminal_self_loop_state_max_abs": float(terminal_state_error.max(initial=0.0)),
         "terminal_self_loop_action_max_abs": float(terminal_action_error.max(initial=0.0)),
         "return_recurrence_max_abs": float(return_error.max(initial=0.0)),
