@@ -10,7 +10,7 @@ from collections import defaultdict
 import numpy as np
 import torch
 from omegaconf import OmegaConf
-from torch.utils.data._utils.collate import default_collate
+from torch.utils.data import default_collate
 from tqdm import tqdm
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[3]
