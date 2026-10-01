@@ -593,6 +593,10 @@ def _stats(values: list[int] | np.ndarray) -> dict:
     }
 
 
+def _fmt_optional(value, digits: int = 2) -> str:
+    return "n/a" if value is None else f"{float(value):.{digits}f}"
+
+
 def _print_summary(summary: dict) -> None:
     print("\n=== Dataset Episode Integrity Diagnostic ===")
     print(
@@ -664,10 +668,14 @@ def _print_summary(summary: dict) -> None:
     lag = summary["action_state_event_lag_frames"]
     print(
         "Action->state gripper event lag frames mean/median: "
-        f"L-close={lag['left_close']['mean']:.2f}/{lag['left_close']['median']:.2f}, "
-        f"L-open={lag['left_reopen']['mean']:.2f}/{lag['left_reopen']['median']:.2f}, "
-        f"R-close={lag['right_close']['mean']:.2f}/{lag['right_close']['median']:.2f}, "
-        f"R-open={lag['right_reopen']['mean']:.2f}/{lag['right_reopen']['median']:.2f}"
+        f"L-close={_fmt_optional(lag['left_close']['mean'])}/"
+        f"{_fmt_optional(lag['left_close']['median'])}, "
+        f"L-open={_fmt_optional(lag['left_reopen']['mean'])}/"
+        f"{_fmt_optional(lag['left_reopen']['median'])}, "
+        f"R-close={_fmt_optional(lag['right_close']['mean'])}/"
+        f"{_fmt_optional(lag['right_close']['median'])}, "
+        f"R-open={_fmt_optional(lag['right_reopen']['mean'])}/"
+        f"{_fmt_optional(lag['right_reopen']['median'])}"
     )
 
     print("\nSampler checks:")
