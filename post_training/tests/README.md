@@ -41,6 +41,7 @@ The smoke numbering follows the Post-RL data/training/export chain.
 | 05 | `analysis/analysis_05_terminal_advantage.py` | test whether late/terminal-like actions are overvalued before true episode end using cached latents and trained IQL Q/V | current; offline diagnostic only, no training changes |
 | 06 | `analysis/analysis_06_ppo_local_advantage.py` | test whether terminal-directed perturbations inside the actual PPO Gaussian sampling neighborhood receive higher IQL advantage | current; uses PPO finetune stride and no training updates |
 | 07 | `analysis/analysis_07_ppo_gradient_alignment.py` | estimate the Gaussian PPO score-function mean gradient and compare it with terminal direction and observed IL-to-Post-RL action drift | current; first-order action-mean diagnostic only, no training updates |
+| 08 | `analysis/analysis_08_one_step_ppo_replay.py` | replay one production Offline PPO optimizer step from Base ACT and measure the resulting deterministic ACT output drift on fixed probe states | current; mutates only an in-memory PPO clone and never overwrites training artifacts |
 
 ### Analysis 05: Terminal / Advantage diagnostic
 
@@ -80,6 +81,16 @@ The estimated action-mean gradient is compared with two directions on the exact 
 The comparison is reported for the full chunk and separately for left/right joints and grippers. Positive `cos(g, terminal)` means the local PPO update points terminal-ward. Positive `cos(g, PostRL-drift)` means the estimated update is aligned with the final deterministic action drift actually observed after Post-RL. `cos(terminal, PostRL-drift)` checks whether that observed drift itself is terminal-ward.
 
 This is deliberately not a full optimizer replay. It estimates the score-function direction with respect to the action mean when samples are drawn from the old/reference policy, where the PPO ratio starts at one and clipping is inactive. It does not reconstruct the Transformer parameter Jacobian, repeated clipped epochs on the same samples, or intermediate old-policy snapshots after OPE reference refreshes.
+
+### Analysis 08: one-step real PPO replay
+
+This diagnostic moves from action-space theory to the actual shared ACT network update. It constructs the same Stage-2 PPO object and finetune dataloader used by production training, starts from the Base ACT checkpoint, draws the first reproducible shuffled finetune batch, and calls the production `BehaviorProximalPolicyOptimization.update_distribution()` exactly once with the trained Stage-1 critic and the configured learning-rate / clip-decay flags.
+
+Before the update it probes the deterministic Base ACT mean on all real PPO-stride anchors and also records the final best-OPE Post-RL mean on those exact cached observations. After the single real optimizer step it probes the mutated PPO policy again. The resulting one-step drift is compared with both the same-episode terminal direction and the final observed IL-to-Post-RL drift.
+
+Metrics are reported for the full 32x16 chunk and separately for left/right joints and grippers. This is the first analysis in the terminal-bias chain that includes the real ACT decoder/action-head parameter Jacobian and parameter sharing: if a gripper-driven PPO signal also creates systematic arm-joint output drift after one optimizer step, the coupling is now observable directly rather than inferred from action-space gradients.
+
+The script previews the exact stochastic batch action and IQL advantage, restores the RNG state, and then lets the production update sample the identical action chunk. It also verifies that the PPO policy clone exactly matches Base ACT before mutation. The scope is intentionally one optimizer step only; it does not reproduce the full 8000-step accumulation, OPE old-policy refreshes, EMA selection, or intermediate optimizer state.
 
 ## Rollout diagnostics
 
