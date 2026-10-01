@@ -38,6 +38,70 @@ The smoke numbering follows the Post-RL data/training/export chain.
 | 02 | `analysis/analysis_02_dynamics_eval.py` | evaluate trained dynamics one-step/multi-step behavior and uncertainty | retained; Stage-1 model diagnostic |
 | 03 | `analysis/analysis_03_policy_drift.py` | compare IL vs exported Post-RL deterministic weights and same-observation actions | current; primary policy-drift diagnostic |
 | 04 | `analysis/analysis_04_rgb_storage_estimate.py` | estimate JPEG RGB storage before full data conversion | retained; moved out of smoke because it is capacity analysis rather than pass/fail testing |
+| 05 | `analysis/analysis_05_terminal_advantage.py` | test whether late/terminal-like actions are overvalued before true episode end using cached latents and trained IQL Q/V | current; offline diagnostic only, no training changes |
+| 06 | `analysis/analysis_06_ppo_local_advantage.py` | test whether terminal-directed perturbations inside the actual PPO Gaussian sampling neighborhood receive higher IQL advantage | current; uses PPO finetune stride and no training updates |
+| 07 | `analysis/analysis_07_ppo_gradient_alignment.py` | estimate the Gaussian PPO score-function mean gradient and compare it with terminal direction and observed IL-to-Post-RL action drift | current; first-order action-mean diagnostic only, no training updates |
+| 08 | `analysis/analysis_08_one_step_ppo_replay.py` | replay one production Offline PPO optimizer step from Base ACT and measure the resulting deterministic ACT output drift on fixed probe states | current; mutates only an in-memory PPO clone and never overwrites training artifacts |
+| 09 | `analysis/analysis_09_multi_batch_one_step.py` | repeat independent one-step PPO replays from the same Base ACT over many shuffled finetune batches/seeds and estimate the expected deterministic action drift | current; isolates batch/sample variance before studying multi-step accumulation |
+
+### Analysis 05: Terminal / Advantage diagnostic
+
+This diagnostic targets the hypothesis that Post-RL may enter a premature terminal-like fixed point during the second half of the task. It does not assume that ACT receives an explicit done flag. Instead it tests whether the trained critic assigns excessive value or positive advantage to hold-like or true terminal-tail action chunks before the real episode end.
+
+It reuses the existing Offline RL Zarr, frozen ACT latent cache, Stage-1 IQL Q/V checkpoint, Base ACT checkpoint, and a Post-RL checkpoint. The analysis always scans valid chunk anchors at diagnostic stride 1, while separately reporting the configured dataset, critic, and PPO-finetune strides so sampler coverage is not silently conflated.
+
+For each valid observation anchor it compares:
+
+- demonstration action chunk;
+- Base ACT deterministic mean;
+- Post-RL deterministic mean;
+- a hold proxy that repeats the first demonstration action across the chunk;
+- the final H-action terminal template from the same episode.
+
+The primary outputs are `terminal_window_coverage.csv`, `episode_action_motion.csv`, `qva_per_anchor.csv`, phase/progress summaries, plots, and `summary.json`. The key quantities are `Q`, `V`, `A=Q-V`, and whether Post-RL/hold/terminal-template actions outrank the Base ACT continuation action during the second half of the episode.
+
+The expanded counterfactuals test three more links in the hypothesis. First, the terminal action is replaced by the next episode's terminal chunk while the current state is fixed, and the current episode's terminal action is also evaluated on a progress-matched state from the next episode. This separates same-episode compatibility from a generic terminal-action shortcut. Second, the normalized action-chunk RMSE from Base ACT and Post-RL to the same terminal template is compared; a negative `postrl_terminal_delta_rmse` means Post-RL moved closer to the terminal-action manifold. Third, for the 16D bimanual contract `[left7, left_gripper, right7, right_gripper]`, terminal components are injected into the Base ACT chunk one arm / joint group / gripper at a time to localize which side drives any Q overvaluation.
+
+### Analysis 06: PPO local sampling advantage
+
+This diagnostic tests the missing causal link left by Analysis 05. Analysis 05 can show that far terminal-like counterfactual actions receive excessive Q, but PPO only updates from action chunks that the old stochastic policy can actually sample. Analysis 06 therefore reconstructs the local Gaussian action neighborhood on the real PPO finetune anchors (using `dataset.finetune_sequence_stride`) and samples many chunks around each policy mean without changing any model weights.
+
+For each sampled chunk it computes raw IQL advantage `Q(s,a)-V(s)`, applies the same optional PPO temperature transform used before advantage normalization, and measures the signed projection of the sampled perturbation toward the same-episode terminal action template. Correlations are computed within each state across local samples before being averaged, so state-to-state value differences do not create a false terminal correlation.
+
+The diagnostic runs on both the initial stochastic Base ACT neighborhood and the final `best_ope` Post-RL neighborhood by default. It reports whole-action and bimanual component projections for left/right joints and grippers. Positive local correlation, positive top-score-minus-bottom-score terminal projection, and positive best-score projection mean that PPO-accessible perturbations toward the terminal manifold are systematically preferred by the Critic. Near-zero or negative values mean the far terminal-template Q anomaly from Analysis 05 is not locally reachable through PPO sampling and is less likely to explain policy drift.
+
+### Analysis 07: PPO gradient alignment
+
+This diagnostic turns the local correlations from Analysis 06 into a first-order mean-space PPO update estimate. For a Gaussian policy it Monte-Carlo estimates `E[score * (a-mu) / sigma^2]` on the real PPO finetune anchors, where `score` matches the Offline PPO pre-normalization advantage transform. The primary estimator subtracts the within-state sample-score mean as a control variate; because an action-independent baseline has zero expected score-function gradient, this reduces Monte-Carlo variance without changing the expected direction.
+
+The estimated action-mean gradient is compared with two directions on the exact same cached observations:
+
+- the same-episode terminal direction, `terminal_chunk - current_policy_mean`;
+- the observed deterministic policy drift, `PostRL_mean - BaseIL_mean`.
+
+The comparison is reported for the full chunk and separately for left/right joints and grippers. Positive `cos(g, terminal)` means the local PPO update points terminal-ward. Positive `cos(g, PostRL-drift)` means the estimated update is aligned with the final deterministic action drift actually observed after Post-RL. `cos(terminal, PostRL-drift)` checks whether that observed drift itself is terminal-ward.
+
+This is deliberately not a full optimizer replay. It estimates the score-function direction with respect to the action mean when samples are drawn from the old/reference policy, where the PPO ratio starts at one and clipping is inactive. It does not reconstruct the Transformer parameter Jacobian, repeated clipped epochs on the same samples, or intermediate old-policy snapshots after OPE reference refreshes.
+
+### Analysis 08: one-step real PPO replay
+
+This diagnostic moves from action-space theory to the actual shared ACT network update. It constructs the same Stage-2 PPO object and finetune dataloader used by production training, starts from the Base ACT checkpoint, draws the first reproducible shuffled finetune batch, and calls the production `BehaviorProximalPolicyOptimization.update_distribution()` exactly once with the trained Stage-1 critic and the configured learning-rate / clip-decay flags.
+
+Before the update it probes the deterministic Base ACT mean on all real PPO-stride anchors and also records the final best-OPE Post-RL mean on those exact cached observations. After the single real optimizer step it probes the mutated PPO policy again. The resulting one-step drift is compared with both the same-episode terminal direction and the final observed IL-to-Post-RL drift.
+
+Metrics are reported for the full 32x16 chunk and separately for left/right joints and grippers. This is the first analysis in the terminal-bias chain that includes the real ACT decoder/action-head parameter Jacobian and parameter sharing: if a gripper-driven PPO signal also creates systematic arm-joint output drift after one optimizer step, the coupling is now observable directly rather than inferred from action-space gradients.
+
+The script previews the exact stochastic batch action and IQL advantage, restores the RNG state, and then lets the production update sample the identical action chunk. It also verifies that the PPO policy clone exactly matches Base ACT before mutation. The scope is intentionally one optimizer step only; it does not reproduce the full 8000-step accumulation, OPE old-policy refreshes, EMA selection, or intermediate optimizer state.
+
+### Analysis 09: multi-batch one-step PPO expectation
+
+Analysis 08 showed that a single real PPO optimizer step can produce a complicated shared-network output drift: some gripper components may move terminal-ward while other gripper/arm components move the opposite way. Analysis 09 tests whether that pattern is systematic or just one shuffled batch / policy-sampling realization.
+
+Each repeat starts from the exact same Base ACT checkpoint with a fresh current policy, fresh old/reference policy, fresh optimizer/scheduler state, one independently shuffled production finetune batch, and one production `update_distribution()` call. The final best-OPE Post-RL policy and the fixed probe observations are held constant across repeats. The script therefore estimates the expectation of the first PPO update rather than accumulating training history.
+
+Two summaries are intentionally separated. First, every repeat gets its own phase-level alignment statistics, so the distribution and sign consistency across repeats are visible. Second, the action drift vectors are averaged per fixed probe state before cosine metrics are computed. This `E[delta action]` view answers whether there is a systematic expected network-output direction after marginalizing over one-step batch/sample noise.
+
+The output also reports an expected-drift signal-to-repeat-noise ratio: the RMSE magnitude of the across-repeat mean drift divided by the RMS standard deviation across repeats for the same action group. A stable positive terminal alignment with useful SNR would support a systematic first-step mechanism. Near-zero expected drift or low sign consistency would indicate that the Analysis 08 direction was dominated by batch/sample variance and that later debugging should focus on multi-step accumulation, optimizer state, clipping, or old-policy refresh dynamics instead.
 
 ## Rollout diagnostics
 
