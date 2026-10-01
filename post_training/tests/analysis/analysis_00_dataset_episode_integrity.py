@@ -476,9 +476,6 @@ def _transition_contract_summary(arrays: dict[str, np.ndarray], gamma: float) ->
     nonterminal = ~done
     terminal = done
 
-    state_error = np.abs(next_state[nonterminal] - state[1:][nonterminal[:-1]]) if len(state) > 1 else np.empty(0)
-    action_error = np.abs(next_action[nonterminal] - action[1:][nonterminal[:-1]]) if len(action) > 1 else np.empty(0)
-
     # Direct vectorized checks using next_index are valid for every row, including terminal self-loops.
     ni = arrays["next_index"]
     state_by_index_error = np.abs(next_state - state[ni])
@@ -486,9 +483,10 @@ def _transition_contract_summary(arrays: dict[str, np.ndarray], gamma: float) ->
 
     target_return = reward.copy()
     nonterminal_indices = np.flatnonzero(nonterminal)
-    valid_next = nonterminal_indices + 1
-    target_return[nonterminal_indices] += gamma * returns[valid_next]
+    valid_nonterminal = nonterminal_indices[nonterminal_indices + 1 < len(returns)]
+    target_return[valid_nonterminal] += gamma * returns[valid_nonterminal + 1]
     return_error = np.abs(returns - target_return)
+    dangling_last_nonterminal = bool(len(done) > 0 and not done[-1])
 
     terminal_state_error = np.abs(next_state[terminal] - state[terminal])
     terminal_action_error = np.abs(next_action[terminal] - action[terminal])
@@ -500,6 +498,7 @@ def _transition_contract_summary(arrays: dict[str, np.ndarray], gamma: float) ->
         "terminal_self_loop_action_max_abs": float(terminal_action_error.max(initial=0.0)),
         "return_recurrence_max_abs": float(return_error.max(initial=0.0)),
         "return_recurrence_mean_abs": float(return_error.mean()) if len(return_error) else 0.0,
+        "dangling_last_nonterminal": dangling_last_nonterminal,
     }
 
 
