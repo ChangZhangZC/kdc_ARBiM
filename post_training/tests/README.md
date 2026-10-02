@@ -17,6 +17,7 @@ The smoke numbering follows the Post-RL data/training/export chain.
 
 | Order | Script | Purpose | V1 status |
 | --- | --- | --- | --- |
+| 00 | `analysis/analysis_00_dataset_episode_integrity.py` | audit LeRobot episode boundaries, Zarr transition/terminal contracts, sampler windows, and one-grasp/one-release semantics for both grippers | current; dataset sanity check before Critic/PPO analysis |
 | 00 | `smoke/smoke_00_data_prepare.py` | LeRobot -> streamed NPY -> JPEG Zarr data contract | current; manual because it needs the original LeRobot dataset |
 | 01 | `smoke/smoke_01_contract.py` | fixed/configurable Post-RL contract guards | current |
 | 02 | `smoke/smoke_02_policy_data.py` | Offline dataset -> stochastic ACT -> shared latent frontend | current |
@@ -43,6 +44,18 @@ The smoke numbering follows the Post-RL data/training/export chain.
 | 07 | `analysis/analysis_07_ppo_gradient_alignment.py` | estimate the Gaussian PPO score-function mean gradient and compare it with terminal direction and observed IL-to-Post-RL action drift | current; first-order action-mean diagnostic only, no training updates |
 | 08 | `analysis/analysis_08_one_step_ppo_replay.py` | replay one production Offline PPO optimizer step from Base ACT and measure the resulting deterministic ACT output drift on fixed probe states | current; mutates only an in-memory PPO clone and never overwrites training artifacts |
 | 09 | `analysis/analysis_09_multi_batch_one_step.py` | repeat independent one-step PPO replays from the same Base ACT over many shuffled finetune batches/seeds and estimate the expected deterministic action drift | current; isolates batch/sample variance before studying multi-step accumulation |
+
+### Analysis 00: Dataset episode integrity
+
+This diagnostic is the dataset-level prerequisite for the later Critic/PPO analyses. It audits the actual LeRobot source and Offline RL Zarr used by sim_task1 without decoding RGB, and it treats episode semantics separately from structural consistency.
+
+The current Rosbag -> LeRobot converter contract is also documented by code inspection: `kuavo_data/CvtRosbag2Lerobot.py` iterates over selected rosbag files and calls `dataset.save_episode()` exactly once after each bag is processed. Therefore one successfully converted rosbag file maps to one LeRobot episode. Because the original bags are not available in the current debugging setup, the script cannot verify whether each original bag itself represented one complete task; it verifies the resulting LeRobot and Zarr data instead.
+
+The structural audit checks `episode_index`, optional `frame_index`, optional `timestamp`, repeated/non-contiguous episode IDs, episode lengths, LeRobot-to-Zarr row ordering, `episode_ends`, `done`, `timeout`, terminal self-loops, `next_index`, nonterminal positive rewards, transition next-state/next-action consistency, return recurrence, and real `SequenceSampler` windows at configurable horizon/strides. This distinguishes “the conversion pipeline preserved its own boundaries” from “the boundaries were semantically correct.”
+
+The task-semantic audit uses the 16D bimanual contract by default: left gripper index 7 and right gripper index 15. For the episode-boundary question, the primary contract is that both commanded grippers complete exactly one debounced `open -> closed -> open` cycle before the episode ends. The diagnostic now reports each left/right close and reopen frame, `frames_before_first_close`, and `tail_after_last_release = episode_last_frame - max(left_reopen, right_reopen)`. This directly quantifies whether a recorded episode begins before grasping and still contains frames after both release commands, rather than ending in the middle of the bimanual task. Observed `observation.state` gripper cycles and action-to-state lag remain secondary diagnostics and are not part of the episode-boundary validity metric.
+
+Primary outputs are `episode_integrity.csv`, `suspicious_episodes.csv`, `gripper_events.csv`, `sampler_checks.csv`, and `summary.json`. The next visualization diagnostic should use the suspicious episode IDs and detected gripper event frames to render start / grasp / release / end RGB contact sheets for manual semantic verification.
 
 ### Analysis 05: Terminal / Advantage diagnostic
 
