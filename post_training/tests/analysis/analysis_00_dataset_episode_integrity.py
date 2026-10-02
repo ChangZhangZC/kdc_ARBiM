@@ -309,6 +309,13 @@ def _paired_event_lag(
     return int(state_events[0]["frame_offset"] - action_events[0]["frame_offset"])
 
 
+def _single_event_offset(result: dict, event_key: str) -> int | None:
+    events = result[event_key]
+    if len(events) != 1:
+        return None
+    return int(events[0]["frame_offset"])
+
+
 def _episode_structural_row(
     *,
     ep_id: int,
@@ -651,6 +658,10 @@ def _print_summary(summary: dict) -> None:
         f"{summary['counts']['task_semantic_valid']} / {summary['lerobot']['episodes']}"
     )
     print(
+        "Episode boundary valid (structure + Zarr + both command cycles + releases before end): "
+        f"{summary['counts']['episode_boundary_valid']} / {summary['lerobot']['episodes']}"
+    )
+    print(
         "Fully valid episodes: "
         f"{summary['counts']['fully_valid']} / {summary['lerobot']['episodes']}"
     )
@@ -664,6 +675,26 @@ def _print_summary(summary: dict) -> None:
                 f"low/high thresholds={thresholds['low']:.5f}/{thresholds['high']:.5f} "
                 f"start_median={thresholds['start_median']:.5f}"
             )
+
+    event_pos = summary["action_event_position_frames"]
+    lead = event_pos["frames_before_first_close"]
+    tail = event_pos["tail_after_last_release"]
+    print(
+        "Action event boundary margins frames min/mean/median/max: "
+        f"before-first-close={_fmt_optional(lead['min'])}/"
+        f"{_fmt_optional(lead['mean'])}/"
+        f"{_fmt_optional(lead['median'])}/"
+        f"{_fmt_optional(lead['max'])}, "
+        f"after-last-release={_fmt_optional(tail['min'])}/"
+        f"{_fmt_optional(tail['mean'])}/"
+        f"{_fmt_optional(tail['median'])}/"
+        f"{_fmt_optional(tail['max'])}"
+    )
+    print(
+        "Episodes with both action releases before episode end: "
+        f"{event_pos['episodes_with_both_releases_before_end']} / "
+        f"{summary['lerobot']['episodes']}"
+    )
 
     lag = summary["action_state_event_lag_frames"]
     print(
@@ -882,6 +913,33 @@ def main() -> None:
         execution_semantic_valid = bool(
             left_state_result["valid"] and right_state_result["valid"]
         )
+
+        left_close_offset = _single_event_offset(left, "close_events")
+        left_reopen_offset = _single_event_offset(left, "reopen_events")
+        right_close_offset = _single_event_offset(right, "close_events")
+        right_reopen_offset = _single_event_offset(right, "reopen_events")
+        close_offsets = [
+            value for value in (left_close_offset, right_close_offset)
+            if value is not None
+        ]
+        reopen_offsets = [
+            value for value in (left_reopen_offset, right_reopen_offset)
+            if value is not None
+        ]
+        first_close_offset = min(close_offsets) if len(close_offsets) == 2 else None
+        last_release_offset = max(reopen_offsets) if len(reopen_offsets) == 2 else None
+        episode_last_offset = len(positions) - 1
+        frames_before_first_close = first_close_offset
+        tail_after_last_release = (
+            episode_last_offset - last_release_offset
+            if last_release_offset is not None
+            else None
+        )
+        releases_before_episode_end = bool(
+            last_release_offset is not None
+            and tail_after_last_release is not None
+            and tail_after_last_release >= 0
+        )
         gripper_rows.append(
             {
                 "episode_id": int(ep_id),
@@ -917,6 +975,15 @@ def main() -> None:
                 "left_reopen_action_to_state_lag_frames": left_reopen_lag,
                 "right_close_action_to_state_lag_frames": right_close_lag,
                 "right_reopen_action_to_state_lag_frames": right_reopen_lag,
+                "left_close_frame_offset": left_close_offset,
+                "left_reopen_frame_offset": left_reopen_offset,
+                "right_close_frame_offset": right_close_offset,
+                "right_reopen_frame_offset": right_reopen_offset,
+                "first_close_frame_offset": first_close_offset,
+                "last_release_frame_offset": last_release_offset,
+                "frames_before_first_close": frames_before_first_close,
+                "tail_after_last_release": tail_after_last_release,
+                "releases_before_episode_end": releases_before_episode_end,
                 "command_semantic_valid": command_semantic_valid,
                 "execution_semantic_valid": execution_semantic_valid,
                 "task_semantic_valid": bool(
@@ -1024,6 +1091,12 @@ def main() -> None:
             "action_reset_jump_l2_to_next_episode": action_reset_jump,
             "state_reset_jump_l2_to_next_episode": state_reset_jump,
         }
+        row["episode_boundary_valid"] = bool(
+            row["structural_valid"]
+            and row["zarr_valid"]
+            and row["command_semantic_valid"]
+            and row["releases_before_episode_end"]
+        )
         row["fully_valid"] = bool(
             row["structural_valid"]
             and row["zarr_valid"]
@@ -1059,6 +1132,8 @@ def main() -> None:
         "command_semantic_valid": int(sum(row["command_semantic_valid"] for row in combined_rows)),
         "execution_semantic_valid": int(sum(row["execution_semantic_valid"] for row in combined_rows)),
         "task_semantic_valid": int(sum(row["task_semantic_valid"] for row in combined_rows)),
+        "episode_boundary_valid": int(sum(row["episode_boundary_valid"] for row in combined_rows)),
+        "releases_before_episode_end": int(sum(row["releases_before_episode_end"] for row in combined_rows)),
         "fully_valid": int(sum(row["fully_valid"] for row in combined_rows)),
         "suspicious": int(len(suspicious_rows)),
     }
@@ -1101,6 +1176,21 @@ def main() -> None:
             "left_index": int(args.left_state_gripper_index),
             "right_index": int(args.right_state_gripper_index),
         },
+        "action_event_position_frames": {
+            "frames_before_first_close": _stats([
+                row["frames_before_first_close"]
+                for row in combined_rows
+                if row["frames_before_first_close"] is not None
+            ]),
+            "tail_after_last_release": _stats([
+                row["tail_after_last_release"]
+                for row in combined_rows
+                if row["tail_after_last_release"] is not None
+            ]),
+            "episodes_with_both_releases_before_end": int(
+                sum(row["releases_before_episode_end"] for row in combined_rows)
+            ),
+        },
         "action_state_event_lag_frames": {
             "left_close": _stats([
                 row["left_close_action_to_state_lag_frames"]
@@ -1133,9 +1223,10 @@ def main() -> None:
             "to one LeRobot episode unless a bag fails and is skipped."
         ),
         "semantic_contract": (
-            "Expected sim_task1 episode: both left and right gripper commands and observed "
-            "gripper states each complete exactly one debounced open->closed->open cycle, "
-            "corresponding to one commanded and executed grasp/release sequence per hand."
+            "Expected sim_task1 episode: both left and right gripper commands each complete "
+            "exactly one debounced open->closed->open cycle before the episode ends. "
+            "Observed gripper-state cycles remain a secondary diagnostic and are not required "
+            "for the episode-boundary validity metric."
         ),
     }
 
