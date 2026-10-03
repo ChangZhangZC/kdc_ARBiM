@@ -460,10 +460,11 @@ def main() -> None:
         length = int(end - start)
         terminal_anchor = length - chunk_size
         events = {
-            "first_release_partial": first_release,
             "last_release_true": last_release,
             "rewarded_terminal_chunk_start": terminal_anchor,
         }
+        if first_release < last_release:
+            events["first_release_partial"] = first_release
         for event_name, event_local in events.items():
             for rel in args.offsets:
                 local = int(event_local + rel)
@@ -545,6 +546,10 @@ def main() -> None:
         "episodes": int(len(geometry_rows)),
         "chunk_size": int(chunk_size),
         "critic_stride": int(critic_stride),
+        "gamma": float(cfg.critic.gamma),
+        "terminal_reward_discount_weight_within_final_chunk": float(
+            float(cfg.critic.gamma) ** max(chunk_size - 1, 0)
+        ),
         "terminal_tail_geometry": {
             "tail_after_last_release_frames": {
                 "min": int(np.min(tail_values)),
