@@ -12,10 +12,7 @@ for path in (REPO_ROOT, POST_RL_SRC):
     if path_str not in sys.path:
         sys.path.insert(0, path_str)
 
-from post_rl.data.reward_zarr_migration import (
-    clone_latent_cache_for_reward_clone,
-    migrate_reward_zarr,
-)
+from post_rl.data.reward_zarr_migration import migrate_reward_zarr
 
 
 def main() -> None:
@@ -57,31 +54,6 @@ def main() -> None:
     parser.add_argument("--overwrite", action="store_true")
 
     parser.add_argument(
-        "--source-latent-cache",
-        default=None,
-        help=(
-            "Optional existing frozen ACT latent cache. Because Reward V2 changes only "
-            "reward/return, the observation latents are identical and can be reused."
-        ),
-    )
-    parser.add_argument(
-        "--target-latent-cache",
-        default=None,
-        help=(
-            "Optional target cache directory. Default: "
-            "<target-zarr>.act_latent_cache/<source-cache-basename>."
-        ),
-    )
-    parser.add_argument(
-        "--latent-link-mode",
-        choices=("hardlink", "symlink", "copy"),
-        default="hardlink",
-        help=(
-            "How to materialize immutable obs_latent.npy/next_indices.npy. hardlink is "
-            "recommended on the same filesystem and avoids duplicating the very large cache."
-        ),
-    )
-    parser.add_argument(
         "--summary-json",
         default=None,
         help="Optional path to save the migration summary JSON.",
@@ -104,18 +76,6 @@ def main() -> None:
         copy_mode=args.copy_mode,
     )
 
-    latent_summary = None
-    if args.source_latent_cache:
-        latent_summary = clone_latent_cache_for_reward_clone(
-            args.source_latent_cache,
-            args.source_zarr,
-            args.target_zarr,
-            target_cache=args.target_latent_cache,
-            link_mode=args.latent_link_mode,
-            overwrite=args.overwrite,
-        )
-        summary["latent_cache"] = latent_summary
-
     print("\n=== Reward V2 Zarr migration ===")
     print(f"Source:   {summary['source_zarr']}")
     print(f"Target:   {summary['target_zarr']}")
@@ -137,13 +97,6 @@ def main() -> None:
             "Reward offset inside final H chunk mean: "
             f"{summary['final_h_chunk_reward_offset_mean']:.2f}"
         )
-
-    if latent_summary is not None:
-        print("\nLatent cache:")
-        print(f"  Source: {latent_summary['source_cache']}")
-        print(f"  Target: {latent_summary['target_cache']}")
-        print(f"  Mode:   {latent_summary['link_mode']}")
-        print(f"  Shape:  {latent_summary['latent_shape']}")
 
     if args.summary_json:
         path = pathlib.Path(args.summary_json).expanduser().resolve()
