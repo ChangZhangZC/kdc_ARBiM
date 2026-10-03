@@ -2,13 +2,11 @@ from __future__ import annotations
 
 import argparse
 import csv
-import inspect
+import datetime as dt
 import json
 import pathlib
 import sys
-from typing import Any
 
-import hydra
 import numpy as np
 import torch
 from omegaconf import OmegaConf
@@ -25,12 +23,12 @@ for path in (REPO_ROOT, POST_TRAINING_SRC, LEROBOT_SRC, ANALYSIS_DIR):
 import lerobot_patches.custom_patches  # noqa: E402,F401
 from lerobot.utils.constants import ACTION, OBS_STATE  # noqa: E402
 from analysis_05_terminal_advantage import (  # noqa: E402
-    _load_postrl_policy,
     _processor_fingerprint,
     _resolve_config,
     _resolve_processor_dir,
-    _resolve_required_path,
 )
+from kuavo_deploy.config import load_kuavo_config  # noqa: E402
+from kuavo_deploy.src.scripts.script_auto_test import ArmMove  # noqa: E402
 from post_rl.critic.networks import ACTCriticEncoder  # noqa: E402
 from post_rl.training import TrainACTWorkspace  # noqa: E402
 
@@ -42,36 +40,12 @@ def _parse_slice(text: str) -> slice:
     return slice(int(parts[0]), int(parts[1]))
 
 
-def _jsonable(value: Any):
-    if isinstance(value, dict):
-        return {str(k): _jsonable(v) for k, v in value.items()}
-    if isinstance(value, (list, tuple)):
-        return [_jsonable(v) for v in value]
-    if isinstance(value, np.ndarray):
-        return value.tolist()
-    if torch.is_tensor(value):
-        return value.detach().cpu().tolist()
-    if isinstance(value, (np.floating, np.integer)):
-        return value.item()
-    if isinstance(value, pathlib.Path):
-        return str(value)
-    try:
-        json.dumps(value)
-        return value
-    except TypeError:
-        return repr(value)
-
-
-def _tensor_stats(delta: torch.Tensor, group: slice) -> dict[str, float]:
-    x = delta[..., group].reshape(delta.shape[0], -1).float()
-    return {
-        "mae": float(x.abs().mean().item()),
-        "rmse": float(torch.sqrt(x.square().mean()).item()),
-        "max_abs": float(x.abs().max().item()),
-    }
-
-
-def _stats_tensor(stats: dict, feature: str, name: str, ref: torch.Tensor) -> torch.Tensor:
+def _stats_tensor(
+    stats: dict,
+    feature: str,
+    name: str,
+    ref: torch.Tensor,
+) -> torch.Tensor:
     return torch.as_tensor(
         stats[feature][name],
         device=ref.device,
@@ -79,271 +53,612 @@ def _stats_tensor(stats: dict, feature: str, name: str, ref: torch.Tensor) -> to
     )
 
 
-def _hold_chunk_from_policy_obs(
-    policy_obs: dict[str, torch.Tensor],
+def _state_raw_and_hold(
+    observation: dict[str, torch.Tensor],
     stats: dict,
     *,
     horizon: int,
     action_dim: int,
-) -> torch.Tensor | None:
-    state = policy_obs.get(OBS_STATE)
-    if state is None:
-        return None
-    state = torch.as_tensor(state)
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if OBS_STATE not in observation:
+        raise KeyError(
+            f"MuJoCo policy observation has no {OBS_STATE!r}; "
+            "cannot build hold chunk."
+        )
+    state = torch.as_tensor(observation[OBS_STATE])
     if state.ndim == 1:
         state = state.unsqueeze(0)
     if state.ndim != 2 or state.shape[-1] != action_dim:
-        return None
+        raise ValueError(
+            "Critic probe assumes state/action coordinates match "
+            "for the hold counterfactual; "
+            f"state={tuple(state.shape)}, action_dim={action_dim}."
+        )
 
-    # The env runner receives/constructs the same normalized policy batch used by
-    # StochasticACTPolicyWrapper. Convert normalized observation.state back to raw
-    # robot coordinates, then normalize those coordinates with the ACTION stats.
-    state_mean = _stats_tensor(stats, OBS_STATE, "mean", state)
-    state_std = _stats_tensor(stats, OBS_STATE, "std", state)
-    action_mean = _stats_tensor(stats, ACTION, "mean", state)
-    action_std = _stats_tensor(stats, ACTION, "std", state)
-    raw_state = state * (state_std + 1e-8) + state_mean
-    hold_step = (raw_state - action_mean) / (action_std + 1e-8)
-    return hold_step[:, None, :].expand(-1, horizon, -1).contiguous()
+    state_mean = _stats_tensor(
+        stats,
+        OBS_STATE,
+        "mean",
+        state,
+    )
+    state_std = _stats_tensor(
+        stats,
+        OBS_STATE,
+        "std",
+        state,
+    )
+    action_mean = _stats_tensor(
+        stats,
+        ACTION,
+        "mean",
+        state,
+    )
+    action_std = _stats_tensor(
+        stats,
+        ACTION,
+        "std",
+        state,
+    )
+    raw_state = (
+        state * (state_std + 1e-8)
+        + state_mean
+    )
+    hold_step = (
+        (raw_state - action_mean)
+        / (action_std + 1e-8)
+    )
+    hold = (
+        hold_step[:, None, :]
+        .expand(-1, horizon, -1)
+        .contiguous()
+    )
+    return raw_state, hold
 
 
-class CriticProbePolicy:
-    """Deterministic Post-RL policy wrapper that logs live Q/V/A at each replan.
+def _physical_action(
+    normalized_action: torch.Tensor,
+    stats: dict,
+) -> torch.Tensor:
+    mean = _stats_tensor(
+        stats,
+        ACTION,
+        "mean",
+        normalized_action,
+    )
+    std = _stats_tensor(
+        stats,
+        ACTION,
+        "std",
+        normalized_action,
+    )
+    return (
+        normalized_action
+        * (std + 1e-8)
+        + mean
+    )
 
-    The wrapped env runner still executes the Post-RL deterministic mean. The
-    diagnostic only adds counterfactual Critic evaluations for the exact same
-    observation passed to the policy.
+
+def _group_rmse(
+    delta: torch.Tensor,
+    group: slice,
+) -> float:
+    value = delta[..., group].float()
+    return float(
+        torch.sqrt(
+            value.square().mean()
+        ).item()
+    )
+
+
+class MuJoCoCriticProbePolicy:
+    """Execute Post-RL while probing Stage-1 Q/V on every live state.
+
+    The returned action is exactly the deployed Post-RL policy's
+    select_action output. Counterfactual full chunks are fresh
+    deterministic plans on the same normalized observation and
+    never affect the simulator trajectory.
     """
 
     def __init__(
         self,
         *,
-        active_policy,
+        postrl_policy,
         base_policy,
-        critic,
-        stats: dict,
-        output_csv: pathlib.Path,
+        critic_workspace,
+        csv_path: pathlib.Path,
         left_slice: slice,
         right_slice: slice,
-        print_every: int,
+        log_every: int,
     ) -> None:
-        self._active_policy = active_policy
-        self._base_policy = base_policy
-        self._critic = critic
-        self._stats = stats
-        self._output_csv = output_csv
-        self._left_slice = left_slice
-        self._right_slice = right_slice
-        self._print_every = max(1, int(print_every))
-        self._probe_call = 0
-        self._header_written = output_csv.is_file() and output_csv.stat().st_size > 0
+        self.postrl_policy = postrl_policy
+        self.base_policy = base_policy
+        self.workspace = critic_workspace
+        self.critic = critic_workspace.critic
+        self.stats = critic_workspace.stats
+        self.config = postrl_policy.config
+        self.csv_path = csv_path
+        self.left_slice = left_slice
+        self.right_slice = right_slice
+        self.log_every = max(
+            int(log_every),
+            1,
+        )
 
-    def __getattr__(self, name: str):
-        return getattr(self._active_policy, name)
-
-    def eval(self):
-        self._active_policy.eval()
-        self._base_policy.eval()
-        return self
+        csv_path.parent.mkdir(
+            parents=True,
+            exist_ok=True,
+        )
+        self._file = csv_path.open(
+            "w",
+            newline="",
+            buffering=1,
+        )
+        self._writer = None
+        self._episode = -1
+        self._step = 0
+        self._has_steps = False
+        self._rows = 0
 
     @property
-    def probe_calls(self) -> int:
-        return self._probe_call
+    def rows(self) -> int:
+        return self._rows
 
-    def _append_rows(self, rows: list[dict]) -> None:
-        if not rows:
-            return
-        self._output_csv.parent.mkdir(parents=True, exist_ok=True)
-        with self._output_csv.open("a", newline="") as file:
-            writer = csv.DictWriter(file, fieldnames=list(rows[0]))
-            if not self._header_written:
-                writer.writeheader()
-                self._header_written = True
-            writer.writerows(rows)
+    def eval(self):
+        self.postrl_policy.eval()
+        self.base_policy.eval()
+        return self
 
-    @torch.no_grad()
-    def _record(
+    def to(self, device):
+        self.postrl_policy.to(device)
+        self.base_policy.to(device)
+        return self
+
+    def reset(self):
+        self.postrl_policy.reset()
+        self.base_policy.reset()
+        if self._episode < 0:
+            self._episode = 0
+        elif self._has_steps:
+            self._episode += 1
+        self._step = 0
+        self._has_steps = False
+
+    def _write(self, row: dict) -> None:
+        if self._writer is None:
+            self._writer = csv.DictWriter(
+                self._file,
+                fieldnames=list(row),
+            )
+            self._writer.writeheader()
+        self._writer.writerow(row)
+        self._file.flush()
+        self._rows += 1
+
+    @torch.inference_mode()
+    def select_action(
         self,
-        policy_obs: dict[str, torch.Tensor],
-        executed_chunk: torch.Tensor,
-    ) -> None:
-        if not isinstance(policy_obs, dict):
-            raise TypeError(
-                "Critic probe expects the env runner to call the ACT policy "
-                "with a dict observation batch."
+        observation: dict[str, torch.Tensor],
+    ) -> torch.Tensor:
+        # This is the only action returned to the MuJoCo loop.
+        executed_action = (
+            self.postrl_policy.select_action(
+                observation
             )
-        if "latent" in policy_obs:
-            raise RuntimeError(
-                "Live MuJoCo probe received cached latent input. It needs the current "
-                "normalized policy observation so a physical hold counterfactual can "
-                "be constructed."
-            )
-
-        base_chunk = self._base_policy.get_action_mean(policy_obs)
-        rl_chunk = self._active_policy.get_action_mean(policy_obs)
-        executed_chunk = torch.as_tensor(
-            executed_chunk,
-            device=rl_chunk.device,
-            dtype=rl_chunk.dtype,
         )
-        if executed_chunk.shape != rl_chunk.shape:
-            raise ValueError(
-                f"Executed policy chunk shape {tuple(executed_chunk.shape)} != "
-                f"deterministic Post-RL chunk {tuple(rl_chunk.shape)}"
+
+        # Fresh counterfactual plans on the exact current observation.
+        # predict_action_chunk does not alter either ACT action queue.
+        base_chunk = (
+            self.base_policy.predict_action_chunk(
+                observation
+            )
+        )
+        postrl_chunk = (
+            self.postrl_policy.predict_action_chunk(
+                observation
+            )
+        )
+        if base_chunk.shape != postrl_chunk.shape:
+            raise RuntimeError(
+                "Base/Post-RL fresh chunk shape mismatch: "
+                f"{tuple(base_chunk.shape)} vs "
+                f"{tuple(postrl_chunk.shape)}"
+            )
+        if postrl_chunk.ndim != 3:
+            raise RuntimeError(
+                "Expected ACT chunk [B,H,D], got "
+                f"{tuple(postrl_chunk.shape)}"
             )
 
-        latent, _ = self._base_policy.encode_observation(policy_obs)
+        batch_size, horizon, action_dim = (
+            postrl_chunk.shape
+        )
+        if batch_size != 1:
+            raise RuntimeError(
+                "Kuavo MuJoCo critic probe currently expects "
+                "one live environment; got policy batch "
+                f"{batch_size}."
+            )
+        if horizon != int(
+            self.workspace.cfg.n_action_steps
+        ):
+            raise RuntimeError(
+                "Deploy/RL chunk mismatch: fresh policy chunk "
+                f"has H={horizon}, Stage-1 Critic expects "
+                f"H={self.workspace.cfg.n_action_steps}."
+            )
+
+        # Deployment preprocessor already normalized observation into
+        # the LeRobot policy feature contract. Reuse the frozen Base
+        # encoder directly; do not normalize the observation again.
+        latent, _ = (
+            self.workspace.model.encode_observation(
+                observation
+            )
+        )
         critic_state = latent.mean(dim=1)
-        value = self._critic.value(critic_state).reshape(-1)
-        horizon = int(rl_chunk.shape[1])
-        action_dim = int(rl_chunk.shape[2])
-        hold_chunk = _hold_chunk_from_policy_obs(
-            policy_obs,
-            self._stats,
-            horizon=horizon,
-            action_dim=action_dim,
+        value = self.critic.value(
+            critic_state
+        ).reshape(-1)
+
+        raw_state, hold_chunk = (
+            _state_raw_and_hold(
+                observation,
+                self.stats,
+                horizon=horizon,
+                action_dim=action_dim,
+            )
         )
 
         actions = {
             "base": base_chunk,
-            "postrl": rl_chunk,
+            "postrl": postrl_chunk,
+            "hold": hold_chunk,
         }
-        if hold_chunk is not None:
-            actions["hold"] = hold_chunk
-        if action_dim >= max(self._left_slice.stop, self._right_slice.stop):
-            left_rl_right_base = base_chunk.clone()
-            left_rl_right_base[..., self._left_slice] = rl_chunk[..., self._left_slice]
-            left_base_right_rl = base_chunk.clone()
-            left_base_right_rl[..., self._right_slice] = rl_chunk[..., self._right_slice]
-            actions["left_rl_right_base"] = left_rl_right_base
-            actions["left_base_right_rl"] = left_base_right_rl
+        if action_dim >= max(
+            self.left_slice.stop,
+            self.right_slice.stop,
+        ):
+            left_rl_right_base = (
+                base_chunk.clone()
+            )
+            left_rl_right_base[
+                ...,
+                self.left_slice,
+            ] = postrl_chunk[
+                ...,
+                self.left_slice,
+            ]
+            left_base_right_rl = (
+                base_chunk.clone()
+            )
+            left_base_right_rl[
+                ...,
+                self.right_slice,
+            ] = postrl_chunk[
+                ...,
+                self.right_slice,
+            ]
+            actions[
+                "left_rl_right_base"
+            ] = left_rl_right_base
+            actions[
+                "left_base_right_rl"
+            ] = left_base_right_rl
 
-        q_values = {
-            name: self._critic.minQ(critic_state, action).reshape(-1)
+        q = {
+            name: self.critic.minQ(
+                critic_state,
+                action,
+            ).reshape(-1)
             for name, action in actions.items()
         }
-        advantages = {name: q - value for name, q in q_values.items()}
+        advantage = {
+            name: q_value - value
+            for name, q_value in q.items()
+        }
+        q_scalar = {
+            name: float(value_[0].item())
+            for name, value_ in q.items()
+        }
+        best = max(
+            q_scalar,
+            key=q_scalar.get,
+        )
 
-        batch_size = int(rl_chunk.shape[0])
-        rows = []
-        delta_rl_base = rl_chunk - base_chunk
-        for sample in range(batch_size):
-            q_sample = {
-                name: float(q[sample].item())
-                for name, q in q_values.items()
-            }
-            best_action = max(q_sample, key=q_sample.get)
-            row = {
-                "probe_call": self._probe_call,
-                "sample": sample,
-                "value": float(value[sample].item()),
-                "q_base": q_sample["base"],
-                "a_base": float(advantages["base"][sample].item()),
-                "q_postrl": q_sample["postrl"],
-                "a_postrl": float(advantages["postrl"][sample].item()),
-                "q_hold": q_sample.get("hold", float("nan")),
-                "a_hold": (
-                    float(advantages["hold"][sample].item())
-                    if "hold" in advantages
-                    else float("nan")
-                ),
-                "q_left_rl_right_base": q_sample.get(
+        executed_action = torch.as_tensor(
+            executed_action,
+            device=postrl_chunk.device,
+            dtype=postrl_chunk.dtype,
+        )
+        if (
+            executed_action.ndim != 2
+            or executed_action.shape
+            != (1, action_dim)
+        ):
+            raise RuntimeError(
+                "Expected deployed action "
+                f"[1,{action_dim}], got "
+                f"{tuple(executed_action.shape)}"
+            )
+
+        executed_phys = _physical_action(
+            executed_action,
+            self.stats,
+        )
+        fresh_first_phys = _physical_action(
+            postrl_chunk[:, 0],
+            self.stats,
+        )
+        base_first_phys = _physical_action(
+            base_chunk[:, 0],
+            self.stats,
+        )
+        postrl_phys = _physical_action(
+            postrl_chunk,
+            self.stats,
+        )
+        base_phys = _physical_action(
+            base_chunk,
+            self.stats,
+        )
+        hold_phys = _physical_action(
+            hold_chunk,
+            self.stats,
+        )
+
+        row = {
+            "episode": self._episode,
+            "step": self._step,
+            "value": float(
+                value[0].item()
+            ),
+            "q_base": q_scalar["base"],
+            "a_base": float(
+                advantage["base"][0].item()
+            ),
+            "q_postrl": q_scalar["postrl"],
+            "a_postrl": float(
+                advantage["postrl"][0].item()
+            ),
+            "q_hold": q_scalar["hold"],
+            "a_hold": float(
+                advantage["hold"][0].item()
+            ),
+            "q_left_rl_right_base": (
+                q_scalar.get(
                     "left_rl_right_base",
                     float("nan"),
-                ),
-                "q_left_base_right_rl": q_sample.get(
+                )
+            ),
+            "q_left_base_right_rl": (
+                q_scalar.get(
                     "left_base_right_rl",
                     float("nan"),
-                ),
-                "q_postrl_minus_base": q_sample["postrl"] - q_sample["base"],
-                "q_hold_minus_base": (
-                    q_sample.get("hold", float("nan")) - q_sample["base"]
-                ),
-                "critic_best_counterfactual": best_action,
-            }
-            for label, group in (
-                ("all", slice(0, action_dim)),
-                ("left", self._left_slice),
-                ("right", self._right_slice),
-            ):
-                stats = _tensor_stats(
-                    delta_rl_base[sample:sample + 1],
-                    group,
                 )
-                row[f"postrl_base_{label}_mae"] = stats["mae"]
-                row[f"postrl_base_{label}_rmse"] = stats["rmse"]
-                row[f"postrl_base_{label}_max_abs"] = stats["max_abs"]
-            if hold_chunk is not None:
-                delta_hold = (
-                    rl_chunk[sample:sample + 1]
-                    - hold_chunk[sample:sample + 1]
-                )
-                row["postrl_hold_all_rmse"] = _tensor_stats(
-                    delta_hold,
+            ),
+            "q_postrl_minus_base": (
+                q_scalar["postrl"]
+                - q_scalar["base"]
+            ),
+            "q_hold_minus_base": (
+                q_scalar["hold"]
+                - q_scalar["base"]
+            ),
+            "critic_best_counterfactual": best,
+            "postrl_base_chunk_rmse_phys": (
+                _group_rmse(
+                    postrl_phys - base_phys,
                     slice(0, action_dim),
-                )["rmse"]
-            else:
-                row["postrl_hold_all_rmse"] = float("nan")
-            rows.append(row)
+                )
+            ),
+            "postrl_base_left_rmse_phys": (
+                _group_rmse(
+                    postrl_phys - base_phys,
+                    self.left_slice,
+                )
+            ),
+            "postrl_base_right_rmse_phys": (
+                _group_rmse(
+                    postrl_phys - base_phys,
+                    self.right_slice,
+                )
+            ),
+            "postrl_hold_chunk_rmse_phys": (
+                _group_rmse(
+                    postrl_phys - hold_phys,
+                    slice(0, action_dim),
+                )
+            ),
+            "base_hold_chunk_rmse_phys": (
+                _group_rmse(
+                    base_phys - hold_phys,
+                    slice(0, action_dim),
+                )
+            ),
+            "executed_vs_fresh_postrl_first_l2_phys": (
+                float(
+                    torch.linalg.vector_norm(
+                        executed_phys
+                        - fresh_first_phys
+                    ).item()
+                )
+            ),
+            "fresh_postrl_first_vs_state_l2_phys": (
+                float(
+                    torch.linalg.vector_norm(
+                        fresh_first_phys
+                        - raw_state
+                    ).item()
+                )
+            ),
+            "fresh_base_first_vs_state_l2_phys": (
+                float(
+                    torch.linalg.vector_norm(
+                        base_first_phys
+                        - raw_state
+                    ).item()
+                )
+            ),
+        }
 
-        self._append_rows(rows)
-        if self._probe_call % self._print_every == 0:
-            first = rows[0]
+        for index in range(action_dim):
+            row[f"state_{index}"] = float(
+                raw_state[0, index].item()
+            )
+            row[f"executed_action_{index}"] = float(
+                executed_phys[0, index].item()
+            )
+            row[f"fresh_base_first_{index}"] = float(
+                base_first_phys[0, index].item()
+            )
+            row[f"fresh_postrl_first_{index}"] = float(
+                fresh_first_phys[0, index].item()
+            )
+
+        self._write(row)
+        if self._step % self.log_every == 0:
             print(
                 "[critic-probe] "
-                f"replan={self._probe_call} "
-                f"V={first['value']:.4f} "
-                f"Qbase={first['q_base']:.4f} "
-                f"Qrl={first['q_postrl']:.4f} "
-                f"Qhold={first['q_hold']:.4f} "
-                f"best={first['critic_best_counterfactual']} "
-                f"RL-Base-RMSE={first['postrl_base_all_rmse']:.5f}"
+                f"ep={self._episode} "
+                f"step={self._step} "
+                f"V={row['value']:.4f} "
+                f"Qbase={row['q_base']:.4f} "
+                f"Qrl={row['q_postrl']:.4f} "
+                f"Qhold={row['q_hold']:.4f} "
+                f"best={best} "
+                "RL-Hold-RMSE="
+                f"{row['postrl_hold_chunk_rmse_phys']:.5f}"
             )
-        self._probe_call += 1
 
-    @torch.no_grad()
-    def get_action_mean(
-        self,
-        batch: dict[str, torch.Tensor],
-    ) -> torch.Tensor:
-        action = self._active_policy.get_action_mean(batch)
-        self._record(batch, action)
-        return action
+        self._step += 1
+        self._has_steps = True
+        return executed_action
 
-    @torch.no_grad()
-    def predict_action_chunk(
-        self,
-        batch: dict[str, torch.Tensor],
-    ) -> torch.Tensor:
-        action = self._active_policy.predict_action_chunk(batch)
-        self._record(batch, action)
-        return action
+    def close(self) -> None:
+        if self._file.closed:
+            return
+        self._file.flush()
+        self._file.close()
+        print(
+            f"Live Critic probe CSV: "
+            f"{self.csv_path}"
+        )
+
+
+def _build_critic_workspace(
+    *,
+    stage1_dir: pathlib.Path,
+    stage1_config: pathlib.Path | None,
+    base_checkpoint: pathlib.Path,
+    device: str,
+    output_dir: pathlib.Path,
+):
+    config_path = _resolve_config(
+        stage1_dir,
+        (
+            None
+            if stage1_config is None
+            else str(stage1_config)
+        ),
+    )
+    cfg = OmegaConf.load(config_path)
+    cfg.input.policy_checkpoint = str(
+        base_checkpoint
+    )
+    cfg.input.policy_checkpoint_type = "il"
+    cfg.training.device = str(device)
+    cfg.use_wandb = False
+    cfg.eval = False
+    cfg.training.debug = False
+    cfg.critic.load_pretrain = True
+    cfg.critic.artifact_dir = str(
+        stage1_dir / "critic"
+    )
+
+    if not bool(cfg.chunk_as_single_action):
+        raise RuntimeError(
+            "Live Critic probe currently requires "
+            "chunk_as_single_action=true so Q(s,a) uses the "
+            "same whole-chunk semantics as Stage-1 training."
+        )
+
+    workspace = TrainACTWorkspace(
+        cfg,
+        output_dir=str(
+            output_dir / "critic_workspace"
+        ),
+    )
+    workspace._build_act_observation_frontends()
+    workspace._build_critic()
+    if not workspace._load_critic_if_needed():
+        raise RuntimeError(
+            "Expected pretrained Stage-1 Critic; "
+            "probe must not train Q/V."
+        )
+    workspace.critic.eval()
+    return workspace, config_path
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(
         description=(
-            "Run the configured MuJoCo/env_runner with the deterministic Post-RL "
-            "ACT policy while probing the frozen Stage-1 IQL Critic on Base, "
-            "Post-RL, hold, and bimanual counterfactual action chunks at every "
-            "ACT replan."
+            "Run the standard Kuavo MuJoCo ACT evaluation "
+            "with deterministic Post-RL control and probe "
+            "the frozen Stage-1 Critic on Base/Post-RL/hold "
+            "counterfactual chunks for every live simulator "
+            "observation."
         )
     )
-    parser.add_argument("--stage1-dir", required=True)
-    parser.add_argument("--postrl-checkpoint", required=True)
     parser.add_argument(
-        "--checkpoint",
-        default=None,
-        help="Override Base/IL ACT checkpoint.",
+        "--config",
+        required=True,
+        help="Kuavo MuJoCo deployment YAML.",
     )
-    parser.add_argument("--config", default=None)
-    parser.add_argument("--output-dir", default=None)
+    parser.add_argument(
+        "--stage1-dir",
+        required=True,
+    )
+    parser.add_argument(
+        "--stage1-config",
+        default=None,
+        help=(
+            "Optional resolved Offline-RL config override."
+        ),
+    )
+    parser.add_argument(
+        "--il-checkpoint",
+        required=True,
+        help="Deterministic Base ACT checkpoint.",
+    )
+    parser.add_argument(
+        "--postrl-checkpoint",
+        required=True,
+        help=(
+            "Deterministic exported Post-RL ACT checkpoint."
+        ),
+    )
     parser.add_argument(
         "--device",
-        default="cuda:0" if torch.cuda.is_available() else "cpu",
+        default=None,
     )
-    parser.add_argument("--eval-times", type=int, default=1)
-    parser.add_argument("--eval-env-num", type=int, default=None)
+    parser.add_argument(
+        "--episodes",
+        type=int,
+        default=None,
+    )
+    parser.add_argument(
+        "--output-dir",
+        default=(
+            "post_training/outputs/"
+            "mujoco_critic_probe"
+        ),
+    )
+    parser.add_argument(
+        "--log-every",
+        type=int,
+        default=1,
+    )
     parser.add_argument(
         "--left-action-slice",
         type=_parse_slice,
@@ -354,189 +669,273 @@ def main() -> None:
         type=_parse_slice,
         default=slice(8, 16),
     )
-    parser.add_argument("--print-every", type=int, default=1)
     args = parser.parse_args()
 
-    stage1_dir = pathlib.Path(args.stage1_dir).expanduser().resolve()
-    critic_final = stage1_dir / "critic" / "checkpoints" / "final"
-    for name in ("Q.pt", "value.pt", "contract.json"):
-        path = critic_final / name
-        if not path.is_file():
-            raise FileNotFoundError(path)
+    base_checkpoint = pathlib.Path(
+        args.il_checkpoint
+    ).expanduser().resolve()
+    postrl_checkpoint = pathlib.Path(
+        args.postrl_checkpoint
+    ).expanduser().resolve()
 
-    config_path = _resolve_config(stage1_dir, args.config)
-    cfg = OmegaConf.load(config_path)
-    checkpoint = _resolve_required_path(
-        args.checkpoint,
-        cfg.input.get("policy_checkpoint"),
-        "Base ACT checkpoint",
-    )
-    postrl_checkpoint = _resolve_required_path(
-        args.postrl_checkpoint,
-        None,
-        "Post-RL checkpoint",
-    )
-    cfg.input.policy_checkpoint = str(checkpoint)
-    cfg.input.policy_checkpoint_type = "il"
-    cfg.training.device = str(args.device)
-    cfg.use_wandb = False
-    cfg.eval = False
-    cfg.training.debug = False
-    cfg.critic.load_pretrain = True
-    cfg.critic.artifact_dir = str(stage1_dir / "critic")
+    for label, checkpoint in (
+        ("Base ACT", base_checkpoint),
+        ("Post-RL", postrl_checkpoint),
+    ):
+        if (
+            not (
+                checkpoint / "config.json"
+            ).is_file()
+            or not (
+                checkpoint / "model.safetensors"
+            ).is_file()
+        ):
+            raise FileNotFoundError(
+                f"{label} deterministic checkpoint "
+                f"is incomplete: {checkpoint}"
+            )
 
-    if not bool(cfg.chunk_as_single_action):
+    base_processor = _resolve_processor_dir(
+        base_checkpoint
+    )
+    postrl_processor = _resolve_processor_dir(
+        postrl_checkpoint
+    )
+    base_fp = _processor_fingerprint(
+        base_processor
+    )
+    postrl_fp = _processor_fingerprint(
+        postrl_processor
+    )
+    if base_fp != postrl_fp:
         raise RuntimeError(
-            "MuJoCo critic probe currently requires chunk_as_single_action=true "
-            "so Q(s,a) has the same whole-ACT-chunk semantics used by the "
-            "trained Stage-1 Critic."
+            "Base ACT and Post-RL processor "
+            "bundles differ."
         )
 
+    deploy_config_path = pathlib.Path(
+        args.config
+    ).expanduser().resolve()
+    config = load_kuavo_config(
+        deploy_config_path
+    )
+    if args.device is not None:
+        config.inference.device = args.device
+    if args.episodes is not None:
+        if args.episodes < 1:
+            raise ValueError(
+                "--episodes must be >= 1"
+            )
+        config.inference.eval_episodes = int(
+            args.episodes
+        )
+    config.inference.policy_type = "act"
+    config.inference.pretrained_path = str(
+        postrl_checkpoint
+    )
+
+    stamp = dt.datetime.now().strftime(
+        "%Y%m%d_%H%M%S"
+    )
+    config.inference.method = (
+        f"{config.inference.method}"
+        "_postrl_critic_probe"
+    )
+    config.inference.timestamp = (
+        f"{config.inference.timestamp}_{stamp}"
+    )
     output_dir = (
-        pathlib.Path(args.output_dir).expanduser().resolve()
-        if args.output_dir
-        else REPO_ROOT / "post_training" / "outputs" / "mujoco_critic_probe"
+        pathlib.Path(args.output_dir)
+        .expanduser()
+        .resolve()
+        / stamp
     )
-    output_dir.mkdir(parents=True, exist_ok=True)
+    output_dir.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
 
-    workspace = TrainACTWorkspace(cfg, output_dir=str(output_dir))
-    workspace._build_act_observation_frontends()
-    workspace._build_critic()
-    if not workspace._load_critic_if_needed():
-        raise RuntimeError(
-            "Expected pretrained Stage-1 Q/V; probe must not train the Critic."
-        )
-    workspace.critic.eval()
+    stage1_dir = pathlib.Path(
+        args.stage1_dir
+    ).expanduser().resolve()
+    stage1_config = (
+        None
+        if args.stage1_config is None
+        else pathlib.Path(
+            args.stage1_config
+        ).expanduser().resolve()
+    )
+    (
+        workspace,
+        resolved_stage1_config,
+    ) = _build_critic_workspace(
+        stage1_dir=stage1_dir,
+        stage1_config=stage1_config,
+        base_checkpoint=base_checkpoint,
+        device=str(
+            config.inference.device
+        ),
+        output_dir=output_dir,
+    )
 
-    postrl_policy, postrl_kind = _load_postrl_policy(
+    # Initialize the same ROS/control environment used by the
+    # existing rollout diagnostics.
+    _arm = ArmMove(config)
+    from kuavo_deploy.src.eval import (
+        sim_auto_test as sim_eval,
+    )
+
+    device = torch.device(
+        config.inference.device
+    )
+    base_setup_policy = sim_eval.setup_policy
+    base_policy = base_setup_policy(
+        base_checkpoint,
+        "act",
+        config.inference,
+        device,
+    )
+    postrl_policy = base_setup_policy(
         postrl_checkpoint,
-        workspace.device,
-        cfg,
+        "act",
+        config.inference,
+        device,
     )
-    il_processor = _resolve_processor_dir(checkpoint)
-    postrl_processor = _resolve_processor_dir(postrl_checkpoint)
-    il_processor_fp = _processor_fingerprint(il_processor)
-    postrl_processor_fp = _processor_fingerprint(postrl_processor)
-    if il_processor_fp != postrl_processor_fp:
-        raise RuntimeError(
-            "Base ACT and Post-RL processor bundles differ; refusing live Q/V "
-            "comparison."
-        )
 
     postrl_encoder = ACTCriticEncoder(
         postrl_policy.model,
         copy_model=False,
-    ).to(workspace.device).eval()
-    if workspace._fingerprint_module(postrl_encoder) != workspace._encoder_sha256:
+    ).to(device).eval()
+    if (
+        workspace._fingerprint_module(
+            postrl_encoder
+        )
+        != workspace._encoder_sha256
+    ):
         raise RuntimeError(
-            "Post-RL encoder differs from the Stage-1/Base encoder contract."
+            "Deployed Post-RL encoder differs from "
+            "the Stage-1/Base encoder contract."
+        )
+    if int(
+        postrl_policy.config.chunk_size
+    ) != int(
+        workspace.cfg.n_action_steps
+    ):
+        raise RuntimeError(
+            "Post-RL deploy/RL chunk mismatch: "
+            f"deploy={postrl_policy.config.chunk_size}, "
+            f"critic={workspace.cfg.n_action_steps}."
         )
 
-    task_cfg = cfg.get("task")
-    env_runner_cfg = None if task_cfg is None else task_cfg.get("env_runner")
-    if env_runner_cfg is None:
-        raise RuntimeError(
-            "Resolved config has no task.env_runner. Use the same resolved "
-            "Stage-2 config that you normally use for MuJoCo evaluation, or "
-            "pass it with --config."
-        )
-    env_runner = hydra.utils.instantiate(
-        env_runner_cfg,
-        output_dir=str(output_dir),
+    csv_path = (
+        output_dir / "live_critic_probe.csv"
     )
-
-    probe_csv = output_dir / "live_critic_probe.csv"
-    if probe_csv.exists():
-        probe_csv.unlink()
-    probe_policy = CriticProbePolicy(
-        active_policy=postrl_policy,
-        base_policy=workspace.model,
-        critic=workspace.critic,
-        stats=workspace.stats,
-        output_csv=probe_csv,
+    probe_policy = MuJoCoCriticProbePolicy(
+        postrl_policy=postrl_policy,
+        base_policy=base_policy,
+        critic_workspace=workspace,
+        csv_path=csv_path,
         left_slice=args.left_action_slice,
         right_slice=args.right_action_slice,
-        print_every=args.print_every,
-    ).eval()
+        log_every=args.log_every,
+    ).eval().to(device)
 
+    def _setup(
+        _pretrained_path,
+        policy_type,
+        cfg,
+        device=device,
+    ):
+        if policy_type != "act":
+            raise ValueError(
+                "MuJoCo Critic probe supports ACT only."
+            )
+        return probe_policy
+
+    with (
+        output_dir / "run_meta.json"
+    ).open("w") as file:
+        json.dump(
+            {
+                "deploy_config": str(
+                    deploy_config_path
+                ),
+                "resolved_stage1_config": str(
+                    resolved_stage1_config
+                ),
+                "stage1_dir": str(
+                    stage1_dir
+                ),
+                "base_checkpoint": str(
+                    base_checkpoint
+                ),
+                "postrl_checkpoint": str(
+                    postrl_checkpoint
+                ),
+                "processor_fingerprint": (
+                    base_fp
+                ),
+                "device": str(
+                    config.inference.device
+                ),
+                "episodes": int(
+                    config.inference.eval_episodes
+                ),
+                "chunk_size": int(
+                    workspace.cfg.n_action_steps
+                ),
+                "executed_policy": (
+                    "postrl_select_action"
+                ),
+                "counterfactual_policy_chunks": [
+                    "fresh_base",
+                    "fresh_postrl",
+                    "hold",
+                    "left_postrl_right_base",
+                    "left_base_right_postrl",
+                ],
+                "causal_limit": (
+                    "This probe diagnoses the learned Critic "
+                    "ranking on live states. It does not by "
+                    "itself prove that PPO gradients caused "
+                    "final Actor drift; Analysis 10 and 11 "
+                    "test that mechanism."
+                ),
+            },
+            file,
+            indent=2,
+        )
+
+    sim_eval.setup_policy = _setup
     try:
-        run_params = inspect.signature(env_runner.run).parameters
-    except (TypeError, ValueError):
-        run_params = {}
-    kwargs = {}
-    if "eval_env_num" in run_params:
-        kwargs["eval_env_num"] = int(
-            args.eval_env_num
-            if args.eval_env_num is not None
-            else cfg.ppo.eval_env_num
-        )
-
-    results = []
-    for episode in range(int(args.eval_times)):
         print(
-            f"\n=== MuJoCo Critic Probe rollout "
-            f"{episode + 1}/{args.eval_times} ==="
+            "Processor bundles are bit-identical: "
+            f"{base_fp[:12]}..."
         )
-        result = env_runner.run(probe_policy, **kwargs)
-        results.append(_jsonable(result))
+        print(
+            "Control policy: deterministic Post-RL; "
+            "Base/Hold are Critic-only counterfactuals."
+        )
+        print(
+            f"Per-step Q/V/A diagnostics: "
+            f"{csv_path}"
+        )
+        sim_eval.kuavo_eval_autotest(
+            config
+        )
+    finally:
+        sim_eval.setup_policy = base_setup_policy
+        probe_policy.close()
 
-    if probe_policy.probe_calls == 0:
+    if probe_policy.rows == 0:
         raise RuntimeError(
-            "env_runner completed without calling get_action_mean/"
-            "predict_action_chunk on the probe wrapper. This runner bypasses "
-            "the standard ACT policy API; instrument its policy call site before "
-            "interpreting Critic results."
+            "MuJoCo rollout produced zero "
+            "Critic-probe rows."
         )
-
-    summary = {
-        "config": str(config_path),
-        "stage1_dir": str(stage1_dir),
-        "base_checkpoint": str(checkpoint),
-        "postrl_checkpoint": str(postrl_checkpoint),
-        "postrl_checkpoint_kind": postrl_kind,
-        "processor_fingerprint": il_processor_fp,
-        "probe_calls": probe_policy.probe_calls,
-        "chunk_as_single_action": bool(cfg.chunk_as_single_action),
-        "chunk_size": int(cfg.n_action_steps),
-        "left_action_slice": [
-            args.left_action_slice.start,
-            args.left_action_slice.stop,
-        ],
-        "right_action_slice": [
-            args.right_action_slice.start,
-            args.right_action_slice.stop,
-        ],
-        "rollout_results": results,
-        "interpretation_contract": {
-            "value": (
-                "V(s) from the frozen Stage-1 IQL value network at the exact "
-                "live policy observation."
-            ),
-            "q_base": "Q(s, deterministic Base-ACT whole action chunk).",
-            "q_postrl": (
-                "Q(s, deterministic Post-RL whole action chunk actually "
-                "executed by the wrapper)."
-            ),
-            "q_hold": (
-                "Q(s, current observation.state repeated as a position-hold "
-                "chunk after converting state normalization to action "
-                "normalization)."
-            ),
-            "counterfactuals": (
-                "Swap only the configured left or right action dimensions "
-                "between Base and Post-RL chunks."
-            ),
-            "causal_limit": (
-                "Critic misranking on a live state diagnoses the learned Q "
-                "surface; by itself it does not prove PPO gradients caused the "
-                "final Actor drift. Analysis 10/11 test that training mechanism."
-            ),
-        },
-    }
-    with (output_dir / "summary.json").open("w") as file:
-        json.dump(summary, file, indent=2, allow_nan=True)
-    print(f"\nProbe rows: {probe_policy.probe_calls}; saved to {probe_csv}")
-    print(f"Summary: {output_dir / 'summary.json'}")
+    print(
+        f"Saved {probe_policy.rows} live "
+        f"Critic-probe rows to: {csv_path}"
+    )
 
 
 if __name__ == "__main__":
