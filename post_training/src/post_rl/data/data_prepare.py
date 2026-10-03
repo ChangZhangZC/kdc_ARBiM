@@ -864,6 +864,10 @@ def _read_source_header(path, use_depth):
                 "rgb_storage", "jpeg" if stream_format == STREAM_NPY_FORMAT else "dense"
             ),
             "jpeg_quality": int(first.get("jpeg_quality", DEFAULT_JPEG_QUALITY)),
+            "reward_mode": first.get(
+                "reward_mode", REWARD_MODE_EPISODE_END_SHAPED
+            ),
+            "reward_event": first.get("reward_event"),
             "num_frames": int(first["num_frames"]),
             "num_episodes": int(first["num_episodes"]),
             "state_shape": tuple(first["state_shape"]),
@@ -890,6 +894,8 @@ def _read_source_header(path, use_depth):
         "stream_format": "legacy_single_record",
         "rgb_storage": "dense",
         "jpeg_quality": DEFAULT_JPEG_QUALITY,
+        "reward_mode": REWARD_MODE_EPISODE_END_SHAPED,
+        "reward_event": None,
         "num_frames": num_frames,
         "num_episodes": num_episodes,
         "state_shape": tuple(np.asarray(first["agent_pos"][0]).shape),
@@ -1213,6 +1219,9 @@ def run_build_db(config):
             "path": info["path"],
             "format": info["stream_format"],
             "rgb_storage": info["rgb_storage"],
+            "reward_mode": info.get(
+                "reward_mode", REWARD_MODE_EPISODE_END_SHAPED
+            ),
         }
         for info in infos
     ]
