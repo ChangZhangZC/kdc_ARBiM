@@ -295,6 +295,13 @@ def _prepare_experiment(args, *, need_dynamics: bool = False):
         ).cpu()
     )
 
+    # Loading the diagnostic final policy constructs a model and can consume RNG.
+    # Preserve the training RNG so reference probing cannot change PPO samples.
+    cpu_rng_state = torch.get_rng_state()
+    cuda_rng_state = (
+        torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None
+    )
+
     postrl_policy, postrl_kind = _load_postrl_policy(
         postrl_checkpoint, workspace.device, cfg
     )
@@ -328,6 +335,10 @@ def _prepare_experiment(args, *, need_dynamics: bool = False):
     del postrl_policy
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
+
+    torch.set_rng_state(cpu_rng_state)
+    if cuda_rng_state is not None:
+        torch.cuda.set_rng_state_all(cuda_rng_state)
 
     workspace._build_ppo()
     workspace.unio4._policy.set_frozen_encoder_pos_embed(workspace._frozen_encoder_pos_embed)
