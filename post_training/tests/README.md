@@ -116,6 +116,86 @@ Two summaries are intentionally separated. First, every repeat gets its own phas
 
 The output also reports an expected-drift signal-to-repeat-noise ratio: the RMSE magnitude of the across-repeat mean drift divided by the RMS standard deviation across repeats for the same action group. A stable positive terminal alignment with useful SNR would support a systematic first-step mechanism. Near-zero expected drift or low sign consistency would indicate that the Analysis 08 direction was dominated by batch/sample variance and that later debugging should focus on multi-step accumulation, optimizer state, clipping, or old-policy refresh dynamics instead.
 
+## Freeze-cause diagnostics
+
+These three diagnostics answer different links in the current freeze hypothesis and should not be treated as interchangeable.
+
+| Order | Script | Question |
+| --- | --- | --- |
+| A | `analysis/analysis_mujoco_critic_probe.py` | On the exact live rollout state, does the frozen Stage-1 Critic rank Post-RL / hold-like chunks above the Base-ACT continuation chunk? |
+| B | `analysis/analysis_10_multi_step_fixed_old.py` | With Critic and old/reference policy fixed, can repeated real PPO updates alone accumulate the observed Actor drift? |
+| C | `analysis/analysis_11_production_ppo_replay.py` | When production Dynamics OPE and accepted old-policy refreshes are restored, does the moving reference amplify or change that drift? |
+
+The intended interpretation is A -> B -> C. The MuJoCo probe has the highest immediate relevance to the real failure state, but it is not a causal proof: a bad Q ranking on a Post-RL-generated state does not prove that PPO gradients produced the final policy. Analysis 10 is the cleaner intervention on the PPO mechanism. Analysis 11 then restores the production OPE gate and moving old-policy reference.
+
+### Live MuJoCo Critic probe
+
+The probe wraps the deterministic Post-RL policy passed to the configured `task.env_runner`. At each ACT replan it keeps Post-RL as the executed policy and evaluates the frozen Stage-1 IQL Critic on the exact same observation for:
+
+- deterministic Base-ACT chunk;
+- deterministic Post-RL chunk;
+- a physical hold chunk made by repeating the current joint/gripper state after converting state normalization to action normalization;
+- left-PostRL/right-Base and left-Base/right-PostRL hybrid chunks.
+
+It logs `V(s)`, `Q(s,a)`, `A=Q-V`, action disagreement, and the highest-Q counterfactual to `live_critic_probe.csv`. The important comparison is action ranking at one fixed state, especially `Q(hold)-Q(base)` and `Q(postrl)-Q(base)`; absolute low/high Q by itself does not establish terminal confusion.
+
+Example:
+
+```bash
+python post_training/tests/analysis/analysis_mujoco_critic_probe.py \
+  --stage1-dir /path/to/stage1_or_postrl_run \
+  --postrl-checkpoint /path/to/best_ope \
+  --config /path/to/resolved_config.yaml \
+  --eval-times 1 \
+  --output-dir post_training/outputs/mujoco_critic_probe
+```
+
+The resolved config must contain the MuJoCo `task.env_runner` used by normal evaluation. The wrapper expects that runner to call the standard ACT deterministic policy API with the normalized LeRobot observation dictionary. If the runner bypasses that call site, the script fails instead of silently producing an invalid probe.
+
+### Analysis 10: multi-step fixed-old PPO accumulation
+
+Analysis 10 starts from the Base stochastic ACT and loads the trained Stage-1 Critic. It builds the production PPO object and production finetune DataLoader, copies Base ACT into `old_policy` once, and deliberately never refreshes it again. It then calls the real production `update_distribution()` repeatedly, including the configured optimizer, clipping, LR/clip schedule, stochastic old-policy sampling, normalized IQL advantage, and shared ACT decoder/action-head parameter coupling.
+
+Fixed offline probe states are evaluated at step 0 and during accumulation. Metrics include current-vs-Base action drift, alignment with the final observed Post-RL drift, alignment with the same-episode terminal chunk, current-vs-hold distance, Q/V/A on the probe states, trainable-parameter drift, log-std, LR, PPO ratio/KL/clip diagnostics, and a verification that the fixed old policy remains at Base.
+
+Example:
+
+```bash
+python post_training/tests/analysis/analysis_10_multi_step_fixed_old.py \
+  --stage1-dir /path/to/stage1_or_postrl_run \
+  --postrl-checkpoint /path/to/best_ope \
+  --latent-cache-dir /path/to/frozen_latent_cache \
+  --steps 1000 \
+  --probe-every 50 \
+  --output-dir post_training/outputs/analysis_10_multi_step_fixed_old
+```
+
+Use the resolved historical config through `--config` when the stage directory is not sufficient to recover the exact run contract. The diagnostic redirects PPO artifact paths to its own output directory and does not overwrite production checkpoints.
+
+### Analysis 11: production PPO + OPE old-policy replay
+
+Analysis 11 starts from the same Base ACT and fixed Stage-1 artifacts, but restores the trained transition model and the production Stage-2 control loop. It performs the initial Dynamics OPE before the first update, runs real PPO updates, applies EMA updates, repeats OPE at the configured `unio4.eval_step`, and calls `set_old_policy()` only when the production condition `current_mean_q > best_mean_q` accepts the new reference.
+
+The key outputs are `ope_gate.csv`, `probe_checkpoints.csv`, and the same phase/group probe table used by Analysis 10. A useful comparison is:
+
+- Analysis 10 drifts and Analysis 11 drifts similarly: fixed-Critic PPO accumulation is already sufficient;
+- Analysis 10 stays close to Base but Analysis 11 drifts after accepted OPE refreshes: moving-reference/OPE ratcheting is implicated;
+- neither reproduces the observed final drift: the investigated offline training mechanism is insufficient, and the diagnosis should return to live-state/deployment differences rather than forcing a PPO explanation.
+
+Example:
+
+```bash
+python post_training/tests/analysis/analysis_11_production_ppo_replay.py \
+  --stage1-dir /path/to/stage1_or_postrl_run \
+  --postrl-checkpoint /path/to/best_ope \
+  --latent-cache-dir /path/to/frozen_latent_cache \
+  --steps 1000 \
+  --probe-every 50 \
+  --output-dir post_training/outputs/analysis_11_production_ppo_replay
+```
+
+Omit `--steps` for the full configured `bppo_steps` replay. Omit `--ope-every` to use the production `unio4.eval_step` cadence.
+
 ## Rollout diagnostics
 
 | Order | Script | Purpose |
