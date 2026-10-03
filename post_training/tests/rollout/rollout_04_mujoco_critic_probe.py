@@ -150,6 +150,7 @@ class CriticProbePolicy:
             "left_base_right_rl": [],
         }
         self._episode_results = []
+        self._probe_rows = []
 
     def eval(self):
         self.base_policy.eval()
@@ -316,6 +317,7 @@ class CriticProbePolicy:
                 self._writer.writeheader()
             self._writer.writerow(row)
             self._file.flush()
+            self._probe_rows.append(row)
 
             for name, chunk in (
                 ("base", base_chunk),
@@ -371,9 +373,71 @@ class CriticProbePolicy:
                 )
                 writer.writeheader()
                 writer.writerows(self._episode_results)
+        probe_summary_path = self.csv_path.parent / "critic_probe_summary.json"
+        if self._probe_rows:
+            metric_keys = (
+                "q_postrl_minus_base",
+                "q_hold_minus_base",
+                "q_left_rl_right_base_minus_base",
+                "q_left_base_right_rl_minus_base",
+                "postrl_to_base_rmse",
+                "postrl_to_hold_rmse",
+                "base_to_hold_rmse",
+                "postrl_chunk_step_rmse",
+                "executed_step_delta_l2",
+                "executed_to_fresh_control_l2",
+            )
+
+            def summarize(rows):
+                summary = {"count": int(len(rows))}
+                for key in metric_keys:
+                    values = np.asarray(
+                        [float(row[key]) for row in rows], dtype=np.float64
+                    )
+                    values = values[np.isfinite(values)]
+                    summary[f"{key}_mean"] = (
+                        float(values.mean()) if values.size else None
+                    )
+                    summary[f"{key}_median"] = (
+                        float(np.median(values)) if values.size else None
+                    )
+                summary["hold_over_base_fraction"] = float(
+                    np.mean(
+                        [row["critic_prefers_hold_over_base"] for row in rows]
+                    )
+                )
+                summary["postrl_over_base_fraction"] = float(
+                    np.mean(
+                        [row["critic_prefers_postrl_over_base"] for row in rows]
+                    )
+                )
+                return summary
+
+            before = [
+                row for row in self._probe_rows
+                if not row["after_partial_completion"]
+            ]
+            after = [
+                row for row in self._probe_rows
+                if row["after_partial_completion"]
+            ]
+            probe_summary = {
+                "all": summarize(self._probe_rows),
+                "before_partial_completion": summarize(before) if before else None,
+                "after_partial_completion": summarize(after) if after else None,
+                "interpretation_note": (
+                    "Same-state Q ranking is diagnostic only. Q(hold)>Q(Base) on "
+                    "live states does not by itself prove PPO training caused the "
+                    "deployed hold fixed point."
+                ),
+            }
+            with probe_summary_path.open("w") as file:
+                json.dump(probe_summary, file, indent=2, allow_nan=False)
+
         print(f"Critic probe CSV: {self.csv_path}")
         print(f"Fresh counterfactual chunks: {self.chunk_path}")
         print(f"Episode summary: {summary_path}")
+        print(f"Critic probe aggregate summary: {probe_summary_path}")
 
 
 def _build_critic_workspace(
