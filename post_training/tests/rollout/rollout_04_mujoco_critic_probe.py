@@ -311,6 +311,10 @@ def _build_critic_workspace(
     cfg.use_wandb = False
     cfg.eval = False
     cfg.training.debug = False
+    # Live probe has normalized RGB/state, not a dataset latent cache. Build the
+    # ordinary IQLCritic; CachedIQLCritic has the same learned Q/V parameters.
+    cfg.dataset.use_latent_cache = False
+    cfg.dataset.endpoint_obs_only = False
     cfg.critic.load_pretrain = True
     cfg.critic.artifact_dir = str(stage1_dir / "critic")
 
