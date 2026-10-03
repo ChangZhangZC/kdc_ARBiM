@@ -68,6 +68,10 @@ def _old_reference_rows(exp: dict, step: int) -> list[dict]:
         idx = torch.as_tensor(indices, dtype=torch.long)
         for group, slc in ACTION_GROUPS.items():
             base_to_old = (old_action - exp["base_action"]).index_select(0, idx)[..., slc]
+            base_to_current = (current_action - exp["base_action"]).index_select(0, idx)[..., slc]
+            base_to_terminal = (
+                exp["terminal_action"] - exp["base_action"]
+            ).index_select(0, idx)[..., slc]
             old_to_current = (current_action - old_action).index_select(0, idx)[..., slc]
             rows.append({
                 "step": int(step),
@@ -76,11 +80,40 @@ def _old_reference_rows(exp: dict, step: int) -> list[dict]:
                 "group": group,
                 "count": int(len(indices)),
                 "base_to_old_rmse": float(torch.sqrt(base_to_old.square().mean()).item()),
+                "base_to_current_rmse": float(
+                    torch.sqrt(base_to_current.square().mean()).item()
+                ),
                 "old_to_current_rmse": float(torch.sqrt(old_to_current.square().mean()).item()),
+                "cos_base_old_to_terminal": _mean_finite(
+                    (
+                        torch.nn.functional.cosine_similarity(
+                            base_to_old.reshape(base_to_old.shape[0], -1),
+                            base_to_terminal.reshape(base_to_terminal.shape[0], -1),
+                            dim=-1,
+                            eps=1e-12,
+                        )
+                    ).numpy()
+                ),
+                "cos_base_current_to_terminal": _mean_finite(
+                    (
+                        torch.nn.functional.cosine_similarity(
+                            base_to_current.reshape(base_to_current.shape[0], -1),
+                            base_to_terminal.reshape(base_to_terminal.shape[0], -1),
+                            dim=-1,
+                            eps=1e-12,
+                        )
+                    ).numpy()
+                ),
                 "v_mean": _mean_finite(qva["v"][indices]),
                 "q_base_mean": _mean_finite(qva["q_base"][indices]),
                 "q_old_mean": _mean_finite(qva["q_old"][indices]),
                 "q_current_mean": _mean_finite(qva["q_current"][indices]),
+                "q_old_minus_base_mean": _mean_finite(
+                    qva["q_old"][indices] - qva["q_base"][indices]
+                ),
+                "q_current_minus_base_mean": _mean_finite(
+                    qva["q_current"][indices] - qva["q_base"][indices]
+                ),
                 "a_base_mean": _mean_finite(qva["a_base"][indices]),
                 "a_old_mean": _mean_finite(qva["a_old"][indices]),
                 "a_current_mean": _mean_finite(qva["a_current"][indices]),
@@ -245,6 +278,20 @@ def main() -> None:
         "old_policy_refresh_count": refresh_count,
         "initial_ope_mean_q": float(ope_rows[0]["current_mean_q"]),
         "final_best_ope_mean_q": float(best_mean_q),
+        "metric_contract": {
+            "base_to_old_rmse": (
+                "cumulative drift of the moving PPO reference away from immutable Base ACT"
+            ),
+            "old_to_current_rmse": (
+                "local drift of current policy away from the latest accepted PPO reference"
+            ),
+            "cos_base_old_to_terminal": (
+                "terminal-ward alignment already ratcheted into the moving old policy"
+            ),
+            "cos_base_current_to_terminal": (
+                "terminal-ward alignment of the current policy relative to Base ACT"
+            ),
+        },
         "contract": (
             "Uses production batch ordering including initial OPE, production PPO "
             "update_distribution, EMA stepping, dynamics OPE cadence, and the exact "
