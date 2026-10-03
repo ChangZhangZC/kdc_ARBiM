@@ -16,9 +16,23 @@ jpeg_quality: 95
 lerobot_root: /path/to/lerobot_dataset
 processed_npy_output: /path/to/processed/teleop.npy
 
-max_episode_len: 2000  # episode 长度归一化参考值
-lambda_penalty: 0.05   # episode length penalty 系数
-smooth_penalty: 0.01   # action smoothness penalty 系数
+# Reward V2: keep the full recorded episode, but place the only +1 reward at the
+# later of the two action-gripper release events. done/timeout still remain at
+# the original recording end. This mode intentionally disables length/smooth
+# shaping so every other frame has reward 0.
+reward_mode: last_gripper_release_sparse  # option: episode_end_shaped / last_gripper_release_sparse
+reward_left_gripper_index: 7
+reward_right_gripper_index: 15
+reward_left_open_side: auto   # option: auto / low / high
+reward_right_open_side: auto  # option: auto / low / high
+reward_open_infer_frames: 5
+reward_min_dwell: 3
+reward_expected_cycles: 1
+
+# Only used by legacy reward_mode=episode_end_shaped.
+max_episode_len: 2000
+lambda_penalty: 0.05
+smooth_penalty: 0.01
 
 # build_db: one or more processed .npy -> Offline RL Zarr
 overwrite: true
