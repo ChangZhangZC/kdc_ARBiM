@@ -44,6 +44,8 @@ The smoke numbering follows the Post-RL data/training/export chain.
 | 07 | `analysis/analysis_07_ppo_gradient_alignment.py` | estimate the Gaussian PPO score-function mean gradient and compare it with terminal direction and observed IL-to-Post-RL action drift | current; first-order action-mean diagnostic only, no training updates |
 | 08 | `analysis/analysis_08_one_step_ppo_replay.py` | replay one production Offline PPO optimizer step from Base ACT and measure the resulting deterministic ACT output drift on fixed probe states | current; mutates only an in-memory PPO clone and never overwrites training artifacts |
 | 09 | `analysis/analysis_09_multi_batch_one_step.py` | repeat independent one-step PPO replays from the same Base ACT over many shuffled finetune batches/seeds and estimate the expected deterministic action drift | current; isolates batch/sample variance before studying multi-step accumulation |
+| 10 | `analysis/analysis_10_multistep_fixed_old.py` | run many production PPO updates while freezing the PPO old/reference policy at Base ACT and measure cumulative ACT/QVA/parameter drift | current; causal isolation of repeated PPO accumulation without OPE refresh |
+| 11 | `analysis/analysis_11_ope_refresh_replay.py` | restore pretrained dynamics OPE and the production old-policy refresh rule on top of the multi-step replay | current; tests moving-reference/OPE ratcheting |
 
 ### Analysis 00: Dataset episode integrity
 
@@ -116,6 +118,49 @@ Two summaries are intentionally separated. First, every repeat gets its own phas
 
 The output also reports an expected-drift signal-to-repeat-noise ratio: the RMSE magnitude of the across-repeat mean drift divided by the RMS standard deviation across repeats for the same action group. A stable positive terminal alignment with useful SNR would support a systematic first-step mechanism. Near-zero expected drift or low sign consistency would indicate that the Analysis 08 direction was dominated by batch/sample variance and that later debugging should focus on multi-step accumulation, optimizer state, clipping, or old-policy refresh dynamics instead.
 
+
+### Analysis 10: multi-step PPO with fixed Base reference
+
+Analysis 10 starts from the Base stochastic ACT, loads the trained Stage-1 Critic, and then calls the production `update_distribution()` repeatedly on production finetune batches. The PPO `old_policy` is copied once before step 1 and is never refreshed. The script fails immediately if its old-policy version changes.
+
+This isolates the question: can repeated Critic-guided PPO updates alone accumulate a local Base-to-PostRL drift even when the reference policy is fixed? Every probe snapshot evaluates the same cached observations and records deterministic action drift by phase and arm/gripper group, Q/V/A for Base/current/final-PostRL/terminal-template chunks, and parameter drift for decoder/action-head/log-std groups. PPO monitoring also records ratio, approximate KL, clip fraction, pre-normalization advantage statistics, gradient norm, LR, and clip ratio.
+
+Example:
+
+```bash
+python post_training/tests/analysis/analysis_10_multistep_fixed_old.py \
+  --stage1-dir <STAGE1_DIR> \
+  --postrl-checkpoint <POSTRL_CHECKPOINT> \
+  --latent-cache-dir /home/kuavo/changzhang/kdc_ARBiM/data/sim_task1.zarr.act_latent_cache/a157c6c607a37064_48467ef7599ab9b6 \
+  --checkpoint /home/kuavo/changzhang/kdc_ARBiM/outputs/train/sim_toy_pick/act/run_20260912_202758/epoch120 \
+  --dataset /home/kuavo/changzhang/kdc_ARBiM/data/sim_task1.zarr \
+  --steps 1000 \
+  --probe-every 50
+```
+
+Primary outputs: `update_metrics.csv`, `snapshot_phase_group.csv`, `parameter_drift.csv`, and `summary.json`.
+
+### Analysis 11: production OPE / old-policy refresh replay
+
+Analysis 11 uses the same fixed probes and production PPO update as Analysis 10, but also loads the Stage-1 transition model and restores the actual Stage-2 OPE gate: an initial dynamics OPE is run before step 1; thereafter OPE runs at `unio4.eval_step`, and `old_policy` is refreshed only when `current_mean_q > best_mean_q` and `is_update_old_policy=true`. EMA stepping is also preserved. Environment evaluation/checkpoint selection is intentionally omitted because it does not determine the PPO old-policy refresh.
+
+The key comparison is Analysis 10 versus 11. If fixed-reference PPO remains near Base but Analysis 11 drifts strongly after repeated OPE accepts, that supports a moving-reference ratchet mechanism. If both drift similarly, the main mechanism is repeated PPO itself rather than OPE refresh.
+
+Example:
+
+```bash
+python post_training/tests/analysis/analysis_11_ope_refresh_replay.py \
+  --stage1-dir <STAGE1_DIR> \
+  --postrl-checkpoint <POSTRL_CHECKPOINT> \
+  --latent-cache-dir /home/kuavo/changzhang/kdc_ARBiM/data/sim_task1.zarr.act_latent_cache/a157c6c607a37064_48467ef7599ab9b6 \
+  --checkpoint /home/kuavo/changzhang/kdc_ARBiM/outputs/train/sim_toy_pick/act/run_20260912_202758/epoch120 \
+  --dataset /home/kuavo/changzhang/kdc_ARBiM/data/sim_task1.zarr \
+  --steps 1000 \
+  --probe-every 50
+```
+
+Primary outputs additionally include `ope_events.csv` and `old_reference_phase_group.csv`.
+
 ## Rollout diagnostics
 
 | Order | Script | Purpose |
@@ -123,6 +168,7 @@ The output also reports an expected-drift signal-to-repeat-noise ratio: the RMSE
 | 01 | `rollout/rollout_01_shadow_policy_compare.py` | IL controls the simulator for the whole episode; Post-RL is shadow-only on the exact same observations. Measures whether PPO action output drifts on an IL-generated trajectory. No control switch is allowed. |
 | 02 | `rollout/rollout_02_switch_policy_compare.py` | Post-RL controls first while IL runs in shadow, then control switches once from Post-RL to IL either at a fixed step or after fixed-point detection. Tests whether the state is still recoverable by IL. |
 | 03 | `rollout/rollout_03_latent_ood.py` | Scores each live rollout observation against the already-built demonstration ACT latent cache. Uses the V1 critic representation: ACT encoder tokens followed by mean-token readout, then standardized kNN distance calibrated on held-out demonstration latents. |
+| 04 | `rollout/rollout_04_mujoco_critic_probe.py` | Runs Base or Post-RL control in MuJoCo and, on the same live observation, scores fresh Base/Post-RL/hold and left/right hybrid full action chunks with the trained Stage-1 IQL Critic. |
 
 ### Rollout 01: IL trajectory / Post-RL shadow
 
@@ -151,6 +197,36 @@ executed_step_delta_l2
 `latent_demo_percentile` is a rank relative to held-out demonstration samples, not an OOD probability. A value near 99 means the live observation is farther from the demonstration reference than about 99% of held-out demonstration observations under this representation/metric.
 
 The cache contract is checked before rollout: the live ACT encoder fingerprint must exactly match the `encoder_sha256` stored in the cache metadata. This is important because the distance is only meaningful when rollout and demonstration latents share the same frozen coordinate system.
+
+
+### Rollout 04: live MuJoCo Critic counterfactual probe
+
+This is the direct live-state diagnostic for the freeze hypothesis. The simulator can be controlled by either Base ACT or the exported deterministic Post-RL ACT. At each probe step, both policies are freshly replanned on the exact same already-preprocessed observation. The Stage-1 Critic scores five complete normalized ACT chunks using the training-time chunk contract:
+
+- fresh Base ACT chunk;
+- fresh Post-RL ACT chunk;
+- hold chunk formed by repeating the current physical joint/gripper state after mapping it into action-normalized coordinates;
+- Post-RL left arm + Base right arm;
+- Base left arm + Post-RL right arm.
+
+The script records `V(s)`, every `Q(s,a)`, `A=Q-V`, Q differences against Base, Base/Post-RL/hold chunk distances, and left/right-specific drift. The Critic is deliberately evaluated on a fresh full `[H,D]` action chunk, not only the queued single action executed that simulator step, because that is the Stage-2 Q/PPO contract. Absolute Q on a live OOD state should not be over-interpreted; the primary quantity is same-state ranking such as `Q(hold)-Q(Base)`.
+
+Run Post-RL control first:
+
+```bash
+python post_training/tests/rollout/rollout_04_mujoco_critic_probe.py \
+  --config <SIM_EVAL_YAML> \
+  --stage1-dir <STAGE1_DIR> \
+  --postrl-checkpoint <EXPORTED_POSTRL_ACT> \
+  --checkpoint /home/kuavo/changzhang/kdc_ARBiM/outputs/train/sim_toy_pick/act/run_20260912_202758/epoch120 \
+  --control-policy postrl \
+  --episodes 1 \
+  --probe-every 1
+```
+
+For a matched successful Base trajectory, repeat with `--control-policy base`. If the single-hand-completion frame is known from video/logs, `--partial-completion-step N` marks all later rows without changing control or Critic computation.
+
+Primary outputs are `critic_probe_steps.csv`, `counterfactual_chunks.npz`, `episode_summary.csv`, and `run_meta.json`.
 
 ## V1 alignment notes
 
