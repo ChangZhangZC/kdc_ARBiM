@@ -226,7 +226,7 @@ python post_training/tests/rollout/rollout_04_mujoco_critic_probe.py \
 
 For a matched successful Base trajectory, repeat with `--control-policy base`. If the single-hand-completion frame is known from video/logs, `--partial-completion-step N` marks all later rows without changing control or Critic computation.
 
-Primary outputs are `critic_probe_steps.csv`, `counterfactual_chunks.npz`, `episode_summary.csv`, and `run_meta.json`.
+Primary outputs are `critic_probe_steps.csv`, `counterfactual_chunks.npz`, `episode_summary.csv`, `critic_probe_summary.json`, and `run_meta.json`. When `--partial-completion-step` is supplied, the JSON summary separately aggregates same-state Critic ranking before and after that point.
 
 ## V1 alignment notes
 
