@@ -119,6 +119,27 @@ Two summaries are intentionally separated. First, every repeat gets its own phas
 The output also reports an expected-drift signal-to-repeat-noise ratio: the RMSE magnitude of the across-repeat mean drift divided by the RMS standard deviation across repeats for the same action group. A stable positive terminal alignment with useful SNR would support a systematic first-step mechanism. Near-zero expected drift or low sign consistency would indicate that the Analysis 08 direction was dominated by batch/sample variance and that later debugging should focus on multi-step accumulation, optimizer state, clipping, or old-policy refresh dynamics instead.
 
 
+### Analysis 12: terminal-tail reward / phase-aliasing probe
+
+Analysis 12 is a targeted test for the hypothesis that the sparse terminal reward is attached after a long post-release hold tail, causing the Stage-1 Critic to associate hold/terminal-like action chunks with high value and then mis-rank the same pattern at a partial-completion state.
+
+It reuses the already-validated release offsets from Analysis 00 and separates two questions. First, the data-geometry audit measures where the only rewarded final H-step chunk starts relative to the true last release, how much of that chunk is post-release hold, and whether that exact terminal window was actually sampled by the configured Critic stride. Second, the Critic probe aligns states to three events: the first gripper release (partial completion), the last release (true bimanual completion), and the start of the final H-step terminal chunk. At each aligned state it compares same-state Q/V for Base ACT continuation, demonstrated continuation when a complete H-step window still exists, an explicit hold chunk formed from the current robot state, and the same-episode terminal action template.
+
+The strongest support for terminal-tail aliasing is not merely high V near the end. It is: (1) a hold-dominated rewarded terminal chunk, and (2) at the **first-release partial-completion state**, Q(hold) or Q(terminal-template) exceeding Q(Base/demo continuation). If the Critic still prefers Base/demo continuation at first release, the specific terminal-tail mis-ranking hypothesis is weakened even if terminal Q/V is high.
+
+Example:
+
+```bash
+python post_training/tests/analysis/analysis_12_terminal_tail_aliasing.py \
+  --stage1-dir <STAGE1_DIR> \
+  --integrity-dir /home/kuavo/changzhang/kdc_ARBiM/post_training/outputs/dataset_episode_integrity_sim_task1 \
+  --latent-cache-dir /home/kuavo/changzhang/kdc_ARBiM/data/sim_task1.zarr.act_latent_cache/a157c6c607a37064_48467ef7599ab9b6 \
+  --checkpoint /home/kuavo/changzhang/kdc_ARBiM/outputs/train/sim_toy_pick/act/run_20260912_202758/epoch120 \
+  --dataset /home/kuavo/changzhang/kdc_ARBiM/data/sim_task1.zarr
+```
+
+Primary outputs are `terminal_tail_geometry.csv`, `critic_event_probe.csv`, `critic_event_summary.csv`, and `summary.json`.
+
 ### Analysis 10: multi-step PPO with fixed Base reference
 
 Analysis 10 starts from the Base stochastic ACT, loads the trained Stage-1 Critic, and then calls the production `update_distribution()` repeatedly on production finetune batches. The PPO `old_policy` is copied once before step 1 and is never refreshed. The script fails immediately if its old-policy version changes.
