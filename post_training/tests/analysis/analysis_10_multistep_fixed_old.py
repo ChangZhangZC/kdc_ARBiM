@@ -346,6 +346,7 @@ def _prepare_experiment(args, *, need_dynamics: bool = False):
         "postrl_checkpoint": postrl_checkpoint,
         "postrl_kind": postrl_kind,
         "processor_fingerprint": base_fp,
+        "output_dir": output_dir,
         "anchors": anchors,
         "anchor_episode_ids": anchor_episode_ids,
         "anchor_starts": anchor_starts,
@@ -476,9 +477,10 @@ def main() -> None:
                 f"loss={loss:+.6f} old_version={workspace.unio4._old_policy_version}"
             )
 
-    _write_csv(pathlib.Path(args.output_dir) / "update_metrics.csv", update_rows)
-    _write_csv(pathlib.Path(args.output_dir) / "snapshot_phase_group.csv", snapshot_rows)
-    _write_csv(pathlib.Path(args.output_dir) / "parameter_drift.csv", parameter_rows)
+    output_dir = exp["output_dir"]
+    _write_csv(output_dir / "update_metrics.csv", update_rows)
+    _write_csv(output_dir / "snapshot_phase_group.csv", snapshot_rows)
+    _write_csv(output_dir / "parameter_drift.csv", parameter_rows)
 
     summary = {
         "analysis": "10_multistep_fixed_old",
@@ -501,13 +503,13 @@ def main() -> None:
             "the production Offline-PPO implementation."
         ),
     }
-    with (pathlib.Path(args.output_dir) / "summary.json").open("w") as file:
+    with (output_dir / "summary.json").open("w") as file:
         json.dump(summary, file, indent=2)
 
     print("\n=== Analysis 10 complete ===")
     print(f"steps={args.steps}, fixed old-policy version={old_version}")
     print(f"probe anchors={len(exp['anchors'])}")
-    print(f"saved to: {pathlib.Path(args.output_dir).resolve()}")
+    print(f"saved to: {output_dir}")
 
 
 if __name__ == "__main__":
