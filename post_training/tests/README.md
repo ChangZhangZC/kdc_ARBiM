@@ -119,6 +119,35 @@ Two summaries are intentionally separated. First, every repeat gets its own phas
 The output also reports an expected-drift signal-to-repeat-noise ratio: the RMSE magnitude of the across-repeat mean drift divided by the RMS standard deviation across repeats for the same action group. A stable positive terminal alignment with useful SNR would support a systematic first-step mechanism. Near-zero expected drift or low sign consistency would indicate that the Analysis 08 direction was dominated by batch/sample variance and that later debugging should focus on multi-step accumulation, optimizer state, clipping, or old-policy refresh dynamics instead.
 
 
+### Analysis 13: Base-to-terminal interpolation and policy-support probe
+
+Analysis 13 follows Analysis 12 after a terminal-like action chunk is found to receive higher Critic value at the first-release partial-completion state. It tests whether that high-Q region is **locally reachable from the Base ACT policy**, rather than only existing at a distant counterfactual endpoint.
+
+For each valid episode, the script aligns to the first gripper release, re-infers the Base ACT mean chunk from the cached ACT latent, takes the same-episode final H-step terminal chunk, and constructs
+
+```text
+a(alpha) = a_base + alpha * (a_terminal - a_base)
+```
+
+with default `alpha = 0, .02, .05, .10, .20, .40, .60, .80, 1.0`. It measures Stage-1 Critic Q/A, Double-Q disagreement, and Base stochastic-policy support for every interpolated chunk. Policy support is reported as per-element RMS sigma distance, full-chunk Mahalanobis-like L2 sigma distance, maximum absolute sigma distance, and the summed Gaussian log-prob drop relative to the Base mean. The summed log-prob follows the same full action-chunk event dimensions used by scalar chunk PPO.
+
+The same test also decomposes the terminal target into bimanual counterfactual directions: completed arm, remaining arm, completed/remaining joints, and completed/remaining gripper. This helps determine whether the terminal Q preference is driven by the arm that has already completed its subtask or by the arm that should still continue.
+
+Example:
+
+```bash
+python post_training/tests/analysis/analysis_13_terminal_direction_interpolation.py \
+  --stage1-dir /home/kuavo/changzhang/kdc_ARBiM/post_training/outputs/sim_task1_postrl_ppo8k_bs256_stride1_20260915_010436/stage1 \
+  --integrity-dir /home/kuavo/changzhang/kdc_ARBiM/post_training/outputs/dataset_episode_integrity_sim_task1 \
+  --latent-cache-dir /home/kuavo/changzhang/kdc_ARBiM/data/sim_task1.zarr.act_latent_cache/a157c6c607a37064_48467ef7599ab9b6 \
+  --checkpoint /home/kuavo/changzhang/kdc_ARBiM/outputs/train/sim_toy_pick/act/run_20260912_202758/epoch120 \
+  --dataset /home/kuavo/changzhang/kdc_ARBiM/data/sim_task1.zarr
+```
+
+Primary outputs are `interpolation_per_episode.csv`, `interpolation_summary.csv`, `terminal_hybrid_side_summary.csv`, and `summary.json`.
+
+Interpretation: the Critic-to-PPO mechanism is more plausible if Q rises above Base already at small alpha while those actions remain relatively close under the Base Gaussian policy. If Q only rises near alpha=1 and the log-prob drop is extremely large, the terminal endpoint may be a distant Critic extrapolation that the initial PPO policy rarely samples.
+
 ### Analysis 12: terminal-tail reward / phase-aliasing probe
 
 Analysis 12 is a targeted test for the hypothesis that the sparse terminal reward is attached after a long post-release hold tail, causing the Stage-1 Critic to associate hold/terminal-like action chunks with high value and then mis-rank the same pattern at a partial-completion state.
