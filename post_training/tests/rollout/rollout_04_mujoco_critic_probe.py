@@ -40,16 +40,34 @@ def _stat_tensor(stats: dict, feature: str, name: str, ref: torch.Tensor) -> tor
     )
 
 
-def _hold_chunk_from_normalized_obs(
+def _physical_state_from_normalized_obs(
     observation: dict,
     stats: dict,
-    horizon: int,
 ) -> torch.Tensor:
     state = observation["observation.state"].float()
     if state.ndim != 2:
         raise RuntimeError(f"Expected processed state [B,D], got {tuple(state.shape)}")
     state_mean = _stat_tensor(stats, "observation.state", "mean", state)
     state_std = _stat_tensor(stats, "observation.state", "std", state)
+    return state * state_std + state_mean
+
+
+def _physical_action_from_normalized(
+    action: torch.Tensor,
+    stats: dict,
+) -> torch.Tensor:
+    action_mean = _stat_tensor(stats, "action", "mean", action)
+    action_std = _stat_tensor(stats, "action", "std", action)
+    return action * action_std + action_mean
+
+
+def _hold_chunk_from_normalized_obs(
+    observation: dict,
+    stats: dict,
+    horizon: int,
+) -> torch.Tensor:
+    state = observation["observation.state"].float()
+    physical_state = _physical_state_from_normalized_obs(observation, stats)
     action_mean = _stat_tensor(stats, "action", "mean", state)
     action_std = _stat_tensor(stats, "action", "std", state)
     if state.shape[-1] != action_mean.numel():
@@ -57,7 +75,6 @@ def _hold_chunk_from_normalized_obs(
             f"Hold counterfactual requires state/action dims to match, got "
             f"{state.shape[-1]} and {action_mean.numel()}"
         )
-    physical_state = state * state_std + state_mean
     normalized_hold = (physical_state - action_mean) / (action_std + 1e-8)
     return normalized_hold.unsqueeze(1).expand(-1, horizon, -1).clone()
 
@@ -75,6 +92,13 @@ def _critic_values(critic, state: torch.Tensor, actions: dict[str, torch.Tensor]
 
 def _chunk_rmse(a: torch.Tensor, b: torch.Tensor, slc: slice = slice(None)) -> float:
     d = a[..., slc] - b[..., slc]
+    return float(torch.sqrt(d.square().mean()).item())
+
+
+def _chunk_step_rmse(chunk: torch.Tensor, slc: slice = slice(None)) -> float:
+    if chunk.shape[1] < 2:
+        return 0.0
+    d = chunk[:, 1:, slc] - chunk[:, :-1, slc]
     return float(torch.sqrt(d.square().mean()).item())
 
 
@@ -156,6 +180,18 @@ class CriticProbePolicy:
             self.postrl_policy if self.control_policy == "postrl" else self.base_policy
         )
 
+        # This is the action actually returned to the deployment loop. It can come
+        # from ACT's execution queue, so keep it separate from the fresh full chunks
+        # used for the Critic counterfactual.
+        action = control.select_action(observation)
+        executed_norm_t = action[0].detach().float()
+        executed_norm = executed_norm_t.cpu().numpy()
+        executed_step_delta = (
+            float("nan")
+            if self._prev_executed_norm is None
+            else float(np.linalg.norm(executed_norm - self._prev_executed_norm))
+        )
+
         if self._step % self.probe_every == 0:
             base_chunk = self.base_policy.predict_action_chunk(observation)
             postrl_chunk = self.postrl_policy.predict_action_chunk(observation)
@@ -193,13 +229,34 @@ class CriticProbePolicy:
                     "left_base_right_rl": left_base_right_rl,
                 },
             )
+
+            state_norm_t = observation["observation.state"][0].detach().float()
+            state_phys_t = _physical_state_from_normalized_obs(
+                observation, self.stats
+            )[0].detach().float()
+            executed_phys_t = _physical_action_from_normalized(
+                executed_norm_t, self.stats
+            ).detach().float()
+            fresh_control_chunk = (
+                postrl_chunk if self.control_policy == "postrl" else base_chunk
+            )
+            fresh_control_first = fresh_control_chunk[0, 0].detach().float()
+            executed_to_fresh = float(
+                torch.linalg.vector_norm(executed_norm_t - fresh_control_first).item()
+            )
+
             row = {
                 "episode": int(self._episode),
                 "step": int(self._step),
                 "control_policy": self.control_policy,
                 "after_partial_completion": (
-                    int(self.partial_completion_step is not None and self._step >= self.partial_completion_step)
+                    int(
+                        self.partial_completion_step is not None
+                        and self._step >= self.partial_completion_step
+                    )
                 ),
+                "executed_step_delta_l2": executed_step_delta,
+                "executed_to_fresh_control_l2": executed_to_fresh,
                 **values,
                 "q_postrl_minus_base": values["q_postrl"] - values["q_base"],
                 "q_hold_minus_base": values["q_hold"] - values["q_base"],
@@ -209,16 +266,51 @@ class CriticProbePolicy:
                 "q_left_base_right_rl_minus_base": (
                     values["q_left_base_right_rl"] - values["q_base"]
                 ),
-                "critic_prefers_hold_over_base": int(values["q_hold"] > values["q_base"]),
-                "critic_prefers_postrl_over_base": int(values["q_postrl"] > values["q_base"]),
+                "critic_prefers_hold_over_base": int(
+                    values["q_hold"] > values["q_base"]
+                ),
+                "critic_prefers_postrl_over_base": int(
+                    values["q_postrl"] > values["q_base"]
+                ),
                 "postrl_to_base_rmse": _chunk_rmse(postrl_chunk, base_chunk),
                 "postrl_to_hold_rmse": _chunk_rmse(postrl_chunk, hold_chunk),
                 "base_to_hold_rmse": _chunk_rmse(base_chunk, hold_chunk),
-                "left_postrl_to_base_rmse": _chunk_rmse(postrl_chunk, base_chunk, slice(0, 8)),
-                "right_postrl_to_base_rmse": _chunk_rmse(postrl_chunk, base_chunk, slice(8, 16)),
-                "left_postrl_to_hold_rmse": _chunk_rmse(postrl_chunk, hold_chunk, slice(0, 8)),
-                "right_postrl_to_hold_rmse": _chunk_rmse(postrl_chunk, hold_chunk, slice(8, 16)),
+                "base_chunk_step_rmse": _chunk_step_rmse(base_chunk),
+                "postrl_chunk_step_rmse": _chunk_step_rmse(postrl_chunk),
+                "left_postrl_to_base_rmse": _chunk_rmse(
+                    postrl_chunk, base_chunk, slice(0, 8)
+                ),
+                "right_postrl_to_base_rmse": _chunk_rmse(
+                    postrl_chunk, base_chunk, slice(8, 16)
+                ),
+                "left_postrl_to_hold_rmse": _chunk_rmse(
+                    postrl_chunk, hold_chunk, slice(0, 8)
+                ),
+                "right_postrl_to_hold_rmse": _chunk_rmse(
+                    postrl_chunk, hold_chunk, slice(8, 16)
+                ),
+                "left_base_chunk_step_rmse": _chunk_step_rmse(
+                    base_chunk, slice(0, 8)
+                ),
+                "right_base_chunk_step_rmse": _chunk_step_rmse(
+                    base_chunk, slice(8, 16)
+                ),
+                "left_postrl_chunk_step_rmse": _chunk_step_rmse(
+                    postrl_chunk, slice(0, 8)
+                ),
+                "right_postrl_chunk_step_rmse": _chunk_step_rmse(
+                    postrl_chunk, slice(8, 16)
+                ),
             }
+            for index, value in enumerate(state_norm_t.cpu().tolist()):
+                row[f"state_norm_{index}"] = float(value)
+            for index, value in enumerate(state_phys_t.cpu().tolist()):
+                row[f"state_phys_{index}"] = float(value)
+            for index, value in enumerate(executed_norm_t.cpu().tolist()):
+                row[f"executed_action_norm_{index}"] = float(value)
+            for index, value in enumerate(executed_phys_t.cpu().tolist()):
+                row[f"executed_action_phys_{index}"] = float(value)
+
             if self._writer is None:
                 self._writer = csv.DictWriter(self._file, fieldnames=list(row))
                 self._writer.writeheader()
@@ -242,14 +334,11 @@ class CriticProbePolicy:
                 f"Qbase={values['q_base']:+.4f} "
                 f"Qrl={values['q_postrl']:+.4f} "
                 f"Qhold={values['q_hold']:+.4f} "
-                f"dQhold={values['q_hold'] - values['q_base']:+.4f}"
+                f"dQhold={values['q_hold'] - values['q_base']:+.4f} "
+                f"exec_delta={executed_step_delta:.6g} "
+                f"queue_to_fresh={executed_to_fresh:.6g}"
             )
 
-        action = control.select_action(observation)
-        executed_norm = action[0].detach().float().cpu().numpy()
-        if self._prev_executed_norm is not None and self._step % self.probe_every == 0:
-            delta = float(np.linalg.norm(executed_norm - self._prev_executed_norm))
-            print(f"[critic-probe] executed_step_delta_l2={delta:.6g}")
         self._prev_executed_norm = executed_norm.copy()
         self._step += 1
         self._has_steps = True
