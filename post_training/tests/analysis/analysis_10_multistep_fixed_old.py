@@ -183,6 +183,7 @@ def _snapshot_rows(
     phases = np.asarray([_phase(float(x)) for x in progress], dtype=object)
     base_to_current = current_action - base_action
     base_to_final = final_action - base_action
+    base_to_terminal = terminal_action - base_action
     rows = []
     for phase in ("early_0_25", "middle_25_50", "late_50_75", "tail_75_100", "all"):
         mask_np = np.ones(len(anchors), dtype=bool) if phase == "all" else phases == phase
@@ -193,7 +194,23 @@ def _snapshot_rows(
         for group, slc in ACTION_GROUPS.items():
             drift = base_to_current.index_select(0, idx_t)[..., slc]
             final_drift = base_to_final.index_select(0, idx_t)[..., slc]
+            terminal_drift = base_to_terminal.index_select(0, idx_t)[..., slc]
             cur_to_final = (current_action - final_action).index_select(0, idx_t)[..., slc]
+            cur_to_terminal = (current_action - terminal_action).index_select(0, idx_t)[..., slc]
+            terminal_norm = torch.linalg.vector_norm(
+                terminal_drift.reshape(terminal_drift.shape[0], -1), dim=-1
+            )
+            terminal_unit = terminal_drift.reshape(terminal_drift.shape[0], -1) / (
+                terminal_norm.unsqueeze(-1).clamp_min(1e-12)
+            )
+            current_projection_terminal = (
+                drift.reshape(drift.shape[0], -1) * terminal_unit
+            ).sum(dim=-1)
+            current_projection_terminal = torch.where(
+                terminal_norm > 1e-12,
+                current_projection_terminal,
+                torch.full_like(current_projection_terminal, float("nan")),
+            )
             rows.append({
                 "step": int(step),
                 "phase": phase,
@@ -201,14 +218,32 @@ def _snapshot_rows(
                 "count": int(len(idx)),
                 "base_to_current_rmse": float(torch.sqrt(drift.square().mean()).item()),
                 "current_to_final_rmse": float(torch.sqrt(cur_to_final.square().mean()).item()),
+                "current_to_terminal_rmse": float(
+                    torch.sqrt(cur_to_terminal.square().mean()).item()
+                ),
                 "cos_base_current_to_base_final": _mean_finite(
                     _cosine(drift, final_drift).numpy()
+                ),
+                "cos_base_current_to_terminal": _mean_finite(
+                    _cosine(drift, terminal_drift).numpy()
+                ),
+                "cos_base_final_to_terminal": _mean_finite(
+                    _cosine(final_drift, terminal_drift).numpy()
+                ),
+                "projection_base_current_onto_terminal": _mean_finite(
+                    current_projection_terminal.numpy()
                 ),
                 "v_mean": _mean_finite(qva["v"][idx]),
                 "q_base_mean": _mean_finite(qva["q_base"][idx]),
                 "q_current_mean": _mean_finite(qva["q_current"][idx]),
                 "q_final_mean": _mean_finite(qva["q_final"][idx]),
                 "q_terminal_mean": _mean_finite(qva["q_terminal"][idx]),
+                "q_current_minus_base_mean": _mean_finite(
+                    qva["q_current"][idx] - qva["q_base"][idx]
+                ),
+                "q_terminal_minus_base_mean": _mean_finite(
+                    qva["q_terminal"][idx] - qva["q_base"][idx]
+                ),
                 "a_base_mean": _mean_finite(qva["a_base"][idx]),
                 "a_current_mean": _mean_finite(qva["a_current"][idx]),
                 "a_final_mean": _mean_finite(qva["a_final"][idx]),
@@ -508,6 +543,23 @@ def main() -> None:
         "probe_anchors": int(len(exp["anchors"])),
         "fixed_old_policy_version": old_version,
         "final_old_policy_version": int(workspace.unio4._old_policy_version),
+        "metric_contract": {
+            "base_to_current_rmse": (
+                "deterministic current-policy drift from the immutable Base ACT on fixed "
+                "offline probe observations"
+            ),
+            "cos_base_current_to_terminal": (
+                "cosine between Base->current drift and Base->same-episode terminal-chunk "
+                "direction; positive means terminal-ward output drift"
+            ),
+            "projection_base_current_onto_terminal": (
+                "signed Base->current displacement along the unit terminal direction in "
+                "normalized action-chunk space"
+            ),
+            "q_current_minus_base_mean": (
+                "same-state Critic preference for current policy chunk over Base chunk"
+            ),
+        },
         "contract": (
             "Critic fixed; old/reference policy copied from Base ACT once before step 1 "
             "and never refreshed. Batches, PPO loss, clipping, optimizer, and decay use "
