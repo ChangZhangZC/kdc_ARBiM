@@ -130,27 +130,31 @@ The intended interpretation is A -> B -> C. The MuJoCo probe has the highest imm
 
 ### Live MuJoCo Critic probe
 
-The probe wraps the deterministic Post-RL policy passed to the configured `task.env_runner`. At each ACT replan it keeps Post-RL as the executed policy and evaluates the frozen Stage-1 IQL Critic on the exact same observation for:
+This probe is wired to the same Kuavo MuJoCo execution path used by the existing rollout diagnostics: `load_kuavo_config -> sim_auto_test.kuavo_eval_autotest -> policy.select_action`. The simulator remains under deterministic exported Post-RL control. At every live environment step the wrapper evaluates fresh whole ACT chunks on the exact same preprocessed observation for:
 
-- deterministic Base-ACT chunk;
-- deterministic Post-RL chunk;
+- deterministic Base ACT;
+- deterministic Post-RL ACT;
 - a physical hold chunk made by repeating the current joint/gripper state after converting state normalization to action normalization;
-- left-PostRL/right-Base and left-Base/right-PostRL hybrid chunks.
+- left-PostRL/right-Base and left-Base/right-PostRL hybrids.
 
-It logs `V(s)`, `Q(s,a)`, `A=Q-V`, action disagreement, and the highest-Q counterfactual to `live_critic_probe.csv`. The important comparison is action ranking at one fixed state, especially `Q(hold)-Q(base)` and `Q(postrl)-Q(base)`; absolute low/high Q by itself does not establish terminal confusion.
+The Stage-1 IQL Critic logs `V(s)`, all corresponding `Q(s,a)` and `A=Q-V`, physical Base/Post-RL/Hold chunk distances, the actually executed queued Post-RL action, and the fresh first-step plans. This distinction matters because deployed ACT can be executing an action already cached by its action queue while the Critic counterfactual asks what each policy would freshly plan from the current state.
+
+The important comparison is action ranking at one fixed state, especially `Q(hold)-Q(base)` and `Q(postrl)-Q(base)`; absolute low/high Q by itself does not establish terminal confusion. The live probe diagnoses the learned Q surface and is not a causal proof that PPO gradients created the final Actor drift.
 
 Example:
 
 ```bash
 python post_training/tests/analysis/analysis_mujoco_critic_probe.py \
+  --config /path/to/kuavo_mujoco_deploy.yaml \
   --stage1-dir /path/to/stage1_or_postrl_run \
-  --postrl-checkpoint /path/to/best_ope \
-  --config /path/to/resolved_config.yaml \
-  --eval-times 1 \
+  --stage1-config /path/to/resolved_offline_rl_config.yaml \
+  --il-checkpoint /path/to/base_act_deterministic_checkpoint \
+  --postrl-checkpoint /path/to/exported_postrl_deterministic_checkpoint \
+  --episodes 1 \
   --output-dir post_training/outputs/mujoco_critic_probe
 ```
 
-The resolved config must contain the MuJoCo `task.env_runner` used by normal evaluation. The wrapper expects that runner to call the standard ACT deterministic policy API with the normalized LeRobot observation dictionary. If the runner bypasses that call site, the script fails instead of silently producing an invalid probe.
+`--stage1-config` is optional when the Stage-1 directory already contains the resolved training config. The Base and Post-RL deployment checkpoints must contain deterministic ACT `config.json` and `model.safetensors` bundles and must share the processor/encoder contract with the Stage-1 Critic.
 
 ### Analysis 10: multi-step fixed-old PPO accumulation
 
