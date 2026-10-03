@@ -123,7 +123,7 @@ The output also reports an expected-drift signal-to-repeat-noise ratio: the RMSE
 
 Analysis 10 starts from the Base stochastic ACT, loads the trained Stage-1 Critic, and then calls the production `update_distribution()` repeatedly on production finetune batches. The PPO `old_policy` is copied once before step 1 and is never refreshed. The script fails immediately if its old-policy version changes.
 
-This isolates the question: can repeated Critic-guided PPO updates alone accumulate a local Base-to-PostRL drift even when the reference policy is fixed? Every probe snapshot evaluates the same cached observations and records deterministic action drift by phase and arm/gripper group, Q/V/A for Base/current/final-PostRL/terminal-template chunks, and parameter drift for decoder/action-head/log-std groups. PPO monitoring also records ratio, approximate KL, clip fraction, pre-normalization advantage statistics, gradient norm, LR, and clip ratio.
+This isolates the question: can repeated Critic-guided PPO updates alone accumulate a local Base-to-PostRL drift even when the reference policy is fixed? Every probe snapshot evaluates the same cached observations and records deterministic action drift by phase and arm/gripper group, Q/V/A for Base/current/final-PostRL/terminal-template chunks, and parameter drift for decoder/action-head/log-std groups. It also reports the cosine and signed projection of Base->current drift onto the same-episode Base->terminal direction, plus same-state Q(current)-Q(Base), so "drift" is not conflated with specifically terminal-ward drift. PPO monitoring records ratio, approximate KL, clip fraction, pre-normalization advantage statistics, gradient norm, LR, and clip ratio.
 
 Example:
 
@@ -144,7 +144,7 @@ Primary outputs: `update_metrics.csv`, `snapshot_phase_group.csv`, `parameter_dr
 
 Analysis 11 uses the same fixed probes and production PPO update as Analysis 10, but also loads the Stage-1 transition model and restores the actual Stage-2 OPE gate: an initial dynamics OPE is run before step 1; thereafter OPE runs at `unio4.eval_step`, and `old_policy` is refreshed only when `current_mean_q > best_mean_q` and `is_update_old_policy=true`. EMA stepping is also preserved. Environment evaluation/checkpoint selection is intentionally omitted because it does not determine the PPO old-policy refresh.
 
-The key comparison is Analysis 10 versus 11. If fixed-reference PPO remains near Base but Analysis 11 drifts strongly after repeated OPE accepts, that supports a moving-reference ratchet mechanism. If both drift similarly, the main mechanism is repeated PPO itself rather than OPE refresh.
+The key comparison is Analysis 10 versus 11. If fixed-reference PPO remains near Base but Analysis 11 drifts strongly after repeated OPE accepts, that supports a moving-reference ratchet mechanism. If both drift similarly, the main mechanism is repeated PPO itself rather than OPE refresh. `old_reference_phase_group.csv` separately records Base->old-reference drift, old->current drift, same-state Q differences, and terminal-direction alignment, making it possible to see whether each accepted OPE refresh ratchets terminal-like behavior into the next PPO reference.
 
 Example:
 
@@ -209,7 +209,7 @@ This is the direct live-state diagnostic for the freeze hypothesis. The simulato
 - Post-RL left arm + Base right arm;
 - Base left arm + Post-RL right arm.
 
-The script records `V(s)`, every `Q(s,a)`, `A=Q-V`, Q differences against Base, Base/Post-RL/hold chunk distances, and left/right-specific drift. The Critic is deliberately evaluated on a fresh full `[H,D]` action chunk, not only the queued single action executed that simulator step, because that is the Stage-2 Q/PPO contract. Absolute Q on a live OOD state should not be over-interpreted; the primary quantity is same-state ranking such as `Q(hold)-Q(Base)`.
+The script records `V(s)`, every `Q(s,a)`, `A=Q-V`, Q differences against Base, Base/Post-RL/hold chunk distances, left/right-specific drift, full-chunk step-to-step motion, the normalized/physical live robot state, and the actually returned normalized/physical action. It also records `executed_to_fresh_control_l2`: deployed ACT may execute an action from its queue while the Critic probe intentionally scores a fresh full replan, so this field prevents stale-queue behavior from being mistaken for a fresh policy preference. The Critic is deliberately evaluated on a fresh full `[H,D]` action chunk, not only the queued single action executed that simulator step, because that is the Stage-2 Q/PPO contract. Absolute Q on a live OOD state should not be over-interpreted; the primary quantity is same-state ranking such as `Q(hold)-Q(Base)`.
 
 Run Post-RL control first:
 
