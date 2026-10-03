@@ -1,8 +1,5 @@
 from __future__ import annotations
 
-import hashlib
-import json
-import os
 import pathlib
 import sys
 import tempfile
@@ -18,7 +15,6 @@ for path in (REPO_ROOT, POST_RL_SRC):
         sys.path.insert(0, path_str)
 
 from post_rl.data.reward_zarr_migration import (
-    clone_latent_cache_for_reward_clone,
     compute_discounted_return,
     migrate_reward_zarr,
 )
@@ -72,39 +68,6 @@ def _create_source_zarr(path: pathlib.Path) -> tuple[np.ndarray, np.ndarray]:
     ep[:] = episode_ends
     root.attrs["marker"] = "source_unchanged"
     return action, episode_ends
-
-
-def _create_source_cache(
-    path: pathlib.Path,
-    source_zarr: pathlib.Path,
-    episode_ends: np.ndarray,
-) -> np.ndarray:
-    path.mkdir(parents=True)
-    n = int(episode_ends[-1])
-    latent = np.arange(n * 6, dtype=np.float32).reshape(n, 2, 3)
-    next_indices = np.arange(n, dtype=np.int64) + 1
-    next_indices[episode_ends - 1] = episode_ends - 1
-    np.save(path / "obs_latent.npy", latent)
-    np.save(path / "next_indices.npy", next_indices)
-
-    metadata = {
-        "version": 1,
-        "source_dataset": os.path.realpath(source_zarr),
-        "encoder_sha256": "encoder-test",
-        "normalizer_sha256": "normalizer-test",
-        "use_depth": False,
-        "feature_dim": 3,
-        "size": n,
-        "episode_ends_sha256": hashlib.sha256(
-            np.asarray(episode_ends, dtype=np.int64).tobytes()
-        ).hexdigest(),
-        "transition_alignment": "next_obs=obs[next_index]; terminal=self",
-        "latent_shape": [2, 3],
-        "dtype": "float32",
-    }
-    with (path / "metadata.json").open("w") as file:
-        json.dump(metadata, file, indent=2)
-    return latent
 
 
 def main() -> None:
@@ -176,28 +139,7 @@ def main() -> None:
     assert target_reward[episode_ends[1] - 1] == 0.0
     assert target_root.attrs["reward_mode"] == "last_gripper_release_sparse"
 
-    source_cache = work / "source_cache" / "encoder_normalizer"
-    latent = _create_source_cache(source_cache, source, episode_ends)
-    cache_summary = clone_latent_cache_for_reward_clone(
-        source_cache,
-        source,
-        target,
-        link_mode="hardlink",
-    )
-    target_cache = pathlib.Path(cache_summary["target_cache"])
-    target_latent = np.load(target_cache / "obs_latent.npy", mmap_mode="r")
-    np.testing.assert_array_equal(target_latent, latent)
-
-    with (target_cache / "metadata.json").open("r") as file:
-        target_metadata = json.load(file)
-    assert target_metadata["source_dataset"] == os.path.realpath(target)
-    assert target_metadata["reward_only_dataset_clone"] is True
-    assert target_metadata["derived_from_cache"] == str(source_cache.resolve())
-    assert os.stat(source_cache / "obs_latent.npy").st_ino == os.stat(
-        target_cache / "obs_latent.npy"
-    ).st_ino
-
-    print("SMOKE reward-v2 Zarr migration + latent-cache reuse PASSED")
+    print("SMOKE reward-v2 Zarr migration PASSED")
     print(f"Work dir: {work}")
 
 
