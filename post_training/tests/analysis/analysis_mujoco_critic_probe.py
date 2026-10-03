@@ -571,6 +571,11 @@ def _build_critic_workspace(
     cfg.use_wandb = False
     cfg.eval = False
     cfg.training.debug = False
+    # Live probe does not need the offline buffer or cached dataset latents.
+    # Disable performance-cache construction even if the historical resolved
+    # config enabled it for Stage 1/2 training.
+    cfg.dataset.use_latent_cache = False
+    cfg.dataset.endpoint_obs_only = False
     cfg.critic.load_pretrain = True
     cfg.critic.artifact_dir = str(
         stage1_dir / "critic"
