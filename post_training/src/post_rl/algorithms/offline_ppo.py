@@ -309,14 +309,9 @@ class BehaviorProximalPolicyOptimization(ProximalPolicyOptimization):
             )
             advantages.append(advantage)
             if step_idx + 1 < action_chunk.shape[1]:
-                next_state, _, _, _ = self.dynamics.step(
+                state_tokens = self.dynamics.step_tensor(
                     state_tokens,
                     action_step,
-                )
-                state_tokens = torch.as_tensor(
-                    next_state,
-                    device=self._device,
-                    dtype=state_tokens.dtype,
                 )
 
         advantages = torch.stack(advantages, dim=1)
