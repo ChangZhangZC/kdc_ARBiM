@@ -60,13 +60,13 @@ def main() -> None:
     parser = add_common_args(
         argparse.ArgumentParser(
             description=(
-                "Smoke 06: JPEG-backed dataset -> tiny Critic->Dynamics->Offline PPO E2E "
+                "Smoke 08: JPEG-backed dataset -> tiny Critic->Dynamics->Offline PPO E2E "
                 "+ exact resume"
             )
         ),
     )
     args = parser.parse_args()
-    root = pathlib.Path(make_work_dir(args, "smoke_06_e2e"))
+    root = pathlib.Path(make_work_dir(args, "smoke_08_e2e"))
     first_dir = root / "first_run"
     resume_dir = root / "resume_run"
     first_dir.mkdir(parents=True, exist_ok=True)
@@ -164,7 +164,7 @@ def main() -> None:
     print_pass(f"resume continued from step 1 to step 2; max trainable-param diff={max_diff:.3g}")
 
     print(f"\nSmoke artifacts: {root}")
-    print("SMOKE 06 PASSED")
+    print("SMOKE 08 PASSED")
 
 
 if __name__ == "__main__":
