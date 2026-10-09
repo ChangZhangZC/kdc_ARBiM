@@ -210,6 +210,48 @@ class EnsembleDynamics_batch(BaseDynamics):
         return list(loss.cpu().numpy())
 
     @torch.no_grad()
+    def step_tensor(
+        self,
+        nobs_features: torch.Tensor,
+        action: torch.Tensor,
+        policy_features: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Sample the next latent state without leaving the current torch device.
+
+        This is the fast path for sequential single-step PPO advantage rollout.
+        It intentionally skips reward/termination/uncertainty bookkeeping because
+        those outputs are unused by that caller.
+        """
+        state_tokens = self._as_tokens(
+            policy_features if policy_features is not None else nobs_features
+        )
+        action = torch.as_tensor(
+            action,
+            device=self.device,
+            dtype=torch.float32,
+        )
+        mean, logvar = self.model(state_tokens, action)
+        if self.predict_delta:
+            mean = mean + state_tokens.unsqueeze(0)
+
+        std = torch.sqrt(torch.exp(logvar))
+        samples = mean + torch.randn_like(std) * std
+        model = self._model()
+        batch_size = state_tokens.shape[0]
+        elites = model.elites.to(device=self.device, dtype=torch.long)
+        if elites.numel() == 0:
+            raise RuntimeError("Dynamics model has no elite members.")
+        elite_choice = torch.randint(
+            0,
+            elites.numel(),
+            (batch_size,),
+            device=self.device,
+        )
+        elite_idx = elites[elite_choice]
+        batch_idx = torch.arange(batch_size, device=self.device)
+        return samples[elite_idx, batch_idx]
+
+    @torch.no_grad()
     def step(
         self,
         nobs_features: torch.Tensor,
