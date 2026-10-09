@@ -50,6 +50,12 @@ DEFAULT_JPEG_QUALITY = 95
 STREAM_NPY_FORMAT_V1 = "arbim_processed_npy_stream_v1"
 STREAM_NPY_FORMAT = "arbim_processed_npy_stream_v2"
 RGB_ZARR_STORAGE = "jpeg_bytes_v1"
+REWARD_MODE_EPISODE_END_SHAPED = "episode_end_shaped"
+REWARD_MODE_LAST_GRIPPER_RELEASE_SPARSE = "last_gripper_release_sparse"
+SUPPORTED_REWARD_MODES = {
+    REWARD_MODE_EPISODE_END_SHAPED,
+    REWARD_MODE_LAST_GRIPPER_RELEASE_SPARSE,
+}
 
 
 def load_config(path):
@@ -58,6 +64,14 @@ def load_config(path):
     cfg.setdefault("lambda_penalty", 0.05)
     cfg.setdefault("smooth_penalty", 0.01)
     cfg.setdefault("max_episode_len", 2000)
+    cfg.setdefault("reward_mode", REWARD_MODE_EPISODE_END_SHAPED)
+    cfg.setdefault("reward_left_gripper_index", 7)
+    cfg.setdefault("reward_right_gripper_index", 15)
+    cfg.setdefault("reward_left_open_side", "auto")
+    cfg.setdefault("reward_right_open_side", "auto")
+    cfg.setdefault("reward_open_infer_frames", 5)
+    cfg.setdefault("reward_min_dwell", 3)
+    cfg.setdefault("reward_expected_cycles", 1)
     cfg.setdefault("use_depth", False)
     cfg.setdefault("overwrite", True)
     cfg.setdefault("teleop_sources", [])
@@ -175,6 +189,244 @@ def _group_episode_indices(dataset):
             raise KeyError(f"frame {frame_index} is missing required key 'episode_index'")
         episodes.setdefault(_episode_id(frame["episode_index"]), []).append(frame_index)
     return episodes
+
+
+def _stack_action_column(dataset):
+    hf_dataset = getattr(dataset, "hf_dataset", None)
+    if hf_dataset is not None:
+        try:
+            values = hf_dataset["action"]
+            action = np.stack(
+                [
+                    _as_numpy(value, "action", index)
+                    for index, value in enumerate(values)
+                ],
+                axis=0,
+            )
+        except (KeyError, TypeError, ValueError):
+            action = None
+        if action is not None:
+            if action.ndim != 2:
+                raise ValueError(f"Expected action column [N,D], got {action.shape}")
+            return action.astype(np.float32, copy=False)
+
+    action = np.stack(
+        [
+            _as_numpy(dataset[index]["action"], "action", index)
+            for index in range(len(dataset))
+        ],
+        axis=0,
+    )
+    if action.ndim != 2:
+        raise ValueError(f"Expected action column [N,D], got {action.shape}")
+    return action.astype(np.float32, copy=False)
+
+
+def _infer_gripper_thresholds(
+    values,
+    episode_frames,
+    *,
+    open_side,
+    start_frames,
+    low_threshold=None,
+    high_threshold=None,
+):
+    values = np.asarray(values, dtype=np.float64).reshape(-1)
+    finite = values[np.isfinite(values)]
+    if finite.size == 0:
+        raise ValueError("Gripper action contains no finite values")
+
+    q10, q90 = np.quantile(finite, [0.10, 0.90]).tolist()
+    span = q90 - q10
+    if span <= 1e-8:
+        raise ValueError(
+            f"Gripper action has almost no dynamic range: q10={q10}, q90={q90}"
+        )
+
+    low = float(low_threshold) if low_threshold is not None else q10 + 0.35 * span
+    high = float(high_threshold) if high_threshold is not None else q10 + 0.65 * span
+    if not low < high:
+        raise ValueError(
+            f"Expected low gripper threshold < high threshold, got {low} >= {high}"
+        )
+
+    starts = []
+    for frames in episode_frames:
+        take = frames[: min(int(start_frames), len(frames))]
+        starts.extend(values[np.asarray(take, dtype=np.int64)].tolist())
+    start_median = float(np.median(np.asarray(starts, dtype=np.float64)))
+
+    if open_side == "auto":
+        open_side = (
+            "low"
+            if abs(start_median - q10) <= abs(start_median - q90)
+            else "high"
+        )
+    if open_side not in {"low", "high"}:
+        raise ValueError(
+            f"reward gripper open_side must be auto/low/high, got {open_side!r}"
+        )
+
+    return {
+        "low": float(low),
+        "high": float(high),
+        "open_side": open_side,
+        "q10": float(q10),
+        "q90": float(q90),
+        "start_median": start_median,
+    }
+
+
+def _classify_gripper(value, thresholds):
+    value = float(value)
+    if value <= thresholds["low"]:
+        side = "low"
+    elif value >= thresholds["high"]:
+        side = "high"
+    else:
+        return None
+    return "open" if side == thresholds["open_side"] else "closed"
+
+
+def _debounced_gripper_transitions(values, thresholds, min_dwell):
+    state = None
+    candidate = None
+    candidate_start = None
+    candidate_count = 0
+    transitions = []
+
+    for index, value in enumerate(np.asarray(values, dtype=np.float64)):
+        classified = _classify_gripper(value, thresholds)
+        if classified is None:
+            continue
+
+        if state is None:
+            if candidate == classified:
+                candidate_count += 1
+            else:
+                candidate = classified
+                candidate_start = index
+                candidate_count = 1
+            if candidate_count >= min_dwell:
+                state = classified
+                candidate = None
+                candidate_start = None
+                candidate_count = 0
+            continue
+
+        if classified == state:
+            candidate = None
+            candidate_start = None
+            candidate_count = 0
+            continue
+
+        if candidate == classified:
+            candidate_count += 1
+        else:
+            candidate = classified
+            candidate_start = index
+            candidate_count = 1
+
+        if candidate_count >= min_dwell:
+            transitions.append(
+                {
+                    "frame_offset": int(candidate_start),
+                    "from_state": state,
+                    "to_state": classified,
+                }
+            )
+            state = classified
+            candidate = None
+            candidate_start = None
+            candidate_count = 0
+
+    return transitions
+
+
+def _last_gripper_release_offsets(dataset, episodes, config):
+    action = _stack_action_column(dataset)
+    left_index = int(config.get("reward_left_gripper_index", 7))
+    right_index = int(config.get("reward_right_gripper_index", 15))
+    max_index = max(left_index, right_index)
+    if action.shape[1] <= max_index:
+        raise ValueError(
+            f"Action dim={action.shape[1]} cannot access reward gripper index {max_index}"
+        )
+
+    start_frames = int(config.get("reward_open_infer_frames", 5))
+    min_dwell = int(config.get("reward_min_dwell", 3))
+    expected_cycles = int(config.get("reward_expected_cycles", 1))
+    if start_frames < 1 or min_dwell < 1 or expected_cycles < 1:
+        raise ValueError(
+            "reward_open_infer_frames, reward_min_dwell, and "
+            "reward_expected_cycles must all be >= 1"
+        )
+
+    episode_frames = list(episodes.values())
+    left_thresholds = _infer_gripper_thresholds(
+        action[:, left_index],
+        episode_frames,
+        open_side=config.get("reward_left_open_side", "auto"),
+        start_frames=start_frames,
+        low_threshold=config.get("reward_left_low_threshold"),
+        high_threshold=config.get("reward_left_high_threshold"),
+    )
+    right_thresholds = _infer_gripper_thresholds(
+        action[:, right_index],
+        episode_frames,
+        open_side=config.get("reward_right_open_side", "auto"),
+        start_frames=start_frames,
+        low_threshold=config.get("reward_right_low_threshold"),
+        high_threshold=config.get("reward_right_high_threshold"),
+    )
+
+    release_offsets = {}
+    for episode_id, frames in episodes.items():
+        frame_array = np.asarray(frames, dtype=np.int64)
+        left_transitions = _debounced_gripper_transitions(
+            action[frame_array, left_index],
+            left_thresholds,
+            min_dwell,
+        )
+        right_transitions = _debounced_gripper_transitions(
+            action[frame_array, right_index],
+            right_thresholds,
+            min_dwell,
+        )
+        left_release = [
+            event["frame_offset"]
+            for event in left_transitions
+            if event["from_state"] == "closed" and event["to_state"] == "open"
+        ]
+        right_release = [
+            event["frame_offset"]
+            for event in right_transitions
+            if event["from_state"] == "closed" and event["to_state"] == "open"
+        ]
+        if len(left_release) != expected_cycles or len(right_release) != expected_cycles:
+            raise ValueError(
+                f"Episode {episode_id!r} reward event detection failed: "
+                f"left_release={left_release}, right_release={right_release}, "
+                f"expected_cycles={expected_cycles}"
+            )
+        reward_offset = max(left_release[-1], right_release[-1])
+        if reward_offset >= len(frames) - 1:
+            raise ValueError(
+                f"Episode {episode_id!r} final gripper release offset={reward_offset} "
+                f"must occur before recording end={len(frames) - 1}"
+            )
+        release_offsets[episode_id] = int(reward_offset)
+
+    metadata = {
+        "left_index": left_index,
+        "right_index": right_index,
+        "left_thresholds": left_thresholds,
+        "right_thresholds": right_thresholds,
+        "open_infer_frames": start_frames,
+        "min_dwell": min_dwell,
+        "expected_cycles": expected_cycles,
+    }
+    return release_offsets, metadata
 
 
 def _validate_frame(frame, frame_index, use_depth):
@@ -408,6 +660,14 @@ def process_raw_teleop_to_npy(config):
     max_episode_len = int(config.get("max_episode_len", 2000))
     lambda_penalty = float(config.get("lambda_penalty", 0.05))
     smooth_penalty = float(config.get("smooth_penalty", 0.01))
+    reward_mode = str(
+        config.get("reward_mode", REWARD_MODE_EPISODE_END_SHAPED)
+    )
+    if reward_mode not in SUPPORTED_REWARD_MODES:
+        raise ValueError(
+            f"Unsupported reward_mode={reward_mode!r}; "
+            f"expected one of {sorted(SUPPORTED_REWARD_MODES)}"
+        )
     batch_size = int(config.get("stream_batch_size", ZARR_CHUNK_LEAD))
     jpeg_quality = int(config.get("jpeg_quality", DEFAULT_JPEG_QUALITY))
     overwrite = bool(config.get("overwrite", True))
@@ -424,6 +684,20 @@ def process_raw_teleop_to_npy(config):
     episodes = _group_episode_indices(dataset)
     if not episodes:
         raise RuntimeError("LeRobot dataset contains no episodes")
+
+    reward_offsets = None
+    reward_event_metadata = None
+    if reward_mode == REWARD_MODE_LAST_GRIPPER_RELEASE_SPARSE:
+        reward_offsets, reward_event_metadata = _last_gripper_release_offsets(
+            dataset,
+            episodes,
+            config,
+        )
+        cprint(
+            "Reward mode: sparse +1 at the later of the two action-gripper releases; "
+            "recording tail is preserved and terminal/done remains at recording end.",
+            "cyan",
+        )
 
     batch_decode = _can_batch_decode(dataset)
     if batch_decode:
@@ -463,7 +737,10 @@ def process_raw_teleop_to_npy(config):
         "rgb_shapes": rgb_shapes,
         "rgb_dtypes": {key: "uint8" for key in RGB_FEATURE_TO_BUFFER},
         "source_root": str(Path(lerobot_root).expanduser().resolve()),
+        "reward_mode": reward_mode,
     }
+    if reward_event_metadata is not None:
+        manifest["reward_event"] = reward_event_metadata
     if use_depth:
         manifest["depth_shapes"] = {
             key: tuple(first["depth"][key].shape) for key in DEPTH_FEATURE_TO_BUFFER
@@ -499,13 +776,16 @@ def process_raw_teleop_to_npy(config):
                 ):
                     t = batch_start + batch_offset
                     terminal = t == episode_length - 1
-                    reward = float(terminal)
-                    if terminal:
-                        reward -= lambda_penalty * episode_length / max_episode_len
-                    if previous_action is not None:
-                        reward -= smooth_penalty * np.linalg.norm(
-                            item["action"] - previous_action
-                        )
+                    if reward_mode == REWARD_MODE_LAST_GRIPPER_RELEASE_SPARSE:
+                        reward = float(t == reward_offsets[episode_id])
+                    else:
+                        reward = float(terminal)
+                        if terminal:
+                            reward -= lambda_penalty * episode_length / max_episode_len
+                        if previous_action is not None:
+                            reward -= smooth_penalty * np.linalg.norm(
+                                item["action"] - previous_action
+                            )
                     encoded_rgb = {
                         key: encode_rgb_jpeg(item["rgb"][key], jpeg_quality)
                         for key in RGB_FEATURE_TO_BUFFER
@@ -584,6 +864,10 @@ def _read_source_header(path, use_depth):
                 "rgb_storage", "jpeg" if stream_format == STREAM_NPY_FORMAT else "dense"
             ),
             "jpeg_quality": int(first.get("jpeg_quality", DEFAULT_JPEG_QUALITY)),
+            "reward_mode": first.get(
+                "reward_mode", REWARD_MODE_EPISODE_END_SHAPED
+            ),
+            "reward_event": first.get("reward_event"),
             "num_frames": int(first["num_frames"]),
             "num_episodes": int(first["num_episodes"]),
             "state_shape": tuple(first["state_shape"]),
@@ -610,6 +894,8 @@ def _read_source_header(path, use_depth):
         "stream_format": "legacy_single_record",
         "rgb_storage": "dense",
         "jpeg_quality": DEFAULT_JPEG_QUALITY,
+        "reward_mode": REWARD_MODE_EPISODE_END_SHAPED,
+        "reward_event": None,
         "num_frames": num_frames,
         "num_episodes": num_episodes,
         "state_shape": tuple(np.asarray(first["agent_pos"][0]).shape),
@@ -933,6 +1219,9 @@ def run_build_db(config):
             "path": info["path"],
             "format": info["stream_format"],
             "rgb_storage": info["rgb_storage"],
+            "reward_mode": info.get(
+                "reward_mode", REWARD_MODE_EPISODE_END_SHAPED
+            ),
         }
         for info in infos
     ]
