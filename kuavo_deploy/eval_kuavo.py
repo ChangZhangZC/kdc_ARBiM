@@ -206,6 +206,7 @@ def print_task_menu(config_path="<config_path>", use_color=True):
         ("back_to_zero", "Normal Task: After interrputing the running model, play the rosbag file in reverse to its zero position"),
         ("go (verbose)", "Normal Task: Same as Option 2 but with detailed outputs"),
         ("auto_test", "Simulator auto-test: Auto-testing inside the simulator, with number of iterations specified as eval_episode"),
+        ("data_wheel", "Simulator auto-test with successful rollout collection"),
         ("Exit", ""),
     ]
 
@@ -268,13 +269,13 @@ def main():
     while True:
         print_task_menu(config_path=config_path, use_color=True)
 
-        sub_choice = input("Please select one of the following options (1-9): ").strip()
+        sub_choice = input("Please select one of the following options (1-10): ").strip()
 
-        def start_task(cmd):
+        def start_task(cmd, env=None):
             global current_proc
             log_path = LOG_DIR / "kuavo_deploy.log"
             with open(log_path, "w") as f:
-                current_proc = subprocess.Popen(cmd, stdout=f, stderr=subprocess.STDOUT)
+                current_proc = subprocess.Popen(cmd, stdout=f, stderr=subprocess.STDOUT, env=env)
             print(f"Task started, PID: {current_proc.pid}")
             interactive_controller()
 
@@ -295,6 +296,10 @@ def main():
         elif sub_choice == "8":
             start_task(["python3", str(auto_test), "--task", "auto_test", "--config", config_path])
         elif sub_choice == "9":
+            data_wheel_env = os.environ.copy()
+            data_wheel_env["ARBIM_DATA_WHEEL"] = "1"
+            start_task(["python3", str(auto_test), "--task", "auto_test", "--config", config_path], env=data_wheel_env)
+        elif sub_choice == "10":
             print("Exiting...")
             break
         else:
