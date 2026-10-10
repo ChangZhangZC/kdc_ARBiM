@@ -1202,6 +1202,9 @@ def run_build_db(config):
             raise ValueError(f"teleop source missing path: {source}")
         info = _read_source_header(source["path"], use_depth)
         info["name"] = source_id(source)
+        info["kind"] = source.get("kind", "teleop_npy")
+        if info["kind"] not in {"teleop_npy", "rollout_npy"}:
+            raise ValueError(f"unknown processed NPY source kind: {info['kind']}")
         infos.append(info)
     _validate_source_shapes(infos, use_depth)
     total_frames = sum(info["num_frames"] for info in infos)
@@ -1214,7 +1217,7 @@ def run_build_db(config):
     )
     root.attrs["source_manifest"] = [
         {
-            "kind": "teleop_npy",
+            "kind": info["kind"],
             "name": info["name"],
             "path": info["path"],
             "format": info["stream_format"],
