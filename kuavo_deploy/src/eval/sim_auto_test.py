@@ -197,148 +197,152 @@ def run_single_episode(config, policy, preprocessor, postprocessor, episode, out
     )
 
     recorder = None
-    if os.environ.get("ARBIM_DATA_WHEEL") == "1":
-        from kuavo_deploy.src.eval.rollout_recorder import RolloutRecorder
-        recorder = RolloutRecorder(output_directory / "data_wheel" / "staging", episode)
+    run_single_ros_manager = None
+    try:
+        if os.environ.get("ARBIM_DATA_WHEEL") == "1":
+            from kuavo_deploy.src.eval.rollout_recorder import RolloutRecorder
+            recorder = RolloutRecorder(output_directory / "data_wheel" / "staging", episode)
 
-    run_single_ros_manager = ROSManager()
-    # Setup ROS subscribers and services
-    run_single_ros_manager.register_subscriber("/simulator/success", Bool, env_success_callback)
+        run_single_ros_manager = ROSManager()
+        # Setup ROS subscribers and services
+        run_single_ros_manager.register_subscriber("/simulator/success", Bool, env_success_callback)
 
-    # max_episode_steps = cfg.max_episode_steps
+        # max_episode_steps = cfg.max_episode_steps
 
-    start_service = rospy.ServiceProxy('/simulator/start', Trigger)
-
-
-    if cfg.policy_type not in ['client', 'lingbot'] and hasattr(policy, "config"):
-        log_model.info(f"policy.config.input_features: {policy.config.input_features}")
-        log_robot.info(f"env.observation_space: {env.observation_space}")
-        log_model.info(f"policy.config.output_features: {policy.config.output_features}")
-        log_robot.info(f"env.action_space: {env.action_space}")
-
-    # Reset the policy and environments to prepare for rollout
-    policy.reset()
-    observation, info = env.reset(seed=seed)
-    # first_img =  (observation["observation.images.head_cam_h"].squeeze().permute(1,2,0).numpy()*255).astype(np.uint8)
-    
-    # import cv2
-    # first_img = cv2.cvtColor(first_img,cv2.COLOR_RGB2BGR)
-    # cv2.imwrite( "obs.png", first_img)
-    # raise ValueError("stop for debug!")
-    start_service(TriggerRequest())
-    if recorder is not None:
-        recorder.start_episode(observation)
-
-    # Prepare to collect every rewards and all the frames of the episode,
-    # from initial state to final state.
-    rewards = []
-    cam_keys = [k for k in observation.keys() if "images" in k or "depth" in k]
-
-    frame_temp_dirs = {}
-    for k in cam_keys:
-        temp_dir = output_directory / f"temp_frames_{episode}_{k}"
-        temp_dir.mkdir(parents=True, exist_ok=True)
-        frame_temp_dirs[k] = temp_dir
+        start_service = rospy.ServiceProxy('/simulator/start', Trigger)
 
 
-    average_exec_time = 0
-    average_action_infer_time = 0
-    average_step_time = 0
+        if cfg.policy_type not in ['client', 'lingbot'] and hasattr(policy, "config"):
+            log_model.info(f"policy.config.input_features: {policy.config.input_features}")
+            log_robot.info(f"env.observation_space: {env.observation_space}")
+            log_model.info(f"policy.config.output_features: {policy.config.output_features}")
+            log_robot.info(f"env.action_space: {env.action_space}")
 
-    step = 0
-    done = False
-    while not done:
-        # --- Pause support: block here if pause_flag is set ---
-        if not check_control_signals():
-            log_robot.info("🛑 Stop signal detected, exiting robot arm motion")
-            if recorder is not None:
-                recorder.abort()
-            return 0
+        # Reset the policy and environments to prepare for rollout
+        policy.reset()
+        observation, info = env.reset(seed=seed)
+        # first_img =  (observation["observation.images.head_cam_h"].squeeze().permute(1,2,0).numpy()*255).astype(np.uint8)
         
-        start_time = time.time()
-        observation = preprocessor(observation)
-        with torch.inference_mode():
-            action = policy.select_action(observation)
-        log_model.info(f"Step {step}: predict action {action}")
-        action = postprocessor(action)
-        # print(f"action: {action}, action.shape: {action.shape}, action min: {action.min()}, action max: {action.max()}")
-        action_infer_time = time.time()
-        log_model.info(f"episode {episode}, step {step}, action infer time: {action_infer_time - start_time:.3f}s")
-        average_action_infer_time += action_infer_time - start_time
-
-        numpy_action = action.squeeze(0).cpu().numpy()
-
-        executed_action = None
+        # import cv2
+        # first_img = cv2.cvtColor(first_img,cv2.COLOR_RGB2BGR)
+        # cv2.imwrite( "obs.png", first_img)
+        # raise ValueError("stop for debug!")
+        start_service(TriggerRequest())
         if recorder is not None:
-            executed_action = env.unwrapped.check_action(numpy_action.copy())
-        log_model.info(f"Step {step}: Executing action {numpy_action}")
-        observation, reward, terminated, truncated, info = env.step(numpy_action)
-        if recorder is not None:
-            recorder.append_step(executed_action, observation)
+            recorder.start_episode(observation)
 
-        exec_time = time.time()
-        log_model.debug(f"step {step}: exec time: {exec_time - action_infer_time:.3f}s")
-        average_exec_time += exec_time - action_infer_time
-        
-        rewards.append(reward)
+        # Prepare to collect every rewards and all the frames of the episode,
+        # from initial state to final state.
+        rewards = []
+        cam_keys = [k for k in observation.keys() if "images" in k or "depth" in k]
 
+        frame_temp_dirs = {}
         for k in cam_keys:
-            frame_path = frame_temp_dirs[k] / f"frame_{step:04d}.png"
-            img = (observation[k].squeeze(0).cpu().numpy().transpose(1, 2, 0) * 255).astype(np.uint8)
-            if img.shape[-1] == 1:
-                img = img.squeeze(-1)
-            imageio.imwrite(str(frame_path), img)
+            temp_dir = output_directory / f"temp_frames_{episode}_{k}"
+            temp_dir.mkdir(parents=True, exist_ok=True)
+            frame_temp_dirs[k] = temp_dir
 
-        # The rollout is considered done when the success state is reached (i.e. terminated is True),
-        # or the maximum number of iterations is reached (i.e. truncated is True)
-        done = terminated | truncated | done
-        done = done or success_evt.is_set()
-        step += 1
 
-        end_time = time.time()
-        log_model.debug(f"Step {step} time: {end_time - start_time:.3f}s")
-        average_step_time += end_time - start_time
-    
-    # Get the speed of environment (i.e. its number of frames per second).
-    fps = env.unwrapped.ros_rate
+        average_exec_time = 0
+        average_action_infer_time = 0
+        average_step_time = 0
 
-    log_model.info(f"average exec time: {average_exec_time / step:.3f}s")
-    log_model.info(f"average action infer time: {average_action_infer_time / step:.3f}s")
-    log_model.info(f"average step time: {average_step_time / step:.3f}s")
-    log_model.info(f"average sleep time: {env.unwrapped.average_sleep_time / step:.3f}s")
-    
-    for cam in cam_keys:
-        temp_dir = frame_temp_dirs[cam]
-        frame_files = sorted(temp_dir.glob("frame_*.png"))
-        frames = [imageio.imread(str(f)) for f in frame_files]
-        output_path = output_directory / f"rollout_{episode}_{cam}.mp4"
-        imageio.mimsave(str(output_path), frames, fps=fps)
+        step = 0
+        done = False
+        while not done:
+            # --- Pause support: block here if pause_flag is set ---
+            if not check_control_signals():
+                log_robot.info("🛑 Stop signal detected, exiting robot arm motion")
+                return 0
+            
+            start_time = time.time()
+            observation = preprocessor(observation)
+            with torch.inference_mode():
+                action = policy.select_action(observation)
+            log_model.info(f"Step {step}: predict action {action}")
+            action = postprocessor(action)
+            # print(f"action: {action}, action.shape: {action.shape}, action min: {action.min()}, action max: {action.max()}")
+            action_infer_time = time.time()
+            log_model.info(f"episode {episode}, step {step}, action infer time: {action_infer_time - start_time:.3f}s")
+            average_action_infer_time += action_infer_time - start_time
+
+            numpy_action = action.squeeze(0).cpu().numpy()
+
+            executed_action = None
+            if recorder is not None:
+                executed_action = env.unwrapped.check_action(numpy_action.copy())
+            log_model.info(f"Step {step}: Executing action {numpy_action}")
+            observation, reward, terminated, truncated, info = env.step(numpy_action)
+            if recorder is not None:
+                recorder.append_step(executed_action, observation)
+
+            exec_time = time.time()
+            log_model.debug(f"step {step}: exec time: {exec_time - action_infer_time:.3f}s")
+            average_exec_time += exec_time - action_infer_time
+            
+            rewards.append(reward)
+
+            for k in cam_keys:
+                frame_path = frame_temp_dirs[k] / f"frame_{step:04d}.png"
+                img = (observation[k].squeeze(0).cpu().numpy().transpose(1, 2, 0) * 255).astype(np.uint8)
+                if img.shape[-1] == 1:
+                    img = img.squeeze(-1)
+                imageio.imwrite(str(frame_path), img)
+
+            # The rollout is considered done when the success state is reached (i.e. terminated is True),
+            # or the maximum number of iterations is reached (i.e. truncated is True)
+            done = terminated | truncated | done
+            done = done or success_evt.is_set()
+            step += 1
+
+            end_time = time.time()
+            log_model.debug(f"Step {step} time: {end_time - start_time:.3f}s")
+            average_step_time += end_time - start_time
         
+        # Get the speed of environment (i.e. its number of frames per second).
+        fps = env.unwrapped.ros_rate
 
-        for f in frame_files:
-            f.unlink()
-        temp_dir.rmdir()
+        log_model.info(f"average exec time: {average_exec_time / step:.3f}s")
+        log_model.info(f"average action infer time: {average_action_infer_time / step:.3f}s")
+        log_model.info(f"average step time: {average_step_time / step:.3f}s")
+        log_model.info(f"average sleep time: {env.unwrapped.average_sleep_time / step:.3f}s")
         
-        del frames
+        for cam in cam_keys:
+            temp_dir = frame_temp_dirs[cam]
+            frame_files = sorted(temp_dir.glob("frame_*.png"))
+            frames = [imageio.imread(str(f)) for f in frame_files]
+            output_path = output_directory / f"rollout_{episode}_{cam}.mp4"
+            imageio.mimsave(str(output_path), frames, fps=fps)
+            
 
-    success = success_evt.is_set()
-    if recorder is not None:
-        saved_path = recorder.finish_episode(success)
-        if saved_path is not None:
-            log_model.info(f"Data Wheel: saved successful staging rollout to {saved_path}")
-    
-    env.close()
-    run_single_ros_manager.close()
-    
-    del rewards
-    del observation
-    del env
-    del run_single_ros_manager
-    
-    gc.collect()
-    torch.cuda.empty_cache()
-    
-    return 1 if success else 0
+            for f in frame_files:
+                f.unlink()
+            temp_dir.rmdir()
+            
+            del frames
+
+        success = success_evt.is_set()
+        if recorder is not None:
+            saved_path = recorder.finish_episode(success)
+            if saved_path is not None:
+                log_model.info(f"Data Wheel: saved successful staging rollout to {saved_path}")
+        
+        
+        del rewards
+        del observation
+        
+        gc.collect()
+        torch.cuda.empty_cache()
+        
+        return 1 if success else 0
+    finally:
+        if recorder is not None:
+            recorder.abort()
+        try:
+            env.close()
+        finally:
+            if run_single_ros_manager is not None:
+                run_single_ros_manager.close()
 
 
 def kuavo_eval_autotest(config: KuavoConfig):
