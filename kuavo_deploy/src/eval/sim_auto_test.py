@@ -196,6 +196,11 @@ def run_single_episode(config, policy, preprocessor, postprocessor, episode, out
         config=config,
     )
 
+    recorder = None
+    if os.environ.get("ARBIM_DATA_WHEEL") == "1":
+        from kuavo_deploy.src.eval.rollout_recorder import RolloutRecorder
+        recorder = RolloutRecorder(output_directory / "data_wheel" / "staging", episode)
+
     run_single_ros_manager = ROSManager()
     # Setup ROS subscribers and services
     run_single_ros_manager.register_subscriber("/simulator/success", Bool, env_success_callback)
@@ -221,6 +226,8 @@ def run_single_episode(config, policy, preprocessor, postprocessor, episode, out
     # cv2.imwrite( "obs.png", first_img)
     # raise ValueError("stop for debug!")
     start_service(TriggerRequest())
+    if recorder is not None:
+        recorder.start_episode(observation)
 
     # Prepare to collect every rewards and all the frames of the episode,
     # from initial state to final state.
@@ -244,6 +251,8 @@ def run_single_episode(config, policy, preprocessor, postprocessor, episode, out
         # --- Pause support: block here if pause_flag is set ---
         if not check_control_signals():
             log_robot.info("🛑 Stop signal detected, exiting robot arm motion")
+            if recorder is not None:
+                recorder.abort()
             return 0
         
         start_time = time.time()
@@ -259,8 +268,13 @@ def run_single_episode(config, policy, preprocessor, postprocessor, episode, out
 
         numpy_action = action.squeeze(0).cpu().numpy()
 
+        executed_action = None
+        if recorder is not None:
+            executed_action = env.unwrapped.check_action(numpy_action.copy())
         log_model.info(f"Step {step}: Executing action {numpy_action}")
         observation, reward, terminated, truncated, info = env.step(numpy_action)
+        if recorder is not None:
+            recorder.append_step(executed_action, observation)
 
         exec_time = time.time()
         log_model.debug(f"step {step}: exec time: {exec_time - action_infer_time:.3f}s")
@@ -308,6 +322,10 @@ def run_single_episode(config, policy, preprocessor, postprocessor, episode, out
         del frames
 
     success = success_evt.is_set()
+    if recorder is not None:
+        saved_path = recorder.finish_episode(success)
+        if saved_path is not None:
+            log_model.info(f"Data Wheel: saved successful staging rollout to {saved_path}")
     
     env.close()
     run_single_ros_manager.close()
