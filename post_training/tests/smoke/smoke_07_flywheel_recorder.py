@@ -1,4 +1,4 @@
-"""Standalone smoke tests for Batch 02 rollout staging (no ROS required)."""
+"""Standalone smoke tests for successful rollout capture and Reward V2 (no ROS)."""
 
 import sys
 import tempfile
@@ -16,6 +16,7 @@ from kuavo_deploy.src.eval.rollout_recorder import (
     CAMERA_KEYS,
     STAGING_FORMAT,
     RolloutRecorder,
+    _annotate_reward_v2,
 )
 
 
@@ -50,6 +51,9 @@ class TestRolloutRecorder(unittest.TestCase):
             data = np.load(path, allow_pickle=True).item()
             self.assertEqual(data["__format__"], STAGING_FORMAT)
             self.assertEqual(data["num_steps"], 2)
+            self.assertEqual(data["reward_status"], "invalid")
+            self.assertIsNone(data["reward"])
+            self.assertIn("release", data["reward_error"])
             self.assertEqual(data["actions"].shape, (2, 16))
             self.assertEqual(len(data["observations"]), 3)
             self.assertEqual(data["observations"][0]["agent_pos"][0], 1)
@@ -91,6 +95,73 @@ class TestRolloutRecorder(unittest.TestCase):
         with self.assertRaises(ValueError):
             recorder.append_step(np.ones(14), observation(2))
         recorder.abort()
+
+
+    @staticmethod
+    def _valid_actions():
+        # Grippers start open (0), close (1), then release (0).
+        # Left release at t=6; right release at t=8.
+        action = np.zeros((14, 16), dtype=np.float32)
+        action[3:6, 7] = 1.0
+        action[4:8, 15] = 1.0
+        return action
+
+    def test_reward_v2_exactly_one_sparse_success_event(self):
+        actions = self._valid_actions()
+        reward, event = _annotate_reward_v2(actions)
+        self.assertEqual(reward.shape, (14,))
+        self.assertEqual(np.flatnonzero(reward).tolist(), [8])
+        self.assertEqual(float(reward.sum()), 1.0)
+        self.assertEqual(event["left_release"], 6)
+        self.assertEqual(event["right_release"], 8)
+        self.assertEqual(event["frame_offset"], 8)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            recorder = RolloutRecorder(tmp, episode=7)
+            recorder.start_episode(observation(0))
+            for i, command in enumerate(actions):
+                recorder.append_step(command, observation(i + 1))
+            path = recorder.finish_episode(True)
+            payload = np.load(path, allow_pickle=True).item()
+            self.assertEqual(payload["reward_status"], "valid")
+            self.assertIsNone(payload["reward_error"])
+            self.assertEqual(payload["reward_mode"], "last_gripper_release_sparse")
+            self.assertEqual(np.flatnonzero(payload["reward"]).tolist(), [8])
+            self.assertEqual(payload["num_steps"], len(payload["reward"]))
+            self.assertEqual(len(payload["observations"]), len(payload["reward"]) + 1)
+
+    def test_invalid_reward_keeps_successful_staging_data(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            recorder = RolloutRecorder(tmp, episode=8)
+            recorder.start_episode(observation(0))
+            for i in range(6):
+                recorder.append_step(np.zeros(16), observation(i + 1))
+            path = recorder.finish_episode(True)
+            payload = np.load(path, allow_pickle=True).item()
+            self.assertTrue(payload["success"])
+            self.assertEqual(payload["reward_status"], "invalid")
+            self.assertIsNone(payload["reward"])
+            self.assertIsNone(payload["reward_event"])
+            self.assertTrue(payload["reward_error"])
+
+    def test_second_gripper_release_cycle_is_rejected(self):
+        actions = self._valid_actions()
+        # Extend left gripper with a second closed-to-open cycle.
+        extra = np.zeros((10, 16), dtype=np.float32)
+        extra[3:6, 7] = 1.0
+        double_release = np.concatenate((actions, extra), axis=0)
+        with self.assertRaisesRegex(ValueError, "one release per gripper"):
+            _annotate_reward_v2(double_release)
+
+    def test_reward_not_added_to_failure(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            recorder = RolloutRecorder(tmp, episode=9)
+            recorder.start_episode(observation(0))
+            for i, action in enumerate(self._valid_actions()):
+                recorder.append_step(action, observation(i + 1))
+            self.assertIsNone(recorder.finish_episode(False))
+            self.assertEqual(list(Path(tmp).iterdir()), [])
+
 
 
 if __name__ == "__main__":
