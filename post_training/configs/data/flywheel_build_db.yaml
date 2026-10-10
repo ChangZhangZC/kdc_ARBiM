@@ -1,0 +1,27 @@
+# ARBiM Data Wheel: combine existing teleoperation and new policy rollouts.
+# 1) Convert successful staging rollouts first:
+#    python post_training/src/post_rl/data/rollout_to_npy.py \
+#      /path/to/eval/data_wheel/staging --output /path/to/rollout_round_01.npy
+# 2) Build a *new* Zarr (never modifies the previous dataset):
+#    python post_training/src/post_rl/data/data_prepare.py \
+#      --config post_training/configs/data/flywheel_build_db.yaml
+#
+# Reward is already stored in each processed NPY; build_db only transfers
+# reward and recomputes discounted returns. Both sources must use the same
+# State/Action/RGB shapes and use_depth setting.
+mode: build_db
+use_depth: false
+stream_batch_size: 50
+jpeg_quality: 95
+overwrite: false
+zarr_output_path: /path/to/output/offline_rl_flywheel_round_01.zarr
+
+# 'teleop_sources' is the existing run_build_db input name. Each entry can
+# represent teleop or rollout Processed NPY V2. Optional 'kind' is metadata only.
+teleop_sources:
+  - name: original_teleop
+    kind: teleop_npy
+    path: /path/to/processed/original_teleop.npy
+  - name: flywheel_round_01
+    kind: rollout_npy
+    path: /path/to/processed/rollout_round_01.npy
