@@ -39,7 +39,7 @@ def resolve_lerobot(args):
     return result
 
 
-def verify_zarr(path, frames, episodes, reward_v2=True):
+def verify_zarr(path, frames, episodes, reward_v2=True, use_depth=False):
     root = zarr.open_group(str(path), mode="r")
     data = root["data"]
     ep_ends = np.asarray(root["meta"]["episode_ends"][:], dtype=np.int64)
@@ -49,6 +49,9 @@ def verify_zarr(path, frames, episodes, reward_v2=True):
         raise AssertionError(f"{path}: action/state contract mismatch")
     for name in ("head_rgb", "wrist_left_rgb", "wrist_right_rgb"):
         assert len(data[f"{name}_jpeg_offsets"]) == frames + 1
+    for name in ("head_depth", "wrist_left_depth", "wrist_right_depth"):
+        if (name in data) != use_depth or (f"next_{name}" in data) != use_depth:
+            raise AssertionError(f"{path}: Depth storage for {name} differs from use_depth={use_depth}")
     reward = np.asarray(data["reward"][:]).reshape(-1)
     done = np.asarray(data["done"][:]).reshape(-1)
     returns = np.asarray(data["return"][:]).reshape(-1)
@@ -136,6 +139,7 @@ def main():
     })
     teleop, _, _ = verify_zarr(
         teleop_zarr, args.expected_teleop_frames, args.expected_teleop_episodes,
+        use_depth=args.zarr_use_depth,
     )
     if args.reference_zarr:
         compare_reference(teleop, Path(args.reference_zarr).expanduser().resolve())
@@ -147,7 +151,7 @@ def main():
         "zarr_output_path": str(rollout_zarr),
     })
     wheel, wheel_ends, wheel_reward = verify_zarr(
-        rollout_zarr, rollout_frames, rollout_count
+        rollout_zarr, rollout_frames, rollout_count, use_depth=args.zarr_use_depth,
     )
     # Verify recorded reward indices per episode, not just the reward sum.
     import json
@@ -173,7 +177,9 @@ def main():
     total_episodes = args.expected_teleop_episodes + rollout_count
     assert merge_result["num_frames"] == total_frames
     assert merge_result["num_episodes"] == total_episodes
-    merged, ends, rewards = verify_zarr(merged_zarr, total_frames, total_episodes)
+    merged, ends, rewards = verify_zarr(
+        merged_zarr, total_frames, total_episodes, use_depth=args.zarr_use_depth
+    )
     np.testing.assert_array_equal(
         rewards[args.expected_teleop_frames:], wheel_reward,
     )
