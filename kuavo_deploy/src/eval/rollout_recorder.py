@@ -7,6 +7,7 @@ Reward V2 is annotated here; training-ready NPY export belongs to Batch 04.
 import os
 import time
 import warnings
+import zlib
 from pathlib import Path
 
 import cv2
@@ -20,6 +21,7 @@ CAMERA_KEYS = (
 )
 STAGING_FORMAT = "arbim_rollout_staging_v2"
 REWARD_MODE = "last_gripper_release_sparse"
+DEPTH_KEYS = ("observation.depth_h", "observation.depth_l", "observation.depth_r")
 
 
 def _numpy_copy(value):
@@ -57,7 +59,27 @@ def _snapshot(observation, jpeg_quality):
         if not ok:
             raise RuntimeError(f"JPEG encoding failed for {key}")
         rgb[key] = encoded.tobytes()
-    return {"agent_pos": state, "rgb": rgb}
+    snapshot = {"agent_pos": state, "rgb": rgb}
+    present_depth = [key for key in DEPTH_KEYS if key in observation]
+    if present_depth:
+        if len(present_depth) != len(DEPTH_KEYS):
+            raise ValueError(f"Expected all three depth cameras, got {present_depth}")
+        snapshot["depth"] = {}
+        for key in DEPTH_KEYS:
+            depth = _numpy_copy(observation[key])
+            if depth.ndim == 4 and depth.shape[0] == 1:
+                depth = depth[0]
+            if depth.ndim != 3 or depth.shape[0] != 1:
+                raise ValueError(f"{key} must be [1,H,W], got {depth.shape}")
+            if not np.issubdtype(depth.dtype, np.number) or not np.all(np.isfinite(depth)):
+                raise ValueError(f"{key} contains invalid depth values")
+            depth = np.ascontiguousarray(depth)
+            snapshot["depth"][key] = {
+                "shape": tuple(depth.shape),
+                "dtype": depth.dtype.str,
+                "data": zlib.compress(depth.tobytes()),
+            }
+    return snapshot
 
 
 
@@ -250,6 +272,15 @@ class RolloutRecorder:
         if self._actions and action.shape != self._actions[0].shape:
             raise ValueError("Action dimension changed within episode")
         following = _snapshot(next_observation, self.jpeg_quality)
+        first = self._observations[0]
+        if ("depth" in following) != ("depth" in first):
+            raise ValueError("Depth camera availability changed within episode")
+        if "depth" in first:
+            for key in DEPTH_KEYS:
+                if (following["depth"][key]["shape"], following["depth"][key]["dtype"]) != (
+                    first["depth"][key]["shape"], first["depth"][key]["dtype"]
+                ):
+                    raise ValueError(f"{key} depth shape/dtype changed within episode")
         self._actions.append(action)
         self._observations.append(following)
 
@@ -286,6 +317,8 @@ class RolloutRecorder:
                 "episode": self.episode,
                 "success": True,
                 "rgb_storage": "jpeg",
+                "use_depth": "depth" in self._observations[0],
+                "depth_storage": "zlib" if "depth" in self._observations[0] else None,
                 "num_steps": len(self._actions),
                 "observations": self._observations,
                 "actions": actions,
