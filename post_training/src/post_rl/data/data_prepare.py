@@ -1232,53 +1232,140 @@ def _iter_lerobot_frames(dataset, episodes, config, reward_mode, reward_offsets,
             del items
 
 
-def _staging_reward_offsets(lerobot_root, episodes, config):
-    """Use recorded Reward V2 annotations when exporting Data Wheel LeRobot."""
+def _validate_recorded_reward(episode_id, indices, row):
+    if row.get("reward_status") != "valid":
+        raise ValueError(
+            f"Episode {episode_id} has invalid recorded Reward V2; "
+            "export only valid-reward Staging episodes for RL"
+        )
+    if row.get("reward_mode") not in (None, REWARD_MODE_LAST_GRIPPER_RELEASE_SPARSE):
+        raise ValueError(f"Episode {episode_id}: unsupported recorded Reward mode")
+    offset = row.get("reward_index")
+    event = row.get("reward_event")
+    if (
+        not isinstance(offset, int)
+        or not 0 <= offset < len(indices) - 1
+        or not isinstance(event, dict)
+        or event.get("frame_offset") != offset
+    ):
+        raise ValueError(f"Episode {episode_id}: invalid recorded Reward V2 offset")
+    return offset
+
+
+def _reward_offsets_for_subset(dataset, selected_episodes, config):
+    """Calibrate Reward V2 on only selected Teleop episodes, not staged Rollouts."""
+    if not selected_episodes:
+        return {}, None
+    action = _stack_action_column(dataset)
+    indices = np.concatenate([
+        np.asarray(frames, dtype=np.int64)
+        for frames in selected_episodes.values()
+    ])
+    selected_action = np.asarray(action[indices], dtype=np.float32)
+
+    class _ActionOnlyDataset:
+        hf_dataset = {"action": selected_action}
+
+        def __len__(self):
+            return len(selected_action)
+
+        def __getitem__(self, index):
+            return {"action": selected_action[index]}
+
+    local_episodes = {}
+    start = 0
+    for episode_id, frames in selected_episodes.items():
+        local_episodes[episode_id] = list(range(start, start + len(frames)))
+        start += len(frames)
+    return _last_gripper_release_offsets(_ActionOnlyDataset(), local_episodes, config)
+
+
+def _staging_reward_offsets(lerobot_root, episodes, config, dataset=None):
+    """Preserve Staging Reward V2 even after LeRobot merges and multiple rounds."""
     reward_source = str(config.get("reward_source", "auto"))
     if reward_source not in {"auto", "computed", "recorded"}:
         raise ValueError("reward_source must be auto/computed/recorded")
     if reward_source == "computed":
         return None
-    manifest_path = Path(lerobot_root).expanduser().resolve() / "meta" / "arbim_staging_provenance.json"
-    if not manifest_path.is_file():
+
+    meta = Path(lerobot_root).expanduser().resolve() / "meta"
+    staging_path = meta / "arbim_staging_provenance.json"
+    merged_path = meta / "arbim_merge_provenance.json"
+    records = None
+    origin = None
+    if staging_path.is_file():
+        with staging_path.open("r", encoding="utf-8") as fp:
+            manifest = json.load(fp)
+        if manifest.get("format") != "arbim_lerobot_staging_provenance_v1":
+            raise ValueError("unexpected Staging provenance format")
+        records = manifest.get("episodes", [])
+        origin = str(staging_path)
+    elif merged_path.is_file():
+        with merged_path.open("r", encoding="utf-8") as fp:
+            manifest = json.load(fp)
+        if manifest.get("format") != "arbim_lerobot_merge_provenance_v1":
+            raise ValueError("unexpected merged LeRobot provenance format")
+        records = manifest.get("episodes", [])
+        origin = str(merged_path)
+    if records is None:
         if reward_source == "recorded":
-            raise FileNotFoundError(f"recorded Staging Reward metadata missing: {manifest_path}")
+            raise FileNotFoundError(f"recorded Reward provenance missing in {meta}")
         return None
-    with manifest_path.open("r", encoding="utf-8") as fp:
-        manifest = json.load(fp)
-    if manifest.get("format") != "arbim_lerobot_staging_provenance_v1":
-        raise ValueError("unexpected Staging Reward provenance format")
-    records = manifest.get("episodes", [])
     if len(records) != len(episodes):
-        raise ValueError("Staging Reward episode count differs from LeRobot episodes")
-    offsets = {}
+        raise ValueError("recorded Reward episode count differs from LeRobot")
+
+    recorded_offsets = {}
+    to_compute = {}
     for (episode_id, indices), row in zip(episodes.items(), records, strict=True):
-        if (
-            row.get("lerobot_episode_index") != int(episode_id)
-            or row.get("num_frames") != len(indices)
-            or row.get("reward_mode") != REWARD_MODE_LAST_GRIPPER_RELEASE_SPARSE
-        ):
-            raise ValueError(f"Staging Reward metadata mismatch for episode {episode_id}")
-        if row.get("reward_status") != "valid":
-            raise ValueError(
-                f"Episode {episode_id} has invalid Staging Reward V2; "
-                "use --require-valid-reward during Staging -> LeRobot conversion "
-                "for an RL-ready subset"
+        direct_staging = origin == str(staging_path)
+        if direct_staging:
+            if (
+                row.get("lerobot_episode_index") != int(episode_id)
+                or row.get("num_frames") != len(indices)
+                or row.get("reward_mode") != REWARD_MODE_LAST_GRIPPER_RELEASE_SPARSE
+            ):
+                raise ValueError(f"Episode {episode_id}: Staging metadata mismatch")
+            event_row = row
+        else:
+            if (
+                row.get("output_episode_index") != int(episode_id)
+                or row.get("frames") != len(indices)
+            ):
+                raise ValueError(f"Episode {episode_id}: merged metadata mismatch")
+            event_row = row.get("staging_reward")
+
+        if event_row is not None:
+            recorded_offsets[episode_id] = _validate_recorded_reward(
+                episode_id, indices, event_row
             )
-        offset = row.get("reward_index")
-        event = row.get("reward_event")
-        if (
-            not isinstance(offset, int) or not 0 <= offset < len(indices) - 1
-            or not isinstance(event, dict) or event.get("frame_offset") != offset
-        ):
-            raise ValueError(f"Invalid recorded Reward index for episode {episode_id}")
-        offsets[episode_id] = offset
+        else:
+            to_compute[episode_id] = indices
+
+    if not recorded_offsets:
+        if reward_source == "recorded":
+            raise ValueError("Dataset has no recorded Reward V2 episodes")
+        return None
+    if reward_source == "recorded" and to_compute:
+        raise ValueError("reward_source=recorded requires all episodes to have recorded rewards")
+    if to_compute and dataset is None:
+        raise ValueError("LeRobot dataset required to calculate mixed-source rewards")
+
+    computed, computed_metadata = _reward_offsets_for_subset(
+        dataset, to_compute, config
+    ) if to_compute else ({}, None)
+    offsets = {**computed, **recorded_offsets}
+    if set(offsets) != set(episodes):
+        raise RuntimeError("Recorded and computed Reward offsets are incomplete")
     return offsets, {
-        "source": "staging_recorded_v1",
-        "provenance": str(manifest_path),
+        "source": "mixed_lerobot_reward_v2" if to_compute else "staging_recorded_v1",
+        "provenance": origin,
+        "recorded_count": len(recorded_offsets),
+        "computed_count": len(computed),
+        "computed_metadata": computed_metadata,
         "episodes": [
-            {"episode_index": int(ep), "reward_offset": int(offset)}
-            for ep, offset in offsets.items()
+            {"episode_index": int(ep), "reward_offset": int(offsets[ep]),
+             "source": "recorded" if ep in recorded_offsets else "computed"}
+            for ep in episodes
         ],
     }
 
@@ -1309,7 +1396,7 @@ def run_lerobot_to_zarr(config):
     reward_offsets = None
     reward_metadata = None
     if reward_mode == REWARD_MODE_LAST_GRIPPER_RELEASE_SPARSE:
-        recorded = _staging_reward_offsets(lerobot_root, episodes, config)
+        recorded = _staging_reward_offsets(lerobot_root, episodes, config, dataset)
         if recorded is not None:
             reward_offsets, reward_metadata = recorded
         else:
