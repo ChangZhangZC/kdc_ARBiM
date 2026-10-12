@@ -22,6 +22,7 @@ pip install -e ".[pusht]"
 ```
 """
 import sys,os
+import itertools
 import gc
 from std_srvs.srv import Trigger, TriggerRequest, TriggerResponse
 from lerobot_patches import custom_patches
@@ -353,6 +354,12 @@ def kuavo_eval_autotest(config: KuavoConfig):
     timestamp = cfg.timestamp
     epoch = cfg.epoch
     eval_episodes = cfg.eval_episodes
+    wheel_enabled = os.environ.get("ARBIM_DATA_WHEEL") == "1"
+    success_target = None
+    if wheel_enabled:
+        success_target = int(os.environ.get("ARBIM_FLYWHEEL_SUCCESS_TARGET", eval_episodes))
+        if success_target < 1:
+            raise ValueError("Data Wheel success target must be >= 1")
     seed = cfg.seed
     policy_type = cfg.policy_type
 
@@ -366,7 +373,10 @@ def kuavo_eval_autotest(config: KuavoConfig):
     
     with log_file_path.open("w") as log_file:
         log_file.write(f"Evaluation Timestamp: {datetime.datetime.now()}\n")
-        log_file.write(f"Total Episodes: {eval_episodes}\n")
+        if wheel_enabled:
+            log_file.write(f"Target successful rollouts: {success_target}\n")
+        else:
+            log_file.write(f"Total Episodes: {eval_episodes}\n")
     
     
     # Setup policy and environment (只加载一次)
@@ -395,7 +405,8 @@ def kuavo_eval_autotest(config: KuavoConfig):
     init_evt.clear()
 
     success_count = 0
-    for episode in range(eval_episodes):
+    attempted_episodes = 0
+    for episode in (itertools.count() if wheel_enabled else range(eval_episodes)):
 
         while not init_evt.is_set():
             log_robot.info("Waiting for env init...")
@@ -404,6 +415,7 @@ def kuavo_eval_autotest(config: KuavoConfig):
                 return
             time.sleep(1)
         try:
+            attempted_episodes = episode + 1
             result = run_single_episode(config, policy, preprocessor, postprocessor, episode, output_directory)
             log_robot.info(f"Episode {episode+1} completed with return code: {result}")
             
@@ -441,17 +453,31 @@ def kuavo_eval_autotest(config: KuavoConfig):
         with log_file_path.open("a") as log_file:
             log_file.write("\n")
             log_file.write(f"Success Count: {success_count} / Already eval episodes: {episode+1}")
+            if wheel_enabled:
+                log_file.write(f" / Target success: {success_target}")
     
         safe_reset_service(reset_service)
         init_evt.clear()
         success_evt.clear()
-    
+        if wheel_enabled and success_count >= success_target:
+            log_model.info(
+                f"Data Wheel success target reached: {success_count}/{success_target} "
+                f"after {attempted_episodes} attempts"
+            )
+            break
 
     # Display final statistics
     log_model.info("\n" + "="*50)
     log_model.info(f"🎯 Evaluation completed!")
-    log_model.info(f"📊 Success count: {success_count}/{eval_episodes}")
-    log_model.info(f"📈 Success rate: {success_count / eval_episodes:.2%}")
+    log_model.info(
+        f"📊 Success count: {success_count}/{success_target if wheel_enabled else eval_episodes}"
+    )
+    if wheel_enabled:
+        log_model.info(f"📊 Total rollout attempts: {attempted_episodes}")
+    log_model.info(
+        f"📈 Success rate: {success_count / attempted_episodes:.2%}"
+        if attempted_episodes else "📈 Success rate: 0.00%"
+    )
     log_model.info(f"📁 Videos and logs saved to: {output_directory}")
     log_model.info("="*50)
     init_service.shutdown()
