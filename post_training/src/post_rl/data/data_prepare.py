@@ -1182,6 +1182,7 @@ def _iter_lerobot_frames(dataset, episodes, config, reward_mode, reward_offsets,
     """Yield the existing processed-frame contract without writing an NPY."""
     use_depth = bool(config.get("use_depth", False))
     batch_size = int(config.get("stream_batch_size", ZARR_CHUNK_LEAD))
+    jpeg_quality = int(config.get("jpeg_quality", DEFAULT_JPEG_QUALITY))
     max_episode_len = int(config.get("max_episode_len", 2000))
     lambda_penalty = float(config.get("lambda_penalty", 0.05))
     smooth_penalty = float(config.get("smooth_penalty", 0.01))
@@ -1214,7 +1215,11 @@ def _iter_lerobot_frames(dataset, episodes, config, reward_mode, reward_offsets,
                 frame = {
                     "agent_pos": item["agent_pos"],
                     "action": item["action"],
-                    "rgb": item["rgb"],
+                    # Compress before buffering transitions to bound peak RAM.
+                    "rgb": {
+                        key: encode_rgb_jpeg(item["rgb"][key], jpeg_quality)
+                        for key in RGB_FEATURE_TO_BUFFER
+                    },
                     "reward": float(reward),
                     "done": bool(terminal),
                     "timeout": bool(terminal),
