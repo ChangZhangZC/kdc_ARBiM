@@ -130,9 +130,39 @@ def run_case(use_depth):
         print(f"PASS use_depth={use_depth}: frames=27, episodes=2")
 
 
+def test_default_zarr_omits_depth_from_full_lerobot():
+    # Full RGB+Depth LeRobot remains unmodified; Zarr is RGB-only by default.
+    with tempfile.TemporaryDirectory(prefix="arbim_zarr_depth_default_") as name:
+        root = pathlib.Path(name)
+        dataset = FakeLeRobot(use_depth=True)
+        zarr_path = root / "rgb_only.zarr"
+        with patch.object(dp, "load_lerobot_dataset", return_value=dataset):
+            dp.run_lerobot_to_zarr({
+                "lerobot_root": str(root / "full_multimodal_lerobot"),
+                "zarr_output_path": str(zarr_path),
+                "reward_mode": "last_gripper_release_sparse",
+                "reward_left_gripper_index": 7,
+                "reward_right_gripper_index": 15,
+                "reward_open_infer_frames": 3,
+                "reward_min_dwell": 3,
+                "reward_expected_cycles": 1,
+                "stream_batch_size": 6,
+                "jpeg_quality": 95,
+                "overwrite": False,
+                # Intentionally omit use_depth: default must be False.
+            })
+        data = zarr.open_group(str(zarr_path), mode="r")["data"]
+        assert "head_rgb_jpeg_offsets" in data
+        for key in ("head_depth", "wrist_left_depth", "wrist_right_depth"):
+            assert key not in data and f"next_{key}" not in data
+        assert dataset.use_depth
+        print("PASS full LeRobot Depth preserved, Zarr default RGB-only")
+
+
 def main():
     run_case(False)
     run_case(True)
+    test_default_zarr_omits_depth_from_full_lerobot()
     print("SMOKE direct LeRobot -> Zarr PASSED")
 
 
