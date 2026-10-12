@@ -156,6 +156,35 @@ merged Zarr and re-encoded combined LeRobot. Work on a new directory; it
 does **not overwrite** Teleop source, historic NPY or the previous PPO Zarr.
 Always verify Rollout Reward indices, Episode boundaries, and source provenance.
 
+### Resuming after a failure at Step 5 (LeRobot IL merge)
+
+The full E2E is expensive: converting 90,144 Teleop frames to Zarr can take
+more than an hour. If Steps 1–4 already completed and Step 5 failed, **do not**
+rerun them or reuse the incomplete `merged_il_lerobot/` directory. Instead:
+
+```bash
+python post_training/tests/integration/resume_data_contract_merge_lerobot.py \
+  --source-npy data/sim_task1.npy \
+  --work-root outputs/data_contract_e2e_03 \
+  --reference-zarr data/sim_task1.zarr \
+  --output-name merged_il_lerobot_resume_01 \
+  --expected-teleop-episodes 600 \
+  --expected-teleop-frames 90144 \
+  --expected-rollout-episodes 4 \
+  --expected-rollout-frames 600
+```
+
+This validates the already-built Teleop/Rollout/Merged Zarr episode and Reward
+boundaries, reads existing Data Wheel LeRobot provenance and checks that source
+LeRobot task metadata can be resolved. Only Step 5 creates new data, in the
+explicitly named fresh output subdirectory. Step 6 reads the new combined
+LeRobot data back and checks frame/Episode counts.
+
+LeRobot v0.4.x stores `meta.tasks` as a pandas DataFrame indexed by task
+description with a `task_index` column. The merger maps each Episode's
+`task_index` to its source task text; it does **not** treat the DataFrame
+as a boolean or silently replace readable original task strings.
+
 ## Git delivery protocol
 
 ```text

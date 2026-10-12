@@ -85,18 +85,28 @@ def _check_compatible(sources, use_depth):
 
 
 def _episode_task(dataset, first_index, fallback):
-    """Use source task text when available; otherwise require a caller fallback."""
+    """Resolve task_index to text from LeRobot's task metadata.
+
+    LeRobot v0.4.x stores meta.tasks as a pandas DataFrame indexed by task
+    text, with a 'task_index' column. Older test fixtures may use a dict.
+    """
     hf = getattr(dataset, "hf_dataset", None)
     tasks = getattr(dataset.meta, "tasks", None)
-    if hf is not None and tasks:
+    if hf is not None and tasks is not None:
         try:
-            index_value = hf[int(first_index)]["task_index"]
-            index_value = int(index_value.item() if hasattr(index_value, "item") else index_value)
+            raw_index = hf[int(first_index)]["task_index"]
+            task_index = int(raw_index.item() if hasattr(raw_index, "item") else raw_index)
             if isinstance(tasks, dict):
-                value = tasks.get(index_value, tasks.get(str(index_value)))
-                if isinstance(value, str) and value:
-                    return value
-        except (IndexError, KeyError, TypeError, ValueError):
+                task = tasks.get(task_index, tasks.get(str(task_index)))
+                if isinstance(task, str) and task:
+                    return task
+            elif "task_index" in tasks.columns:
+                matches = tasks.index[tasks["task_index"] == task_index]
+                if len(matches) == 1:
+                    task = matches[0]
+                    if isinstance(task, str) and task:
+                        return task
+        except (IndexError, KeyError, TypeError, ValueError, AttributeError):
             pass
     if not fallback:
         raise ValueError("Cannot determine source LeRobot task; set --fallback-task")
