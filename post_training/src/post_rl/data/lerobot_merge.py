@@ -223,7 +223,8 @@ def merge_lerobot_datasets(
                                 item["depth"][key], key,
                                 contract["features"][key]["shape"],
                             )
-                    destination.add_frame(frame, task=task)
+                    frame["task"] = task
+                    destination.add_frame(frame)
                 del items
             destination.save_episode()
             total_frames += len(indices)
