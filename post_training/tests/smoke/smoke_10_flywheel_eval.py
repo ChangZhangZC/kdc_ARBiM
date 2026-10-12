@@ -277,7 +277,7 @@ class TestFlywheelEpisodeIntegration(unittest.TestCase):
             self.assertEqual(result, 1)
             self.assert_clean(env)
             self.assertFalse(list(directory.glob("**/*_staging.npy")))
-            self.assertEqual(len(list(directory.glob("*.mp4"))), len(CAMERA_KEYS))
+            self.assertEqual(len(list(directory.glob("*.mp4"))), len(CAMERA_KEYS) + len(DEPTH_KEYS))
 
 
 if __name__ == "__main__":
