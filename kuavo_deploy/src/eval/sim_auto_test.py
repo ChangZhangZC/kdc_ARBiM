@@ -294,6 +294,13 @@ def run_single_episode(config, policy, preprocessor, postprocessor, episode, out
             # or the maximum number of iterations is reached (i.e. truncated is True)
             done = terminated | truncated | done
             done = done or success_evt.is_set()
+            if recorder is not None and done:
+                print(
+                    f"[DW_END_CHECK] episode={episode} step={step} "
+                    f"terminated={bool(terminated)} truncated={bool(truncated)} "
+                    f"success_evt={success_evt.is_set()}",
+                    flush=True,
+                )
             step += 1
 
             end_time = time.time()
