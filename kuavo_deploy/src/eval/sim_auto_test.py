@@ -365,7 +365,7 @@ def kuavo_eval_autotest(config: KuavoConfig):
 
     # Setup paths
     pretrained_path = resolve_pretrained_path(cfg)
-    output_directory = Path(f"outputs/eval/{task}/{method}/{timestamp}/epoch{epoch}")
+    output_directory = Path(f"outputs/eval/{task}/{method}/{timestamp}/epoch{epoch}{'_flywheel' if wheel_enabled else ''}")
     output_directory.mkdir(parents=True, exist_ok=True)
 
     # Log evaluation results
