@@ -128,7 +128,14 @@ def test_convert(depth):
             result_rl["lerobot_root"], episodes,
             {"reward_source": "recorded"}
         )
-        assert offsets == {0: 9, 1: 9}
+        # The test rollout's later (right) gripper release begins at index 8.
+        # Verify both the known event and byte-for-byte provenance preservation.
+        expected_offsets = {
+            0: int(np.load(first, allow_pickle=True).item()["reward_event"]["frame_offset"]),
+            1: int(np.load(second, allow_pickle=True).item()["reward_event"]["frame_offset"]),
+        }
+        assert expected_offsets == {0: 8, 1: 8}
+        assert offsets == expected_offsets
         assert meta["source"] == "staging_recorded_v1"
         with patch.object(converter, "LeRobotDataset", FakeLeRobot):
             try:
