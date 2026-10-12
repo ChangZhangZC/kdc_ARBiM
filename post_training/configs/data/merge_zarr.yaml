@@ -1,0 +1,17 @@
+# Batch 02: Lossless multi-source Offline RL Zarr merge.
+mode: merge_zarr
+
+# ALWAYS a NEW target directory; existing outputs will never be replaced.
+overwrite: false
+zarr_output_path: /path/to/output/teleop_plus_flywheel.zarr
+
+# Recompute Return from preserved Rewards and Done boundaries.
+return_gamma: 0.99
+
+# At least two sources. All sources must share the same Reward semantics,
+# RGB/Depth contract and core Zarr schema.
+zarr_sources:
+  - name: teleop_reward_v2
+    path: /path/to/teleop_reward_v2.zarr
+  - name: flywheel_round_01
+    path: /path/to/flywheel_round_01.zarr

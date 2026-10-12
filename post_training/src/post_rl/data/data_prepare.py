@@ -73,7 +73,7 @@ def load_config(path):
     cfg.setdefault("reward_min_dwell", 3)
     cfg.setdefault("reward_expected_cycles", 1)
     cfg.setdefault("use_depth", False)
-    cfg.setdefault("overwrite", cfg.get("mode") != "lerobot_to_zarr")
+    cfg.setdefault("overwrite", cfg.get("mode") not in ("lerobot_to_zarr", "merge_zarr"))
     cfg.setdefault("teleop_sources", [])
     cfg.setdefault("stream_batch_size", ZARR_CHUNK_LEAD)
     cfg.setdefault("jpeg_quality", DEFAULT_JPEG_QUALITY)
@@ -1528,9 +1528,12 @@ def main():
         run_build_db(config)
     elif mode == "lerobot_to_zarr":
         run_lerobot_to_zarr(config)
+    elif mode == "merge_zarr":
+        from post_rl.data.zarr_merge import merge_zarr_datasets
+        merge_zarr_datasets(config)
     else:
         raise ValueError(
-            f"unknown mode: {mode!r}. expected 'raw_to_npy', 'build_db', or 'lerobot_to_zarr'."
+            f"unknown mode: {mode!r}. expected 'raw_to_npy', 'build_db', 'lerobot_to_zarr', or 'merge_zarr'."
         )
 
 
