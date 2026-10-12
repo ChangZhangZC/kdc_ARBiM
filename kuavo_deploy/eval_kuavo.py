@@ -296,9 +296,28 @@ def main():
         elif sub_choice == "8":
             start_task(["python3", str(auto_test), "--task", "auto_test", "--config", config_path])
         elif sub_choice == "9":
+            wheel_config = input(
+                f"Data Wheel YAML path (Enter to use {config_path}): "
+            ).strip() or config_path
+            if not Path(wheel_config).is_file():
+                print(f"❌ Configuration file not found: {wheel_config}")
+                continue
+            parse_config(wheel_config)
+            try:
+                target = int(input("Number of successful rollouts to collect: ").strip())
+            except ValueError:
+                print("❌ Please enter a positive integer.")
+                continue
+            if target <= 0:
+                print("❌ Success target must be positive.")
+                continue
             data_wheel_env = os.environ.copy()
             data_wheel_env["ARBIM_DATA_WHEEL"] = "1"
-            start_task(["python3", str(auto_test), "--task", "auto_test", "--config", config_path], env=data_wheel_env)
+            data_wheel_env["ARBIM_FLYWHEEL_SUCCESS_TARGET"] = str(target)
+            start_task(
+                ["python3", str(auto_test), "--task", "auto_test", "--config", wheel_config],
+                env=data_wheel_env,
+            )
         elif sub_choice == "10":
             print("Exiting...")
             break
