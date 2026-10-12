@@ -16,6 +16,15 @@ integration tests pass on the ARBiM environment.
 This migration changes the *data preparation contract*, **not** ACT/PPO
 trainer interfaces or the existing Zarr schema (`jpeg_bytes_v1`).
 
+**Depth policy (independent at each stage):** Data Wheel must capture all
+three Depth cameras; Staging NPY, the converted Rollout LeRobot, and the
+merged LeRobot archive must preserve them. Zarr is a derived PPO cache:
+`use_depth: false` is the **default**. Set `use_depth: true` explicitly
+in `data_prepare.yaml` (or `--zarr-use-depth` in real E2E) to add
+Depth to a new Zarr. Both ACT/IL and PPO training use RGB-only by default
+unless the *model/dataset* configuration is explicitly Depth-enabled.
+A training setting never controls whether Depth was archived.
+
 ## Pipeline
 
 ```text
@@ -27,7 +36,7 @@ Data Wheel eval -> Staging NPY -> staging_to_lerobot.py -> Rollout LeRobot
                     still usable for IL by default           |       |
                                                               |       |
   Teleop LeRobot + Rollout LeRobot ---> lerobot_merge.py ---> ACT IL
-          |                         (re-encodes LeRobot video)
+          |                         (official file-level copy/remux)
           +--> lerobot_to_zarr -----------------------------+
                                                               |
   Rollout LeRobot --> lerobot_to_zarr (recorded Reward V2) ----+
@@ -44,7 +53,10 @@ python post_training/src/post_rl/data/data_prepare.py \
   --config post_training/configs/data/lerobot_to_zarr.yaml
 ```
 
-Set `lerobot_root`, a **new** `zarr_output_path`, and `use_depth`.
+Set `lerobot_root`, a **new** `zarr_output_path`, and choose `use_depth`:
+`false` (default) builds an RGB-only PPO Zarr **without removing any Depth
+from the LeRobot source**; `true` opts into Depth arrays in the Zarr.
+This covers Staging NPY → LeRobot → Zarr as well as Teleop LeRobot → Zarr.
 `reward_mode: last_gripper_release_sparse` is Reward V2.
 `reward_source: auto` (default) checks for
 `meta/arbim_staging_provenance.json` and uses **recorded** reward indices
@@ -97,8 +109,12 @@ python post_training/src/post_rl/data/staging_to_lerobot.py \
 
 Default **IL export**: every successful staging episode, even
 `reward_status=invalid`. Use `--require-valid-reward` to export a
-**Reward-V2-valid RL subset**, and `--use-depth` only when every selected
-Staging episode and the LeRobot template have all three Depth cameras.
+**Reward-V2-valid RL subset**. All three Depth cameras are **required and
+retained by default**. Data Wheel checks for them at capture time and the
+converter rejects missing Depth; for historic RGB-only Staging use
+`--rgb-only-legacy` deliberately, but never treat such data as a full archive.
+Depth is stored in Staging as normalized quantized PNG uint8, **not raw
+millimeter depths**.
 
 Staging has `T` actions and `T+1` observations. LeRobot stores
 `(obs_t, action_t)` for `t=0..T-1`: do **not** insert a fake final Action.
@@ -119,13 +135,19 @@ python post_training/src/post_rl/data/lerobot_merge.py \
   --fallback-task "ARBiM"
 ```
 
-Optional: `--use-depth` and `--batch-size 25`. Inputs must match features
-(including state/action names), FPS, robot type, RGB (and selected Depth).
-The writer streams complete Episodes and records
-`meta/arbim_merge_provenance.json`. LeRobot videos are decoded and
-re-encoded; unlike Zarr Merge this is **not byte-for-byte video copying**.
+Archival merge **requires all three Depth features by default**, and official
+`lerobot.datasets.dataset_tools.merge_datasets()` additionally requires
+the **complete** feature schema, FPS and robot type to match across sources.
+No features are silently removed. LeRobot copies existing video streams,
+remuxing only when needed (no framewise AV1 re-encode), then rewrites
+Parquet indices/tasks/metadata. ARBiM writes
+`meta/arbim_merge_provenance.json` to preserve Reward V2 source events,
+including on repeated merges. `--allow-rgb-only` exists for intentional
+legacy RGB-only archives; `--batch-size` is retained only for API
+compatibility and does not control the official file-level operation.
 A combined IL LeRobot is not the default RL input: convert each clean source
-to its own Zarr and merge Zarr to preserve recorded Reward semantics.
+to RGB-only Zarr (unless explicitly opting into Depth), then merge Zarr to
+preserve recorded Reward semantics.
 
 ## Safe migration and testing
 
@@ -140,7 +162,11 @@ Run synthetic tests from the project root in the `arbim` environment:
 bash post_training/tests/run_data_contract.sh
 ```
 
-The complete real-data integration runner (new **work root** required):
+The complete real-data integration runner (new **work root** required).
+Its Staging sources must have three Depth cameras; older RGB-only staging
+from an earlier evaluation cannot be used to test this archive contract.
+The following builds RGB-only Zarr by default; append `--zarr-use-depth`
+to explicitly test Depth-enabled Zarr:
 ```bash
 python post_training/tests/integration/check_data_contract_real.py \
   --source-npy data/sim_task1.npy \
@@ -152,7 +178,7 @@ python post_training/tests/integration/check_data_contract_real.py \
 ```
 
 Requires substantial temporary disk space for a Teleop Zarr, Rollout Zarr,
-merged Zarr and re-encoded combined LeRobot. Work on a new directory; it
+merged Zarr and a file-level merged LeRobot. Work on a new directory; it
 does **not overwrite** Teleop source, historic NPY or the previous PPO Zarr.
 Always verify Rollout Reward indices, Episode boundaries, and source provenance.
 
