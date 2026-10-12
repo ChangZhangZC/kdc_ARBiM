@@ -1,49 +1,46 @@
-# Data Preparation Mode
-#   raw_to_npy : LeRobot dataset -> processed .npy
-#   build_db   : processed .npy -> Offline RL Zarr dataset
-mode: raw_to_npy
+# ARBiM data contract (LeRobot is the long-term dataset; Zarr is the RL view).
+# Main modes:
+#   lerobot_to_zarr : LeRobot -> Offline RL Zarr, Reward/Return calculated here.
+#   merge_zarr      : Merge 2+ compatible Offline RL Zarr directories.
+#
+# The old raw_to_npy/build_db entrypoints remain temporarily for regression
+# and migration compatibility; do not use them for new Data Wheel rounds.
+mode: lerobot_to_zarr
 
+# Always choose a NEW output directory. Never replace training datasets.
+overwrite: false
+zarr_output_path: /path/to/output/sim_task1_reward_v2.zarr
+
+# lerobot_to_zarr input. The directory must contain meta/.
+lerobot_root: /path/to/teleop_or_rollout_lerobot
 use_depth: false
-
-# Streaming batch size for both stages. This bounds peak RAM usage.
 stream_batch_size: 50
-
-# RGB is JPEG-compressed in the processed NPY and remains JPEG-compressed in Zarr.
-# Higher quality increases disk usage. Recommended V1 default: 95.
 jpeg_quality: 95
 
-# raw_to_npy: LeRobot -> processed .npy
-lerobot_root: /path/to/lerobot_dataset
-processed_npy_output: /path/to/processed/teleop.npy
-
-# Reward V2: keep the full recorded episode, but place the only +1 reward at the
-# later of the two action-gripper release events. done/timeout still remain at
-# the original recording end. This mode intentionally disables length/smooth
-# shaping so every other frame has reward 0.
-reward_mode: last_gripper_release_sparse  # option: episode_end_shaped / last_gripper_release_sparse
+# Data Wheel LeRobot stores Reward V2 provenance in meta/.
+# auto: use recorded Reward for staged episodes, calculate for Teleop episodes.
+# recorded: require recorded Reward V2 for EVERY episode.
+# computed: ignore recorded provenance and recompute.
+reward_source: auto  # options: auto / recorded / computed
+reward_mode: last_gripper_release_sparse  # alternatives: episode_end_shaped
 reward_left_gripper_index: 7
 reward_right_gripper_index: 15
-reward_left_open_side: auto   # option: auto / low / high
-reward_right_open_side: auto  # option: auto / low / high
+reward_left_open_side: auto
+reward_right_open_side: auto
 reward_open_infer_frames: 5
 reward_min_dwell: 3
 reward_expected_cycles: 1
 
-# Only used by legacy reward_mode=episode_end_shaped.
+# Used only for reward_mode=episode_end_shaped.
 max_episode_len: 2000
 lambda_penalty: 0.05
 smooth_penalty: 0.01
 
-# build_db: one or more processed .npy -> Offline RL Zarr
-overwrite: true
-zarr_output_path: /path/to/output/offline_rl.zarr
-
-teleop_sources:
-  - name: teleop_main
-    path: /path/to/processed/teleop.npy
-
-  # 多批数据可继续添加：
-  # - name: original_demo
-  #   path: /path/to/processed/original_demo.npy
-  # - name: rollout_round_01
-  #   path: /path/to/processed/rollout_round_01.npy
+# merge_zarr mode settings (ignored in lerobot_to_zarr).
+# Reward semantics, RGB/Depth structure, and action dimensions must match.
+return_gamma: 0.99
+zarr_sources:
+  - name: teleop_reward_v2
+    path: /path/to/teleop_reward_v2.zarr
+  - name: flywheel_round_01
+    path: /path/to/flywheel_round_01.zarr
