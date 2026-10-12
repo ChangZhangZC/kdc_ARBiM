@@ -70,15 +70,17 @@ def main():
         raise FileNotFoundError(f"Missing Staging reward provenance: {wheel_provenance}")
 
     base, base_ends, base_rewards = verify_zarr(
-        teleop_zarr, args.expected_teleop_frames, args.expected_teleop_episodes
+        teleop_zarr, args.expected_teleop_frames, args.expected_teleop_episodes,
+        use_depth=args.zarr_use_depth,
     )
     wheel, wheel_ends, wheel_rewards = verify_zarr(
-        wheel_zarr, args.expected_rollout_frames, args.expected_rollout_episodes
+        wheel_zarr, args.expected_rollout_frames, args.expected_rollout_episodes,
+        use_depth=args.zarr_use_depth,
     )
     total_frames = args.expected_teleop_frames + args.expected_rollout_frames
     total_episodes = args.expected_teleop_episodes + args.expected_rollout_episodes
     combined, ends, combined_rewards = verify_zarr(
-        merged_zarr, total_frames, total_episodes
+        merged_zarr, total_frames, total_episodes, use_depth=args.zarr_use_depth,
     )
     np.testing.assert_array_equal(ends[:len(base_ends)], base_ends)
     np.testing.assert_array_equal(
