@@ -15,7 +15,7 @@ import sys
 import numpy as np
 
 REPO_ROOT = Path(__file__).resolve().parents[4]
-for folder in (REPO_ROOT, REPO_ROOT / "third_party" / "lerobot" / "src"):
+for folder in (REPO_ROOT, REPO_ROOT / "post_training" / "src", REPO_ROOT / "third_party" / "lerobot" / "src"):
     if str(folder) not in sys.path:
         sys.path.insert(0, str(folder))
 import lerobot_patches.custom_patches  # noqa: F401
