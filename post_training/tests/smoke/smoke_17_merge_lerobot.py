@@ -38,11 +38,25 @@ def run_case(depth):
             str(sources[0].resolve()): FakeReader(depth=depth, repo_id="teleop"),
             str(sources[1].resolve()): FakeReader(depth=depth, repo_id="flywheel"),
         }
+        # Mirror the schema written by staging_to_lerobot.py, not a partial
+        # hand-written provenance file. The fake actions release at 9 and 8.
+        staging_episodes = [
+            {
+                "lerobot_episode_index": i,
+                "num_frames": length,
+                "success": True,
+                "reward_mode": "last_gripper_release_sparse",
+                "reward_status": "valid",
+                "reward_index": reward_idx,
+                "reward_event": {"frame_offset": reward_idx},
+            }
+            for i, (length, reward_idx) in enumerate(((14, 9), (13, 8)))
+        ]
         (sources[1] / "meta" / "arbim_staging_provenance.json").write_text(
-            json.dumps({"episodes": [
-                {"reward_status": "valid", "reward_index": 9},
-                {"reward_status": "valid", "reward_index": 8},
-            ]}),
+            json.dumps({
+                "format": "arbim_lerobot_staging_provenance_v1",
+                "episodes": staging_episodes,
+            }),
             encoding="utf-8",
         )
         FakeWriter.instances.clear()
@@ -73,7 +87,8 @@ def run_case(depth):
         assert [item["output_episode_index"] for item in metadata["episodes"]] == [0, 1, 2, 3]
         assert [item["source_episode_index"] for item in metadata["episodes"]] == [0, 1, 0, 1]
         assert "staging_reward" not in metadata["episodes"][0]
-        assert metadata["episodes"][2]["staging_reward"]["reward_index"] == 9
+        assert metadata["episodes"][2]["staging_reward"] == staging_episodes[0]
+        assert metadata["episodes"][3]["staging_reward"] == staging_episodes[1]
         assert sources[0].exists() and sources[1].exists()
         print(f"PASS merge LeRobot use_depth={depth}, episodes=4, frames=54")
 
