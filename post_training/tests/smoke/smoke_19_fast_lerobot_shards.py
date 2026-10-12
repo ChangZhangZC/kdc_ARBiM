@@ -98,11 +98,13 @@ def test_scoped_compat_is_restored():
     original_video = compat.aggregate.aggregate_videos
     original_data = compat.aggregate.aggregate_data
     original_metadata = compat.aggregate.update_meta_data
+    original_meta_writer = compat.aggregate.aggregate_metadata
 
     def fake_merger(*, datasets, output_repo_id, output_dir):
         assert compat.aggregate.aggregate_videos is compat._aggregate_videos
         assert compat.aggregate.aggregate_data is compat._aggregate_data
         assert compat.aggregate.update_meta_data is compat._update_meta_data
+        assert compat.aggregate.aggregate_metadata is compat._aggregate_metadata
         return "merged"
 
     with patch.object(compat, "merge_datasets", side_effect=fake_merger):
@@ -113,6 +115,7 @@ def test_scoped_compat_is_restored():
     assert compat.aggregate.aggregate_videos is original_video
     assert compat.aggregate.aggregate_data is original_data
     assert compat.aggregate.update_meta_data is original_metadata
+    assert compat.aggregate.aggregate_metadata is original_meta_writer
     print("PASS official merger context and restoration")
 
 
