@@ -6,8 +6,19 @@ dataset builds are **manual**. No dedicated Data Wheel YAML is used.
 
 ## 1. Evaluate and record
 
-Use `kuavo_deploy/eval_kuavo.py` with your regular evaluation config; choose
-`9. data_wheel` in the task menu (ordinary `8. auto_test` is unchanged).
+Use `kuavo_deploy/eval_kuavo.py` and open the task menu. Choose
+`9. data_wheel`. After selecting a task, the menu prompts for a YAML
+config path (Enter can reuse a previously selected path). Data Wheel then
+prompts for a **positive integer number of successful rollouts to collect**.
+Ordinary `8. auto_test` requests only the YAML path and remains capped by
+`inference.eval_episodes`.
+
+In Data Wheel mode `inference.eval_episodes` is **not** the attempt limit:
+the evaluator retries failed episodes until the requested success count is
+reached or the user stops the task. Success means the existing MuJoCo
+`/simulator/success` event, not Reward V2 validity. Successes with an invalid
+Reward are still counted as collected staging files, but the manual converter
+will skip them.
 
 The existing evaluation writes videos and logs as usual, and additionally
 stores successful rollout records in:
@@ -19,7 +30,13 @@ outputs/eval/<task>/<method>/<timestamp>/epoch<epoch>/data_wheel/staging/
 
 Each staging file uses `arbim_rollout_staging_v2` and contains T actions,
 T+1 observations (16D state and three JPEG RGB cameras), and Reward V2
-annotations. The success signal is `/simulator/success`. Failed episodes and
+annotations. **When all three Depth keys** (`observation.depth_h/l/r`) are
+available from the configured simulation, Recorder additionally stores
+Depth with lossless zlib compression. RGB-only configs remain supported;
+missing Depth is not synthesized. Depth is captured **as returned by the
+environment**: the current `ObsBuffer.depth_preprocess()` uses per-frame
+normalization, so these values are not raw millimeter depth.
+ The success signal is `/simulator/success`. Failed episodes and
 interrupted episodes do not produce a staging file.
 
 The existing Reward V2 assigns a sparse +1 at the later of two detected
@@ -39,7 +56,8 @@ python post_training/src/post_rl/data/rollout_to_npy.py \
 Only successful staging episodes with valid Reward V2 are included. The
 converter reports counts and skipped-invalid paths. The output is one
 `arbim_processed_npy_stream_v2` file containing multiple episodes; it
-preserves the existing JPEG bytes. It refuses to overwrite by default
+preserves the existing JPEG bytes and restores optional Depth tensors with
+their original recorded dtype and shape. It refuses to overwrite by default
 (`--overwrite` explicitly replaces a prior output).
 
 If no episodes have a valid reward, conversion fails rather than generating
@@ -53,7 +71,7 @@ Edit **only** `post_training/configs/data/data_prepare.yaml`; set:
 
 ```yaml
 mode: build_db
-use_depth: false
+use_depth: false  # set true only if both original Teleop and Rollout NPY have 3 Depth cameras
 overwrite: false
 zarr_output_path: /path/to/output/offline_rl_flywheel_round_01.zarr
 
@@ -92,11 +110,12 @@ python post_training/tests/smoke/smoke_07_flywheel_recorder.py
 python post_training/tests/smoke/smoke_08_flywheel_npy.py
 python post_training/tests/smoke/smoke_09_flywheel_dataset.py
 python post_training/tests/smoke/smoke_10_flywheel_eval.py
+python post_training/tests/smoke/smoke_11_flywheel_target.py
 ```
 
 The tests cover the Recorder/Reward, NPY converter, mixed-source
-Zarr/OfflineBuffer/50-step sampling, and mocked evaluation success/failure,
-Stop, exception, and normal-mode paths. The last test executes the real
+Zarr/OfflineBuffer/50-step sampling, optional Depth, and mocked evaluation
+success/failure, Stop, exception, success quota, and normal-mode paths. The last test executes the real
 `run_single_episode` function with fake ROS/MuJoCo objects; it is **not** a
 substitute for a live MuJoCo + ROS evaluation.
 
