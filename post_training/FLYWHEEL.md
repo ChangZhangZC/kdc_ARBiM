@@ -25,6 +25,15 @@ writes **all evaluation outputs** (logs, rollout videos and staging) under
 `epoch<epoch>_flywheel/` instead, so the two modes do not share filenames.
 The policy checkpoint lookup is unchanged.
 
+Only menu `9. data_wheel` enables the post-success rollout tail: by default
+the policy continues for **5 additional environment steps** after
+`/simulator/success`, allowing the existing Reward V2 release detector
+to observe the full closing-to-opening transition. The tail stops early on
+`terminated` or `truncated`. Override its length for menu 9 using
+`ARBIM_DW_POST_SUCCESS_STEPS=N` (allowed: 0–20; 0 disables it).
+Menu `8. auto_test` explicitly clears all Data Wheel environment flags and
+**always exits at success without the tail**; other menu tasks are unchanged.
+
 The existing evaluation writes videos and logs as usual, and additionally
 stores successful rollout records in:
 
@@ -55,7 +64,7 @@ Run from the repository root:
 
 ```bash
 python post_training/src/post_rl/data/rollout_to_npy.py \
-  outputs/eval/<task>/<method>/<timestamp>/epoch<epoch>/data_wheel/staging \
+  outputs/eval/<task>/<method>/<timestamp>/epoch<epoch>_flywheel/data_wheel/staging \
   --output /path/to/processed/rollout_round_01.npy
 ```
 

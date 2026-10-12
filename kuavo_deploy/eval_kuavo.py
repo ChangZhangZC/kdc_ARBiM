@@ -304,7 +304,13 @@ def main():
         elif sub_choice == "7":
             start_task(["python3", str(script), "--task", "go", "--verbose", "--config", config_path])
         elif sub_choice == "8":
-            start_task(["python3", str(auto_test), "--task", "auto_test", "--config", config_path])
+            normal_eval_env = os.environ.copy()
+            for key in ("ARBIM_DATA_WHEEL", "ARBIM_FLYWHEEL_SUCCESS_TARGET", "ARBIM_DW_POST_SUCCESS_STEPS"):
+                normal_eval_env.pop(key, None)
+            start_task(
+                ["python3", str(auto_test), "--task", "auto_test", "--config", config_path],
+                env=normal_eval_env,
+            )
         elif sub_choice == "9":
             try:
                 target = int(input("Number of successful rollouts to collect: ").strip())
@@ -317,6 +323,8 @@ def main():
             data_wheel_env = os.environ.copy()
             data_wheel_env["ARBIM_DATA_WHEEL"] = "1"
             data_wheel_env["ARBIM_FLYWHEEL_SUCCESS_TARGET"] = str(target)
+            # Only menu 9 enables the five-step post-success tail by default.
+            data_wheel_env.setdefault("ARBIM_DW_POST_SUCCESS_STEPS", "5")
             start_task(
                 ["python3", str(auto_test), "--task", "auto_test", "--config", config_path],
                 env=data_wheel_env,

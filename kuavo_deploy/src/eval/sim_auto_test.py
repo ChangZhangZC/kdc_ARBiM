@@ -248,6 +248,11 @@ def run_single_episode(config, policy, preprocessor, postprocessor, episode, out
         average_action_infer_time = 0
         average_step_time = 0
 
+        # Diagnostic-only: opt in to a short post-success tail in Data Wheel mode.
+        post_success_steps = int(os.environ.get("ARBIM_DW_POST_SUCCESS_STEPS", "0")) if recorder is not None else 0
+        if not 0 <= post_success_steps <= 20:
+            raise ValueError("ARBIM_DW_POST_SUCCESS_STEPS must be between 0 and 20")
+        tail_remaining = None
         step = 0
         done = False
         while not done:
@@ -292,8 +297,31 @@ def run_single_episode(config, policy, preprocessor, postprocessor, episode, out
 
             # The rollout is considered done when the success state is reached (i.e. terminated is True),
             # or the maximum number of iterations is reached (i.e. truncated is True)
-            done = terminated | truncated | done
-            done = done or success_evt.is_set()
+            env_finished = bool(terminated or truncated)
+            succeeded = success_evt.is_set()
+            if recorder is not None and post_success_steps and succeeded and not env_finished:
+                if tail_remaining is None:
+                    tail_remaining = post_success_steps
+                    print(
+                        f"[DW_TAIL_START] episode={episode} success_step={step} "
+                        f"extra_steps={post_success_steps}",
+                        flush=True,
+                    )
+                else:
+                    tail_remaining -= 1
+                    print(
+                        f"[DW_TAIL_STEP] episode={episode} step={step} "
+                        f"remaining={tail_remaining} right_action={executed_action[15]:.4f}",
+                        flush=True,
+                    )
+            done = env_finished or (succeeded and (tail_remaining is None or tail_remaining == 0))
+            if recorder is not None and done:
+                print(
+                    f"[DW_END_CHECK] episode={episode} step={step} "
+                    f"terminated={bool(terminated)} truncated={bool(truncated)} "
+                    f"success_evt={succeeded} tail_remaining={tail_remaining}",
+                    flush=True,
+                )
             step += 1
 
             end_time = time.time()

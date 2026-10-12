@@ -18,6 +18,7 @@ import torch
 
 ROOT = Path(__file__).resolve().parents[3]
 SCRIPT = ROOT / "kuavo_deploy" / "src" / "eval" / "sim_auto_test.py"
+MENU_SCRIPT = ROOT / "kuavo_deploy" / "eval_kuavo.py"
 
 
 class AlwaysReady:
@@ -131,6 +132,71 @@ class TestTargetSuccessCount(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "target must be >= 1"):
                 runner(self.cfg)
         self.assertEqual(attempts, [])
+
+
+
+class TestMenuTailIsolation(unittest.TestCase):
+    """Menu 8 must never inherit Data Wheel mode; only menu 9 enables the tail."""
+
+    def launch_menu(self, choice, *, incoming=None):
+        menu_tree = ast.parse(MENU_SCRIPT.read_text(encoding="utf-8"), filename=str(MENU_SCRIPT))
+        main_func = next(
+            node for node in menu_tree.body
+            if isinstance(node, ast.FunctionDef) and node.name == "main"
+        )
+        module = ast.fix_missing_locations(ast.Module(body=[main_func], type_ignores=[]))
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            script = root / "script.py"
+            auto_test = root / "script_auto_test.py"
+            config = root / "example.yaml"
+            for item in (script, auto_test, config):
+                item.write_text("stub", encoding="utf-8")
+            answers = iter(["3", choice, str(config)] + (["2"] if choice == "9" else []) + ["10"])
+            launched = []
+
+            def fake_popen(cmd, **kwargs):
+                launched.append((cmd, kwargs))
+                return types.SimpleNamespace(pid=12345)
+
+            ns = {
+                "os": os, "Path": Path,
+                "subprocess": types.SimpleNamespace(Popen=fake_popen, STDOUT=-2),
+                "sys": __import__("sys"), "current_proc": None, "LOG_DIR": None,
+                "print_header": lambda: None,
+                "get_script_paths": lambda: (root, script, auto_test),
+                "ensure_log_dir": lambda _: root,
+                "print_task_menu": lambda **kwargs: None,
+                "parse_config": lambda path: None,
+                "interactive_controller": lambda: None,
+                "input": lambda prompt: next(answers),
+            }
+            exec(compile(module, str(MENU_SCRIPT), "exec"), ns)
+            with patch.dict(os.environ, incoming or {}, clear=True):
+                ns["main"]()
+            self.assertEqual(len(launched), 1)
+            return launched[0][1]["env"]
+
+    def test_menu_8_never_inherits_data_wheel_tail(self):
+        env = self.launch_menu("8", incoming={
+            "ARBIM_DATA_WHEEL": "1",
+            "ARBIM_FLYWHEEL_SUCCESS_TARGET": "5",
+            "ARBIM_DW_POST_SUCCESS_STEPS": "10",
+            "OTHER_KEY": "keep",
+        })
+        for key in ("ARBIM_DATA_WHEEL", "ARBIM_FLYWHEEL_SUCCESS_TARGET", "ARBIM_DW_POST_SUCCESS_STEPS"):
+            self.assertNotIn(key, env)
+        self.assertEqual(env["OTHER_KEY"], "keep")
+
+    def test_menu_9_enables_five_steps_by_default(self):
+        env = self.launch_menu("9")
+        self.assertEqual(env["ARBIM_DATA_WHEEL"], "1")
+        self.assertEqual(env["ARBIM_FLYWHEEL_SUCCESS_TARGET"], "2")
+        self.assertEqual(env["ARBIM_DW_POST_SUCCESS_STEPS"], "5")
+
+    def test_menu_9_allows_explicit_tail_override(self):
+        env = self.launch_menu("9", incoming={"ARBIM_DW_POST_SUCCESS_STEPS": "7"})
+        self.assertEqual(env["ARBIM_DW_POST_SUCCESS_STEPS"], "7")
 
 
 if __name__ == "__main__":
