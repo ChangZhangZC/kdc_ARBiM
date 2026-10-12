@@ -152,7 +152,7 @@ def _read_template(template_root, use_depth):
 
 def convert_staging_to_lerobot(
     staging_sources, template_root, output_root, repo_id, task,
-    *, use_depth=False, require_valid_reward=False,
+    *, use_depth=True, require_valid_reward=False,
 ):
     paths = discover_staging(staging_sources)
     accepted = []
