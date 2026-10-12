@@ -75,6 +75,7 @@ def run_case(depth):
         assert len(writer.episodes) == 4
         assert [len(ep) for ep in writer.episodes] == [14, 13, 14, 13]
         for ep in writer.episodes:
+            assert all(frame["task"] == "sort toy" for frame in ep)
             assert all(frame["action"].shape == (16,) for frame in ep)
             assert all(frame["observation.state"].shape == (16,) for frame in ep)
             assert all(frame["observation.images.head_cam_h"].shape == (16, 16, 3) for frame in ep)

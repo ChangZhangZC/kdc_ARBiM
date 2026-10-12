@@ -208,7 +208,8 @@ def convert_staging_to_lerobot(
                 for key in DEPTH_KEYS:
                     shape = tuple(features[key]["shape"])
                     frame[key] = _decode_depth(obs["depth"][key], shape, key)
-            dataset.add_frame(frame, task=task)
+            frame["task"] = task
+            dataset.add_frame(frame)
         dataset.save_episode()
         total_frames += len(actions)
         # Keep the last T+1 observation in Staging, do not fabricate a dummy action.

@@ -46,8 +46,10 @@ class FakeWriter:
         self.hf_dataset = None
         self.__class__.instances.append(self)
 
-    def add_frame(self, frame, task):
-        assert task == "sort toy"
+    def add_frame(self, frame):
+        # Match the real LeRobotDataset.add_frame(frame) API: task belongs
+        # inside the frame dict, not in a separate keyword argument.
+        assert frame["task"] == "sort toy"
         self.current.append(frame)
 
     def save_episode(self):
