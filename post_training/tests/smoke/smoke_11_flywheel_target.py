@@ -101,10 +101,11 @@ class TestTargetSuccessCount(unittest.TestCase):
                 os.chdir(tmp)
                 with patch.dict(os.environ, environment):
                     fn(self.cfg)
-                log = (
-                    Path("outputs/eval/fake_sim/fake_model/test_run/epoch0")
-                    / "evaluation_autotest.log"
-                ).read_text()
+                eval_base = Path("outputs/eval/fake_sim/fake_model/test_run")
+                output_name = "epoch0_flywheel" if target is not None else "epoch0"
+                self.assertTrue((eval_base / output_name).is_dir())
+                self.assertFalse((eval_base / ("epoch0" if target is not None else "epoch0_flywheel")).exists())
+                log = (eval_base / output_name / "evaluation_autotest.log").read_text()
             finally:
                 os.chdir(before)
         return attempts, log
