@@ -259,17 +259,27 @@ def main():
         print("Invalid Option")
         return
 
-    config_path = input("Please specify filepath to the configuration file: ").strip()
-    if not Path(config_path).exists():
-        print(f"❌ Configuration file not found: {config_path}")
-        sys.exit(1)
-
-    parse_config(config_path)
-
+    config_path = ""
     while True:
-        print_task_menu(config_path=config_path, use_color=True)
-
+        print_task_menu(config_path=config_path or "<config_path>", use_color=True)
         sub_choice = input("Please select one of the following options (1-10): ").strip()
+        if sub_choice == "10":
+            print("Exiting...")
+            break
+        if sub_choice not in {str(i) for i in range(1, 10)}:
+            print("❌ Invalid choice: ", sub_choice)
+            continue
+
+        requested_path = input(
+            f"Please specify filepath to the configuration file"
+            f"{f' (Enter to reuse {config_path})' if config_path else ''}: "
+        ).strip()
+        selected_path = requested_path or config_path
+        if not Path(selected_path).is_file():
+            print(f"❌ Configuration file not found: {selected_path}")
+            continue
+        parse_config(selected_path)
+        config_path = selected_path
 
         def start_task(cmd, env=None):
             global current_proc
@@ -296,13 +306,6 @@ def main():
         elif sub_choice == "8":
             start_task(["python3", str(auto_test), "--task", "auto_test", "--config", config_path])
         elif sub_choice == "9":
-            wheel_config = input(
-                f"Data Wheel YAML path (Enter to use {config_path}): "
-            ).strip() or config_path
-            if not Path(wheel_config).is_file():
-                print(f"❌ Configuration file not found: {wheel_config}")
-                continue
-            parse_config(wheel_config)
             try:
                 target = int(input("Number of successful rollouts to collect: ").strip())
             except ValueError:
@@ -315,14 +318,9 @@ def main():
             data_wheel_env["ARBIM_DATA_WHEEL"] = "1"
             data_wheel_env["ARBIM_FLYWHEEL_SUCCESS_TARGET"] = str(target)
             start_task(
-                ["python3", str(auto_test), "--task", "auto_test", "--config", wheel_config],
+                ["python3", str(auto_test), "--task", "auto_test", "--config", config_path],
                 env=data_wheel_env,
             )
-        elif sub_choice == "10":
-            print("Exiting...")
-            break
-        else:
-            print("❌ Invalid choice: ", sub_choice)
 
 
 if __name__ == "__main__":
