@@ -8,6 +8,7 @@ import tempfile
 from unittest.mock import patch
 
 import numpy as np
+import pandas as pd
 
 ROOT = pathlib.Path(__file__).resolve().parents[3]
 for p in (ROOT, ROOT / "post_training" / "src", ROOT / "third_party" / "lerobot" / "src"):
@@ -25,7 +26,28 @@ class FakeReader(FakeLeRobot):
         super().__init__(use_depth=depth)
         self.repo_id = repo_id
         self.meta = FakeMeta()
-        self.meta.tasks = {0: "sort toy"}
+        # Match actual LeRobot v0.4.x: DataFrame indexed by task strings.
+        self.meta.tasks = pd.DataFrame({"task_index": [0]}, index=["sort toy"])
+        self.hf_dataset = [{"task_index": np.int64(0)} for _ in self.frames]
+
+
+def test_task_metadata_mapping():
+    reader = FakeReader(depth=False, repo_id="task_metadata")
+    # Task indices need not match the DataFrame's row positions.
+    reader.meta.tasks = pd.DataFrame(
+        {"task_index": [4, 2]}, index=["sort toy", "put away"]
+    )
+    reader.hf_dataset[0] = {"task_index": np.int64(2)}
+    reader.hf_dataset[14] = {"task_index": np.int64(4)}
+    assert merger._episode_task(reader, 0, "fallback") == "put away"
+    assert merger._episode_task(reader, 14, "fallback") == "sort toy"
+    reader.meta.tasks = {4: "legacy task"}
+    assert merger._episode_task(reader, 14, "fallback") == "legacy task"
+    reader.meta.tasks = pd.DataFrame(
+        {"task_index": [0]}, index=["different"]
+    )
+    assert merger._episode_task(reader, 14, "fallback") == "fallback"
+    print("PASS LeRobot DataFrame and legacy dict task mappings")
 
 
 def run_case(depth):
@@ -133,6 +155,7 @@ def test_rejections():
 
 
 def main():
+    test_task_metadata_mapping()
     run_case(False)
     run_case(True)
     test_rejections()
