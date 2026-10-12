@@ -14,6 +14,8 @@ if str(ROOT) not in sys.path:
 
 from kuavo_deploy.src.eval.rollout_recorder import (
     CAMERA_KEYS,
+    DEPTH_KEYS,
+    DEPTH_STORAGE,
     STAGING_FORMAT,
     RolloutRecorder,
     _annotate_reward_v2,
@@ -162,6 +164,66 @@ class TestRolloutRecorder(unittest.TestCase):
             self.assertIsNone(recorder.finish_episode(False))
             self.assertEqual(list(Path(tmp).iterdir()), [])
 
+
+
+    def test_depth_snapshot_matches_lerobot_uint8_quantization(self):
+        grid = np.linspace(0, 1, 16 * 16, dtype=np.float32).reshape(1, 1, 16, 16)
+
+        def rgbd(value):
+            result = observation(value)
+            for name in DEPTH_KEYS:
+                result[name] = grid.copy()
+            return result
+
+        with tempfile.TemporaryDirectory() as tmp:
+            recorder = RolloutRecorder(tmp, episode=10)
+            first = rgbd(0)
+            recorder.start_episode(first)
+            first["observation.depth_h"][:] = 0.0
+            recorder.append_step(np.zeros(16), rgbd(1))
+            staged = np.load(recorder.finish_episode(True), allow_pickle=True).item()
+            self.assertTrue(staged["use_depth"])
+            self.assertEqual(staged["depth_storage"], DEPTH_STORAGE)
+            self.assertEqual(len(staged["observations"]), 2)
+            expected = (grid[0, 0] * 255).astype(np.uint8)
+            for sample in staged["observations"]:
+                self.assertEqual(set(sample["depth"]), set(DEPTH_KEYS))
+                for key in DEPTH_KEYS:
+                    decoded = cv2.imdecode(
+                        np.frombuffer(sample["depth"][key], dtype=np.uint8),
+                        cv2.IMREAD_UNCHANGED,
+                    )
+                    self.assertEqual(decoded.dtype, np.uint8)
+                    self.assertEqual(decoded.shape, (16, 16))
+                    np.testing.assert_array_equal(decoded, expected)
+
+    def test_partial_depth_keys_rejected(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            recorder = RolloutRecorder(tmp, episode=11)
+            sample = observation(0)
+            sample["observation.depth_h"] = np.zeros((1, 1, 16, 16), dtype=np.float32)
+            with self.assertRaisesRegex(ValueError, "all three depth cameras"):
+                recorder.start_episode(sample)
+
+    def test_depth_changes_between_steps_rejected(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            recorder = RolloutRecorder(tmp, episode=12)
+            recorder.start_episode(observation(0))
+            sample = observation(1)
+            for key in DEPTH_KEYS:
+                sample[key] = np.zeros((1, 1, 16, 16), dtype=np.float32)
+            with self.assertRaisesRegex(ValueError, "Depth availability changed"):
+                recorder.append_step(np.zeros(16), sample)
+            recorder.abort()
+
+    def test_raw_non_normalized_depth_rejected(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            recorder = RolloutRecorder(tmp, episode=13)
+            sample = observation(0)
+            for key in DEPTH_KEYS:
+                sample[key] = np.full((1, 1, 16, 16), 500, dtype=np.uint16)
+            with self.assertRaisesRegex(ValueError, "normalized to"):
+                recorder.start_episode(sample)
 
 
 if __name__ == "__main__":
