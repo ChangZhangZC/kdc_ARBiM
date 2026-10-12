@@ -131,12 +131,63 @@ def _update_meta_data(df, dst_meta, meta_idx, data_idx, videos_idx):
     return df
 
 
+def _aggregate_metadata(src_meta, dst_meta, meta_idx, data_idx, videos_idx):
+    """Keep meta/episodes location fields aligned with the actual Parquet writer.
+
+    When a source metadata file is appended to an existing destination shard,
+    simply adding its original file index gives the wrong destination path.
+    Predict the exact file rotation using the pinned LeRobot writer's rule.
+    """
+    from lerobot.datasets.utils import (
+        DEFAULT_EPISODES_PATH, DEFAULT_DATA_FILE_SIZE_IN_MB,
+        DEFAULT_CHUNK_SIZE, get_parquet_file_size_in_mb, update_chunk_file_indices,
+    )
+
+    pairs = sorted(set(zip(
+        src_meta.episodes["meta/episodes/chunk_index"],
+        src_meta.episodes["meta/episodes/file_index"],
+        strict=False,
+    )))
+    for src_chunk, src_file in pairs:
+        src_path = src_meta.root / DEFAULT_EPISODES_PATH.format(
+            chunk_index=int(src_chunk), file_index=int(src_file),
+        )
+        if not src_path.is_file():
+            raise FileNotFoundError(f"Source Episode Parquet shard missing: {src_path}")
+        df = pd.read_parquet(src_path)
+        df = _update_meta_data(df, dst_meta, meta_idx, data_idx, videos_idx)
+        chunk_idx, file_idx = int(meta_idx["chunk"]), int(meta_idx["file"])
+        dst_path = dst_meta.root / DEFAULT_EPISODES_PATH.format(
+            chunk_index=chunk_idx, file_index=file_idx,
+        )
+        if dst_path.exists() and (
+            get_parquet_file_size_in_mb(src_path) +
+            get_parquet_file_size_in_mb(dst_path) >= DEFAULT_DATA_FILE_SIZE_IN_MB
+        ):
+            chunk_idx, file_idx = update_chunk_file_indices(
+                chunk_idx, file_idx, DEFAULT_CHUNK_SIZE,
+            )
+        df["meta/episodes/chunk_index"] = int(chunk_idx)
+        df["meta/episodes/file_index"] = int(file_idx)
+        meta_idx = aggregate.append_or_create_parquet_file(
+            df, src_path, meta_idx, DEFAULT_DATA_FILE_SIZE_IN_MB,
+            DEFAULT_CHUNK_SIZE, DEFAULT_EPISODES_PATH, contains_images=False,
+            aggr_root=dst_meta.root,
+        )
+        if (int(meta_idx["chunk"]), int(meta_idx["file"])) != (int(chunk_idx), int(file_idx)):
+            raise RuntimeError("LeRobot Episode Parquet shard rotation unexpectedly changed")
+    for state in videos_idx.values():
+        state["latest_duration"] += state["episode_duration"]
+    return meta_idx
+
+
 def merge_v042_datasets(datasets, *, output_repo_id, output_dir):
     """Use LeRobot official merge with only the v0.4.2 shard-index fixes scoped."""
     with ExitStack() as stack:
         stack.enter_context(patch.object(aggregate, "aggregate_videos", _aggregate_videos))
         stack.enter_context(patch.object(aggregate, "aggregate_data", _aggregate_data))
         stack.enter_context(patch.object(aggregate, "update_meta_data", _update_meta_data))
+        stack.enter_context(patch.object(aggregate, "aggregate_metadata", _aggregate_metadata))
         return merge_datasets(
             datasets=datasets, output_repo_id=output_repo_id, output_dir=Path(output_dir),
         )
