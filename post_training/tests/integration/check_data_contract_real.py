@@ -90,6 +90,8 @@ def main():
     parser.add_argument("--source-npy", help="Optional historical NPY to resolve source_root only")
     parser.add_argument("--staging-dir", required=True)
     parser.add_argument("--reference-zarr", help="Previously migrated Reward V2 Teleop Zarr")
+    parser.add_argument("--reuse-teleop-zarr",
+                        help="Already validated Teleop Reward V2 Zarr: skip expensive Step 2 rebuild")
     parser.add_argument("--work-root", required=True, help="NEW output directory")
     parser.add_argument("--expected-teleop-frames", type=int, default=90144)
     parser.add_argument("--expected-teleop-episodes", type=int, default=600)
@@ -132,11 +134,19 @@ def main():
         "reward_open_infer_frames": 5, "reward_min_dwell": 3,
         "reward_expected_cycles": 1,
     }
-    print("\n[2/6] Original Teleop LeRobot -> Zarr")
-    teleop_zarr = output / "teleop_reward_v2.zarr"
-    run_lerobot_to_zarr({
-        **common, "lerobot_root": str(original), "zarr_output_path": str(teleop_zarr),
-    })
+    if args.reuse_teleop_zarr:
+        print("\n[2/6] Reuse previously validated Teleop Zarr (no rebuild)")
+        teleop_zarr = Path(args.reuse_teleop_zarr).expanduser().resolve()
+        if not teleop_zarr.is_dir():
+            raise FileNotFoundError(f"reused Teleop Zarr missing: {teleop_zarr}")
+        if teleop_zarr == output or output in teleop_zarr.parents:
+            raise ValueError("Reused Teleop Zarr must be external to the new work-root")
+    else:
+        print("\n[2/6] Original Teleop LeRobot -> Zarr")
+        teleop_zarr = output / "teleop_reward_v2.zarr"
+        run_lerobot_to_zarr({
+            **common, "lerobot_root": str(original), "zarr_output_path": str(teleop_zarr),
+        })
     teleop, _, _ = verify_zarr(
         teleop_zarr, args.expected_teleop_frames, args.expected_teleop_episodes,
         use_depth=args.zarr_use_depth,
