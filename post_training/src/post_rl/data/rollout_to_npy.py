@@ -16,6 +16,8 @@ import numpy as np
 STAGING_FORMAT = "arbim_rollout_staging_v2"
 PROCESSED_FORMAT = "arbim_processed_npy_stream_v2"
 REWARD_MODE = "last_gripper_release_sparse"
+DEPTH_KEYS = ("observation.depth_h", "observation.depth_l", "observation.depth_r")
+DEPTH_STORAGE = "png_gray8_v1"
 CAMERA_KEYS = (
     "observation.images.head_cam_h",
     "observation.images.wrist_cam_l",
@@ -49,6 +51,16 @@ def _load_staging(path):
     return payload
 
 
+def _decode_depth_png(payload, label):
+    if not isinstance(payload, bytes) or not payload.startswith(b"\x5cx89PNG\x5cr\x5cn\x5cx1a\x5cn"):
+        raise ValueError(f"{label}: depth must be grayscale PNG bytes")
+    gray = cv2.imdecode(np.frombuffer(payload, np.uint8), cv2.IMREAD_UNCHANGED)
+    if gray is None or gray.ndim != 2 or gray.dtype != np.uint8:
+        raise ValueError(f"{label}: expected uint8 single-channel depth PNG")
+    # Mirror LeRobot v0.4.2 video decoding: [3,H,W], float32 in [0,1].
+    return np.repeat((gray.astype(np.float32) / 255.0)[None], 3, axis=0)
+
+
 def _validate_staging(path, data):
     """Return input dimensions if success and Reward V2 are valid."""
     if not data.get("success") or data.get("reward_status") != "valid":
@@ -74,12 +86,31 @@ def _validate_staging(path, data):
         raise ValueError(f"{path}: reward_event and reward index mismatch")
 
     rgb_shapes = {}
+    use_depth = bool(data.get("use_depth", "depth" in observations[0]))
+    if use_depth and data.get("depth_storage") != DEPTH_STORAGE:
+        raise ValueError(f"{path}: unexpected depth storage mode")
+    depth_shapes = {}
     for index, obs in enumerate(observations):
         if not isinstance(obs, dict):
             raise ValueError(f"{path}: observation {index} is not a dict")
         state = np.asarray(obs["agent_pos"], dtype=np.float32)
         if state.shape != (16,) or not np.all(np.isfinite(state)):
             raise ValueError(f"{path}: invalid state at observation {index}")
+        if ("depth" in obs) != use_depth:
+            raise ValueError(f"{path}: Depth availability changed at observation {index}")
+        if use_depth:
+            if set(obs["depth"]) != set(DEPTH_KEYS):
+                raise ValueError(f"{path}: missing Depth camera at observation {index}")
+            if set(obs.get("depth_shapes", {})) != set(DEPTH_KEYS):
+                raise ValueError(f"{path}: missing Depth shape metadata at observation {index}")
+            for key in DEPTH_KEYS:
+                depth = _decode_depth_png(obs["depth"][key], f"{path} obs {index} {key}")
+                if tuple(obs["depth_shapes"][key]) != tuple(depth.shape[-2:]):
+                    raise ValueError(f"{path}: Depth shape metadata mismatch for {key}")
+                if index == 0:
+                    depth_shapes[key] = tuple(depth.shape)
+                elif depth_shapes[key] != tuple(depth.shape):
+                    raise ValueError(f"{path}: Depth shape changed for {key}")
         if set(obs["rgb"]) != set(CAMERA_KEYS):
             raise ValueError(f"{path}: camera keys mismatch at observation {index}")
         for key in CAMERA_KEYS:
@@ -91,15 +122,22 @@ def _validate_staging(path, data):
                 if bgr is None or bgr.ndim != 3 or bgr.shape[2] != 3:
                     raise ValueError(f"{path}: cannot decode {key}")
                 rgb_shapes[key] = (3, int(bgr.shape[0]), int(bgr.shape[1]))
-    return {"steps": steps, "state_shape": (16,), "action_shape": (16,),
-            "rgb_shapes": rgb_shapes, "reward_event": event}
-
-
-def _new_chunk():
     return {
+        "steps": steps, "state_shape": (16,), "action_shape": (16,),
+        "rgb_shapes": rgb_shapes, "reward_event": event,
+        "use_depth": use_depth, "depth_shapes": depth_shapes,
+        "depth_dtypes": {key: "float32" for key in DEPTH_KEYS} if use_depth else {},
+    }
+
+
+def _new_chunk(use_depth=False):
+    chunk = {
         "agent_pos": [], "action": [], "rgb": [],
         "reward": [], "done": [], "timeout": [],
     }
+    if use_depth:
+        chunk["depth"] = []
+    return chunk
 
 
 def _write_chunk(handle, chunk):
@@ -132,7 +170,8 @@ def convert_staging_to_npy(sources, output, *, batch_size=50, overwrite=False):
             skipped.append(str(path))
             continue
         shape_spec = (
-            info["state_shape"], info["action_shape"], info["rgb_shapes"]
+            info["state_shape"], info["action_shape"], info["rgb_shapes"],
+            info["use_depth"], info["depth_shapes"], info["depth_dtypes"],
         )
         if expected_shapes is None:
             expected_shapes = shape_spec
@@ -148,7 +187,7 @@ def convert_staging_to_npy(sources, output, *, batch_size=50, overwrite=False):
         "__format__": PROCESSED_FORMAT,
         "num_frames": frame_count,
         "num_episodes": len(accepted),
-        "use_depth": False,
+        "use_depth": first_info["use_depth"],
         "state_shape": first_info["state_shape"],
         "action_shape": first_info["action_shape"],
         "rgb_storage": "jpeg",
@@ -166,6 +205,9 @@ def convert_staging_to_npy(sources, output, *, batch_size=50, overwrite=False):
         },
     }
 
+    if first_info["use_depth"]:
+        manifest["depth_shapes"] = first_info["depth_shapes"]
+        manifest["depth_dtypes"] = first_info["depth_dtypes"]
     output.parent.mkdir(parents=True, exist_ok=True)
     temp = output.with_name(output.name + ".tmp")
     if temp.exists():
@@ -174,7 +216,7 @@ def convert_staging_to_npy(sources, output, *, batch_size=50, overwrite=False):
     try:
         with temp.open("wb") as handle:
             np.save(handle, manifest, allow_pickle=True)
-            chunk = _new_chunk()
+            chunk = _new_chunk(first_info["use_depth"])
             for path, info in accepted:
                 data = _load_staging(path)
                 # T transitions use obs[0:T], actions[0:T], reward[0:T].
@@ -189,13 +231,17 @@ def convert_staging_to_npy(sources, output, *, batch_size=50, overwrite=False):
                     chunk["agent_pos"].append(obs["agent_pos"])
                     chunk["action"].append(actions[step])
                     chunk["rgb"].append(obs["rgb"])
+                    if first_info["use_depth"]:
+                        chunk["depth"].append({
+                            key: _decode_depth_png(obs["depth"][key], key) for key in DEPTH_KEYS
+                        })
                     chunk["reward"].append(float(rewards[step]))
                     chunk["done"].append(terminal)
                     chunk["timeout"].append(terminal)
                     if len(chunk["action"]) >= batch_size:
                         _write_chunk(handle, chunk)
                         chunks += 1
-                        chunk = _new_chunk()
+                        chunk = _new_chunk(first_info["use_depth"])
             if chunk["action"]:
                 _write_chunk(handle, chunk)
                 chunks += 1
