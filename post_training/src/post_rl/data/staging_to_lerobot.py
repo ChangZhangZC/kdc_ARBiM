@@ -131,15 +131,20 @@ def _read_template(template_root, use_depth):
         raise ValueError("Template observation.state must be 16D")
     if tuple(features["action"]["shape"]) != (16,):
         raise ValueError("Template action must be 16D")
-    for key in (*RGB_KEYS, *(DEPTH_KEYS if use_depth else ())):
-        if features[key]["dtype"] not in ("video", "image"):
-            raise ValueError(f"Template camera {key} must have image/video dtype")
-        if tuple(features[key]["shape"])[0] != 3:
-            raise ValueError(f"Template camera {key} must have 3 channels")
+    camera_keys = (*RGB_KEYS, *(DEPTH_KEYS if use_depth else ()))
+    camera_modes = {features[key]["dtype"] for key in camera_keys}
+    if camera_modes not in ({"video"}, {"image"}):
+        raise ValueError("Template cameras must all use the same image/video dtype")
+    for key in camera_keys:
+        shape = tuple(features[key]["shape"])
+        if len(shape) != 3 or shape[0] != 3:
+            raise ValueError(f"Template camera {key} must be CHW with 3 channels")
     info = dataset.meta.info
     fps = float(info["fps"])
+    if not np.isfinite(fps) or fps <= 0:
+        raise ValueError("Template fps must be positive")
     robot_type = info.get("robot_type", "kuavo4pro")
-    return features, fps, robot_type
+    return features, fps, robot_type, camera_modes == {"video"}
 
 
 def convert_staging_to_lerobot(
@@ -168,7 +173,7 @@ def convert_staging_to_lerobot(
         if path == output_root or output_root in path.parents:
             raise ValueError("Output may not overwrite an input staging directory")
 
-    features, fps, robot_type = _read_template(template_root, use_depth)
+    features, fps, robot_type, use_videos = _read_template(template_root, use_depth)
     output_root.parent.mkdir(parents=True, exist_ok=True)
     # Use the same creation/saving API as kuavo_data/CvtRosbag2Lerobot.py.
     dataset = LeRobotDataset.create(
@@ -177,7 +182,7 @@ def convert_staging_to_lerobot(
         fps=fps,
         robot_type=robot_type,
         features=features,
-        use_videos=True,
+        use_videos=use_videos,
     )
     episodes = []
     total_frames = 0
