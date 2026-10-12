@@ -80,6 +80,9 @@ Batch 02 does not open, decode or re-encode RGB images.
 
 Use an **existing Teleop LeRobot dataset as template** so FPS,
 `observation.state` / `action` names and camera schema remain consistent.
+The installed PyAV video encoder expects an integer FPS (such as `10`, not
+`10.0`); conversions normalize integral metadata to Python `int` and reject
+non-integral FPS rather than silently rounding timestamps.
 If `data/sim_task1.npy` already exists, its manifest `source_root` identifies
 the original LeRobot root.
 
