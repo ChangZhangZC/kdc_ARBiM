@@ -52,7 +52,7 @@ def _load_staging(path):
 
 
 def _decode_depth_png(payload, label):
-    if not isinstance(payload, bytes) or not payload.startswith(b"\x5cx89PNG\x5cr\x5cn\x5cx1a\x5cn"):
+    if not isinstance(payload, bytes) or not payload[:4] == bytes((137, 80, 78, 71)):
         raise ValueError(f"{label}: depth must be grayscale PNG bytes")
     gray = cv2.imdecode(np.frombuffer(payload, np.uint8), cv2.IMREAD_UNCHANGED)
     if gray is None or gray.ndim != 2 or gray.dtype != np.uint8:
