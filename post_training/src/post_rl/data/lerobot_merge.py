@@ -19,7 +19,7 @@ for folder in (REPO_ROOT, REPO_ROOT / "third_party" / "lerobot" / "src"):
     if str(folder) not in sys.path:
         sys.path.insert(0, str(folder))
 import lerobot_patches.custom_patches  # noqa: F401
-from lerobot.datasets.dataset_tools import merge_datasets
+from post_rl.data.lerobot_v042_fast_merge import merge_v042_datasets as merge_datasets
 
 from post_rl.data import data_prepare as dp
 
@@ -218,7 +218,7 @@ def merge_lerobot_datasets(
         "episodes": records,
         "total_frames": total_frames,
         "total_episodes": ordinal,
-        "merge_backend": "lerobot.datasets.dataset_tools.merge_datasets",
+        "merge_backend": "lerobot.dataset_tools.merge_datasets+v0.4.2_shard_fix",
     }
     provenance = target / "meta" / MERGE_METADATA
     provenance.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
