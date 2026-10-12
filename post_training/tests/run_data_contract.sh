@@ -17,6 +17,12 @@ bash post_training/tests/run_batch03.sh
 echo "=== Batch 04: merge LeRobot ==="
 bash post_training/tests/run_batch04.sh
 
+echo "=== Contract Reward provenance ==="
+python -m py_compile \
+  post_training/tests/smoke/smoke_18_contract_provenance.py \
+  post_training/tests/integration/check_data_contract_real.py
+python post_training/tests/smoke/smoke_18_contract_provenance.py
+
 echo "=== Existing Data Wheel regression suite ==="
 python post_training/tests/smoke/smoke_07_flywheel_recorder.py -v
 python post_training/tests/smoke/smoke_08_flywheel_npy.py -v

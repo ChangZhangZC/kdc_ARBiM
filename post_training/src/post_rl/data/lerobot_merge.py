@@ -51,9 +51,12 @@ def _schema(dataset, use_depth):
         if len(shape) != 3 or shape[0] != 3:
             raise ValueError(f"Expected CHW 3-channel camera feature {key}")
     metadata = dataset.meta.info
+    fps = float(metadata["fps"])
+    if not np.isfinite(fps) or fps <= 0:
+        raise ValueError("LeRobot FPS must be finite and positive")
     return {
         "features": features,
-        "fps": float(metadata["fps"]),
+        "fps": fps,
         "robot_type": metadata.get("robot_type", "kuavo4pro"),
         "use_videos": modes == {"video"},
     }
@@ -169,12 +172,24 @@ def merge_lerobot_datasets(
     for source in sources:
         dataset = source["dataset"]
         use_batch = dp._can_batch_decode(dataset)
-        input_metadata = Path(source["path"]) / "meta" / "arbim_staging_provenance.json"
-        recorded = None
-        if input_metadata.is_file():
-            recorded = json.loads(input_metadata.read_text(encoding="utf-8"))
-            if len(recorded.get("episodes", [])) != len(source["episodes"]):
-                raise ValueError(f"{source['path']}: Staging metadata episode count mismatch")
+        source_meta = Path(source["path"]) / "meta"
+        staging_metadata = source_meta / "arbim_staging_provenance.json"
+        merged_metadata = source_meta / MERGE_METADATA
+        source_reward_rows = None
+        if staging_metadata.is_file():
+            recorded = json.loads(staging_metadata.read_text(encoding="utf-8"))
+            if recorded.get("format") != "arbim_lerobot_staging_provenance_v1":
+                raise ValueError(f"{source['path']}: unrecognized Staging provenance")
+            source_reward_rows = recorded.get("episodes", [])
+        elif merged_metadata.is_file():
+            recorded = json.loads(merged_metadata.read_text(encoding="utf-8"))
+            if recorded.get("format") != "arbim_lerobot_merge_provenance_v1":
+                raise ValueError(f"{source['path']}: unrecognized merged provenance")
+            source_reward_rows = [
+                row.get("staging_reward") for row in recorded.get("episodes", [])
+            ]
+        if source_reward_rows is not None and len(source_reward_rows) != len(source["episodes"]):
+            raise ValueError(f"{source['path']}: Reward provenance episode count mismatch")
         for episode_position, (episode_id, indices) in enumerate(source["episodes"].items()):
             task = _episode_task(dataset, indices[0], fallback_task)
             for start in range(0, len(indices), batch_size):
@@ -219,8 +234,12 @@ def merge_lerobot_datasets(
                 "frames": len(indices),
                 "task": task,
             }
-            if recorded is not None:
-                record["staging_reward"] = recorded["episodes"][episode_position]
+            if source_reward_rows is not None:
+                staging_row = source_reward_rows[episode_position]
+                if staging_row is not None:
+                    if staging_row.get("reward_status") not in {"valid", "invalid"}:
+                        raise ValueError(f"{source['path']}: invalid source Reward status")
+                    record["staging_reward"] = staging_row
             records.append(record)
             output_episode_id += 1
             # Keep parity with the existing Rosbag -> LeRobot writer.
