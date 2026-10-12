@@ -133,7 +133,7 @@ def _read_source(path):
         for start, end in zip(np.r_[0, ends[:-1]], ends):
             if np.count_nonzero(rewards[int(start):int(end)]) != 1:
                 raise ValueError(f"{path}: invalid Reward V2 episode [{start}:{end}]")
-    for name in DEPTH_NAMES if use_depth else ():
+    for name in (DEPTH_NAMES if use_depth else ()):
         if data[name].shape != data[f"next_{name}"].shape:
             raise ValueError(f"{path}: Depth current/next shape mismatch")
 
