@@ -261,7 +261,7 @@ def main():
     print(convert_staging_to_lerobot(
         args.staging, args.template_lerobot_root, args.output_root,
         args.repo_id, args.task,
-        use_depth=args.use_depth,
+        use_depth=not args.rgb_only_legacy,
         require_valid_reward=args.require_valid_reward,
     ))
 
