@@ -27,13 +27,15 @@ class FakeMeta:
             **{key: {"dtype": "video", "shape": (3, 16, 16), "names": ["channels", "height", "width"]}
                for key in (*CAMERA_KEYS, *DEPTH_KEYS)},
         }
-        self.info = {"fps": 10, "robot_type": "kuavo4pro"}
+        # Metadata may store fps as 10.0; real PyAV requires an int.
+        self.info = {"fps": 10.0, "robot_type": "kuavo4pro"}
 
 
 class FakeWriter:
     instances = []
 
     def __init__(self, root, features, fps, robot_type, **kwargs):
+        assert type(fps) is int, f"PyAV-compatible FPS must be an int, got {type(fps)}"
         self.path = pathlib.Path(root)
         self.path.mkdir(parents=True)
         (self.path / "meta").mkdir()
@@ -92,7 +94,8 @@ def test_convert(depth):
         assert result["num_episodes"] == 3
         assert result["num_frames"] == 35  # 14 + 7 + 14
         writer = FakeWriter.instances[-1]
-        assert writer.fps == 10 and writer.robot_type == "kuavo4pro"
+        assert type(writer.fps) is int and writer.fps == 10
+        assert writer.robot_type == "kuavo4pro"
         assert len(writer.episodes) == 3
         assert len(writer.episodes[0]) == 14
         assert len(writer.episodes[1]) == 7
@@ -153,9 +156,28 @@ def test_convert(depth):
         print(f"PASS staging to LeRobot use_depth={depth}, IL=3, RL=2")
 
 
+def test_reject_noninteger_video_fps():
+    class FractionalFpsDataset(FakeLeRobot):
+        def __init__(self, repo_id, root):
+            super().__init__(repo_id, root)
+            self.meta.info["fps"] = 10.5
+
+    with tempfile.TemporaryDirectory(prefix="arbim_staging_fractional_fps_") as tmp:
+        template = pathlib.Path(tmp) / "template"
+        (template / "meta").mkdir(parents=True)
+        with patch.object(converter, "LeRobotDataset", FractionalFpsDataset):
+            try:
+                converter._read_template(template, use_depth=False)
+            except ValueError as exc:
+                assert "fps must be an integer" in str(exc)
+            else:
+                raise AssertionError("Fractional FPS silently reached video encoding")
+
+
 def main():
     test_convert(False)
     test_convert(True)
+    test_reject_noninteger_video_fps()
     print("SMOKE 16 Staging -> LeRobot PASSED")
 
 

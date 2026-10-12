@@ -51,9 +51,12 @@ def _schema(dataset, use_depth):
         if len(shape) != 3 or shape[0] != 3:
             raise ValueError(f"Expected CHW 3-channel camera feature {key}")
     metadata = dataset.meta.info
-    fps = float(metadata["fps"])
-    if not np.isfinite(fps) or fps <= 0:
+    fps_value = float(metadata["fps"])
+    if not np.isfinite(fps_value) or fps_value <= 0:
         raise ValueError("LeRobot FPS must be finite and positive")
+    if not fps_value.is_integer():
+        raise ValueError(f"LeRobot FPS must be an integer for video encoding, got {fps_value}")
+    fps = int(fps_value)
     return {
         "features": features,
         "fps": fps,

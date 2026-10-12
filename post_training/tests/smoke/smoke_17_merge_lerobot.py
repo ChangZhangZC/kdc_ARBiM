@@ -71,7 +71,7 @@ def run_case(depth):
         assert result["num_frames"] == 54
         assert result["num_episodes"] == 4
         writer = FakeWriter.instances[-1]
-        assert writer.fps == 10
+        assert type(writer.fps) is int and writer.fps == 10
         assert len(writer.episodes) == 4
         assert [len(ep) for ep in writer.episodes] == [14, 13, 14, 13]
         for ep in writer.episodes:
@@ -120,6 +120,14 @@ def test_rejections():
                     assert keyword in str(exc), (keyword, str(exc))
                 else:
                     raise AssertionError(f"Expected rejection for {keyword}")
+            # PyAV cannot encode at a float FPS. Do not silently round 10.5.
+            data[str(two.resolve())].meta.info["fps"] = 10.5
+            try:
+                merger.merge_lerobot_datasets([one, two], target, "lerobot/test")
+            except ValueError as exc:
+                assert "FPS must be an integer" in str(exc), str(exc)
+            else:
+                raise AssertionError("Fractional FPS reached video writer")
         assert not target.exists()
         print("PASS LeRobot merge invalid inputs")
 
