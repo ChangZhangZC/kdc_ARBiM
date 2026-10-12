@@ -73,7 +73,7 @@ def load_config(path):
     cfg.setdefault("reward_min_dwell", 3)
     cfg.setdefault("reward_expected_cycles", 1)
     cfg.setdefault("use_depth", False)
-    cfg.setdefault("overwrite", True)
+    cfg.setdefault("overwrite", cfg.get("mode") != "lerobot_to_zarr")
     cfg.setdefault("teleop_sources", [])
     cfg.setdefault("stream_batch_size", ZARR_CHUNK_LEAD)
     cfg.setdefault("jpeg_quality", DEFAULT_JPEG_QUALITY)
@@ -1297,13 +1297,18 @@ def run_lerobot_to_zarr(config):
     del first
     direct_config = dict(config)
     direct_config.setdefault("overwrite", False)
-    return _run_build_db_from_infos(
+    result = _run_build_db_from_infos(
         direct_config,
         [info],
         lambda source: _iter_lerobot_frames(
             dataset, episodes, config, reward_mode, reward_offsets, batch_decode
         ),
     )
+    output = zarr.open_group(result["zarr_path"], mode="a")
+    output.attrs["reward_mode"] = reward_mode
+    if reward_metadata is not None:
+        output.attrs["reward_event"] = reward_metadata
+    return result
 
 
 def run_build_db(config):
@@ -1334,11 +1339,6 @@ def run_build_db(config):
         if info["kind"] not in {"teleop_npy", "rollout_npy"}:
             raise ValueError(f"unknown processed NPY source kind: {info['kind']}")
         infos.append(info)
-    _validate_source_shapes(infos, use_depth)
-    total_frames = sum(info["num_frames"] for info in infos)
-    total_episodes = sum(info["num_episodes"] for info in infos)
-    if total_frames <= 0:
-        raise RuntimeError("processed npy sources contain no frames")
 
     return _run_build_db_from_infos(
         config, infos, lambda info: _iter_processed_frames(info["path"], use_depth)
