@@ -61,7 +61,7 @@ def _decode_depth_png(payload, label):
     return np.repeat((gray.astype(np.float32) / 255.0)[None], 3, axis=0)
 
 
-def _validate_staging(path, data):
+def _validate_staging(path, data, *, use_depth=False):
     """Return input dimensions if success and Reward V2 are valid."""
     if not data.get("success") or data.get("reward_status") != "valid":
         return None
@@ -86,7 +86,9 @@ def _validate_staging(path, data):
         raise ValueError(f"{path}: reward_event and reward index mismatch")
 
     rgb_shapes = {}
-    use_depth = bool(data.get("use_depth", "depth" in observations[0]))
+    available_depth = bool(data.get("use_depth", "depth" in observations[0]))
+    if use_depth and not available_depth:
+        raise ValueError(f"{path}: Depth requested but not recorded in staging")
     if use_depth and data.get("depth_storage") != DEPTH_STORAGE:
         raise ValueError(f"{path}: unexpected depth storage mode")
     depth_shapes = {}
@@ -96,7 +98,7 @@ def _validate_staging(path, data):
         state = np.asarray(obs["agent_pos"], dtype=np.float32)
         if state.shape != (16,) or not np.all(np.isfinite(state)):
             raise ValueError(f"{path}: invalid state at observation {index}")
-        if ("depth" in obs) != use_depth:
+        if use_depth and "depth" not in obs:
             raise ValueError(f"{path}: Depth availability changed at observation {index}")
         if use_depth:
             if set(obs["depth"]) != set(DEPTH_KEYS):
@@ -145,7 +147,7 @@ def _write_chunk(handle, chunk):
         np.save(handle, chunk, allow_pickle=True)
 
 
-def convert_staging_to_npy(sources, output, *, batch_size=50, overwrite=False):
+def convert_staging_to_npy(sources, output, *, batch_size=50, overwrite=False, use_depth=False):
     """Combine valid successful staging episodes into one streamed Processed NPY.
 
     Invalid-reward episodes are skipped and counted. Corrupted valid records,
@@ -165,7 +167,7 @@ def convert_staging_to_npy(sources, output, *, batch_size=50, overwrite=False):
     expected_shapes = None
     for path in paths:
         data = _load_staging(path)
-        info = _validate_staging(path, data)
+        info = _validate_staging(path, data, use_depth=use_depth)
         if info is None:
             skipped.append(str(path))
             continue
@@ -265,10 +267,11 @@ def main():
     parser.add_argument("--output", required=True, help="Processed NPY V2 output")
     parser.add_argument("--batch-size", type=int, default=50)
     parser.add_argument("--overwrite", action="store_true")
+    parser.add_argument("--use-depth", action="store_true", help="Export optional Depth into NPY")
     args = parser.parse_args()
     result = convert_staging_to_npy(
         args.sources, args.output, batch_size=args.batch_size,
-        overwrite=args.overwrite,
+        overwrite=args.overwrite, use_depth=args.use_depth,
     )
     print(result)
 
