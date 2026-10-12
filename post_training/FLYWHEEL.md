@@ -1,5 +1,10 @@
 # ARBiM Data Wheel V1
 
+> **Data contract update:** For new Data Wheel rounds, use
+> [DATA_CONTRACT.md](DATA_CONTRACT.md): Staging NPY → LeRobot → Zarr,
+> LeRobot Merge for IL, and Zarr Merge for PPO. The Processed NPY bridge
+> below is **legacy compatibility**, not the recommended path.
+
 Data Wheel is an opt-in MuJoCo evaluation mode. It **only records successful
 rollouts during evaluation**; all post-evaluation data conversion and Offline RL
 dataset builds are **manual**. No dedicated Data Wheel YAML is used.
@@ -58,7 +63,7 @@ The existing Reward V2 assigns a sparse +1 at the later of two detected
 gripper-release actions. A successful episode whose reward cannot be validated
 is still saved, but marked `reward_status="invalid"` and `reward=None`.
 
-## 2. Manually convert staging to Processed NPY
+## 2. Legacy: manually convert staging to Processed NPY (deprecated)
 
 Run from the repository root:
 
@@ -84,7 +89,7 @@ unlabeled training data. The final T+1 observation remains in staging; the
 current `run_build_db` follows the existing terminal transition convention
 and repeats the final processed state at the terminal index.
 
-## 3. Manually build a new Offline RL Zarr
+## 3. Legacy: manually build a Zarr from Processed NPY (deprecated)
 
 Edit **only** `post_training/configs/data/data_prepare.yaml`; set:
 
