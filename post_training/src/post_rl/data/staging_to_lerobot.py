@@ -140,9 +140,12 @@ def _read_template(template_root, use_depth):
         if len(shape) != 3 or shape[0] != 3:
             raise ValueError(f"Template camera {key} must be CHW with 3 channels")
     info = dataset.meta.info
-    fps = float(info["fps"])
-    if not np.isfinite(fps) or fps <= 0:
-        raise ValueError("Template fps must be positive")
+    fps_value = float(info["fps"])
+    if not np.isfinite(fps_value) or fps_value <= 0:
+        raise ValueError("Template fps must be finite and positive")
+    if not fps_value.is_integer():
+        raise ValueError(f"Template fps must be an integer for video encoding, got {fps_value}")
+    fps = int(fps_value)
     robot_type = info.get("robot_type", "kuavo4pro")
     return features, fps, robot_type, camera_modes == {"video"}
 
