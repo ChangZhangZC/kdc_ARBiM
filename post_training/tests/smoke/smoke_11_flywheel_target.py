@@ -67,6 +67,7 @@ def create_runner(results):
             Service=lambda *args: DummyService(),
         ),
         "Trigger": object, "init_evt": AlwaysReady(), "success_evt": AlwaysReady(),
+        "env_init_service": lambda req: None,
         "pause_sub": types.SimpleNamespace(unregister=lambda: None),
         "stop_sub": types.SimpleNamespace(unregister=lambda: None),
         "check_control_signals": lambda: True,
