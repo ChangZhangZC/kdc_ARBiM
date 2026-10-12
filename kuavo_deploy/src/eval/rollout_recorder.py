@@ -20,6 +20,9 @@ CAMERA_KEYS = (
 )
 STAGING_FORMAT = "arbim_rollout_staging_v2"
 REWARD_MODE = "last_gripper_release_sparse"
+DEPTH_KEYS = ("observation.depth_h", "observation.depth_l", "observation.depth_r")
+DEPTH_STORAGE = "png_gray8_v1"
+
 
 
 def _numpy_copy(value):
@@ -57,7 +60,35 @@ def _snapshot(observation, jpeg_quality):
         if not ok:
             raise RuntimeError(f"JPEG encoding failed for {key}")
         rgb[key] = encoded.tobytes()
-    return {"agent_pos": state, "rgb": rgb}
+    snapshot = {"agent_pos": state, "rgb": rgb}
+    present = [key for key in DEPTH_KEYS if key in observation]
+    if present:
+        if len(present) != len(DEPTH_KEYS):
+            raise ValueError(f"Expected all three depth cameras, got {present}")
+        snapshot["depth"] = {}
+        snapshot["depth_shapes"] = {}
+        for key in DEPTH_KEYS:
+            depth = _numpy_copy(observation[key])
+            if depth.ndim == 4 and depth.shape[0] == 1:
+                depth = depth[0]
+            if depth.ndim == 3 and depth.shape[0] == 1:
+                depth = depth[0]
+            if depth.ndim != 2 or not np.issubdtype(depth.dtype, np.number):
+                raise ValueError(f"{key} must be a single-channel normalized depth image, got {depth.shape}")
+            if depth.size == 0 or not np.all(np.isfinite(depth)):
+                raise ValueError(f"{key} contains invalid depth data")
+            # ObsBuffer.depth_preprocess() already returns per-frame [0,1].
+            # Match the Rosbag->LeRobot uint8 quantization before video decode,
+            # but preserve the quantized image losslessly in staging.
+            if depth.min() < -1e-6 or depth.max() > 1.0 + 1e-6:
+                raise ValueError(f"{key} must be normalized to [0,1]")
+            gray = (np.clip(depth, 0, 1) * 255).astype(np.uint8)
+            ok, encoded = cv2.imencode(".png", np.ascontiguousarray(gray))
+            if not ok:
+                raise RuntimeError(f"PNG encoding failed for {key}")
+            snapshot["depth"][key] = encoded.tobytes()
+            snapshot["depth_shapes"][key] = tuple(int(v) for v in depth.shape)
+    return snapshot
 
 
 
@@ -250,6 +281,11 @@ class RolloutRecorder:
         if self._actions and action.shape != self._actions[0].shape:
             raise ValueError("Action dimension changed within episode")
         following = _snapshot(next_observation, self.jpeg_quality)
+        first = self._observations[0]
+        if ("depth" in first) != ("depth" in following):
+            raise ValueError("Depth availability changed within episode")
+        if "depth" in first and first["depth_shapes"] != following["depth_shapes"]:
+            raise ValueError("Depth camera shape changed within episode")
         self._actions.append(action)
         self._observations.append(following)
 
@@ -286,6 +322,8 @@ class RolloutRecorder:
                 "episode": self.episode,
                 "success": True,
                 "rgb_storage": "jpeg",
+                "use_depth": "depth" in self._observations[0],
+                "depth_storage": DEPTH_STORAGE if "depth" in self._observations[0] else None,
                 "num_steps": len(self._actions),
                 "observations": self._observations,
                 "actions": actions,
