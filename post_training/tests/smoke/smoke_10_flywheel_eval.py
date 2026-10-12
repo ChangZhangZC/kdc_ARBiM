@@ -42,9 +42,10 @@ def actions():
 
 
 class StubEnv:
-    def __init__(self, success, failure_step=None):
+    def __init__(self, success, failure_step=None, success_at=None):
         self.success = success
         self.failure_step = failure_step
+        self.success_at = success_at
         self.current = 0
         self.closed = False
         self.unwrapped = self
@@ -63,7 +64,7 @@ class StubEnv:
             raise RuntimeError("simulated step exception")
         self.current += 1
         terminal = self.current == len(actions())
-        if terminal and self.success:
+        if self.success and self.current == (self.success_at or len(actions())):
             SUCCESS_EVENT.set()
         return observation(self.current), 0, terminal, False, {}
 
@@ -165,11 +166,15 @@ class TestFlywheelEpisodeIntegration(unittest.TestCase):
             env=types.SimpleNamespace(env_name="StubEnv"),
         )
 
-    def run_episode(self, folder, *, enabled, success, failure_step=None, allow_steps=True):
-        env = StubEnv(success=success, failure_step=failure_step)
+    def run_episode(self, folder, *, enabled, success, failure_step=None, allow_steps=True,
+                    success_at=None, post_success_steps=0):
+        env = StubEnv(success=success, failure_step=failure_step, success_at=success_at)
         func = compile_episode(env, allow_steps=allow_steps)
         policy = StubPolicy()
-        with patch.dict(os.environ, {"ARBIM_DATA_WHEEL": "1" if enabled else "0"}):
+        with patch.dict(os.environ, {
+            "ARBIM_DATA_WHEEL": "1" if enabled else "0",
+            "ARBIM_DW_POST_SUCCESS_STEPS": str(post_success_steps),
+        }):
             outcome = func(self.cfg, policy, lambda x: x, lambda x: x, 0, folder)
         return outcome, env
 
@@ -195,6 +200,42 @@ class TestFlywheelEpisodeIntegration(unittest.TestCase):
             self.assertEqual(saved["actions"].shape, (14, 16))
             self.assertFalse(list(directory.glob("**/*processed*.npy")))
             self.assertFalse(list(directory.glob("**/*.zarr")))
+
+    def test_post_success_tail_completes_gripper_reward(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            folder = pathlib.Path(tmp)
+            result, env = self.run_episode(
+                folder, enabled=True, success=True, success_at=6, post_success_steps=5
+            )
+            self.assertEqual(result, 1)
+            self.assertEqual(env.current, 11)
+            self.assert_clean(env)
+            saved_files = list((folder / "data_wheel" / "staging").glob("*_staging.npy"))
+            self.assertEqual(len(saved_files), 1)
+            saved = np.load(saved_files[0], allow_pickle=True).item()
+            self.assertEqual(saved["num_steps"], 11)
+            self.assertEqual(saved["reward_status"], "valid")
+            self.assertEqual(np.flatnonzero(saved["reward"]).tolist(), [8])
+
+    def test_normal_eval_never_extends_tail(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            folder = pathlib.Path(tmp)
+            result, env = self.run_episode(
+                folder, enabled=False, success=True, success_at=6, post_success_steps=5
+            )
+            self.assertEqual(result, 1)
+            self.assertEqual(env.current, 6)
+            self.assert_clean(env)
+            self.assertFalse(list(folder.glob("**/*_staging.npy")))
+
+    def test_environment_terminal_stops_tail(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            result, env = self.run_episode(
+                pathlib.Path(tmp), enabled=True, success=True, post_success_steps=5
+            )
+            self.assertEqual(result, 1)
+            self.assertEqual(env.current, 14)
+            self.assert_clean(env)
 
     def test_failure_never_writes_staging(self):
         with tempfile.TemporaryDirectory() as tmp:
