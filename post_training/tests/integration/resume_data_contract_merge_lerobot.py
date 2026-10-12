@@ -41,7 +41,8 @@ def main():
     parser.add_argument("--expected-rollout-episodes", type=int, default=4)
     parser.add_argument("--expected-rollout-frames", type=int, default=600)
     parser.add_argument("--fallback-task", default="ARBiM Data Wheel")
-    parser.add_argument("--use-depth", action="store_true")
+    parser.add_argument("--zarr-use-depth", action="store_true",
+                        help="Opt in to Depth in Zarr (default RGB-only)")
     args = parser.parse_args()
 
     original = resolve_lerobot(args)
@@ -90,6 +91,8 @@ def main():
         combined_rewards[args.expected_teleop_frames:], wheel_rewards
     )
     manifest = json.loads(wheel_provenance.read_text(encoding="utf-8"))
+    if not manifest.get("use_depth"):
+        raise ValueError("Archived Rollout LeRobot must preserve Depth")
     if manifest.get("format") != "arbim_lerobot_staging_provenance_v1":
         raise ValueError("Rollout LeRobot has unexpected Reward provenance")
     records = manifest.get("episodes", [])
@@ -129,7 +132,7 @@ def main():
     print(f"\n[5/6] Resume LeRobot IL merge → {dest}", flush=True)
     result = merge_lerobot_datasets(
         [original, wheel_lerobot], dest, "arbim/il_contract_resume",
-        use_depth=args.use_depth, batch_size=25, fallback_task=args.fallback_task,
+        use_depth=True, batch_size=25, fallback_task=args.fallback_task,
     )
     assert result["num_episodes"] == total_episodes
     assert result["num_frames"] == total_frames
