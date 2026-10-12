@@ -1178,6 +1178,134 @@ def source_id(source):
     return source.get("name") or source["path"]
 
 
+def _iter_lerobot_frames(dataset, episodes, config, reward_mode, reward_offsets, batch_decode):
+    """Yield the existing processed-frame contract without writing an NPY."""
+    use_depth = bool(config.get("use_depth", False))
+    batch_size = int(config.get("stream_batch_size", ZARR_CHUNK_LEAD))
+    max_episode_len = int(config.get("max_episode_len", 2000))
+    lambda_penalty = float(config.get("lambda_penalty", 0.05))
+    smooth_penalty = float(config.get("smooth_penalty", 0.01))
+
+    for episode_id, episode_frames in episodes.items():
+        previous_action = None
+        episode_length = len(episode_frames)
+        for batch_start in range(0, episode_length, batch_size):
+            indices = episode_frames[batch_start:batch_start + batch_size]
+            if batch_decode:
+                items = _load_lerobot_frame_batch(dataset, episode_id, indices, use_depth)
+            else:
+                items = [
+                    _frame_arrays(dataset[index], index, use_depth)
+                    for index in indices
+                ]
+            for batch_offset, item in enumerate(items):
+                step = batch_start + batch_offset
+                terminal = step == episode_length - 1
+                if reward_mode == REWARD_MODE_LAST_GRIPPER_RELEASE_SPARSE:
+                    reward = float(step == reward_offsets[episode_id])
+                else:
+                    reward = float(terminal)
+                    if terminal:
+                        reward -= lambda_penalty * episode_length / max_episode_len
+                    if previous_action is not None:
+                        reward -= smooth_penalty * np.linalg.norm(
+                            item["action"] - previous_action
+                        )
+                frame = {
+                    "agent_pos": item["agent_pos"],
+                    "action": item["action"],
+                    "rgb": item["rgb"],
+                    "reward": float(reward),
+                    "done": bool(terminal),
+                    "timeout": bool(terminal),
+                }
+                if use_depth:
+                    frame["depth"] = item["depth"]
+                yield frame
+                previous_action = np.array(item["action"], copy=True)
+            del items
+
+
+def run_lerobot_to_zarr(config):
+    """Convert LeRobot directly to the current Offline RL Zarr schema."""
+    lerobot_root = config.get("lerobot_root")
+    if not lerobot_root or not config.get("zarr_output_path"):
+        raise ValueError("lerobot_to_zarr requires lerobot_root and zarr_output_path")
+    use_depth = bool(config.get("use_depth", False))
+    batch_size = int(config.get("stream_batch_size", ZARR_CHUNK_LEAD))
+    jpeg_quality = int(config.get("jpeg_quality", DEFAULT_JPEG_QUALITY))
+    reward_mode = str(config.get("reward_mode", REWARD_MODE_EPISODE_END_SHAPED))
+    if reward_mode not in SUPPORTED_REWARD_MODES:
+        raise ValueError(f"Unsupported reward_mode={reward_mode!r}")
+    if batch_size < 1 or not 1 <= jpeg_quality <= 100:
+        raise ValueError("invalid stream_batch_size or jpeg_quality")
+    if int(config.get("max_episode_len", 2000)) <= 0:
+        raise ValueError("max_episode_len must be positive")
+
+    dataset = load_lerobot_dataset(lerobot_root)
+    if len(dataset) == 0:
+        raise RuntimeError("LeRobot dataset contains no frames")
+    episodes = _group_episode_indices(dataset)
+    if not episodes:
+        raise RuntimeError("LeRobot dataset contains no episodes")
+
+    reward_offsets = None
+    reward_metadata = None
+    if reward_mode == REWARD_MODE_LAST_GRIPPER_RELEASE_SPARSE:
+        reward_offsets, reward_metadata = _last_gripper_release_offsets(
+            dataset, episodes, config
+        )
+    batch_decode = _can_batch_decode(dataset)
+    first_episode, first_indices = next(iter(episodes.items()))
+    first_index = first_indices[0]
+    if batch_decode:
+        first = _load_lerobot_frame_batch(
+            dataset, first_episode, [first_index], use_depth
+        )[0]
+    else:
+        first = _frame_arrays(dataset[first_index], first_index, use_depth)
+
+    info = {
+        "path": str(Path(lerobot_root).expanduser().resolve()),
+        "name": "teleop_lerobot",
+        "kind": "teleop_lerobot",
+        "stream_format": "lerobot_direct_v1",
+        "rgb_storage": "jpeg",
+        "jpeg_quality": jpeg_quality,
+        "reward_mode": reward_mode,
+        "reward_event": reward_metadata,
+        "num_frames": len(dataset),
+        "num_episodes": len(episodes),
+        "state_shape": tuple(first["agent_pos"].shape),
+        "action_shape": tuple(first["action"].shape),
+        "rgb_shapes": {
+            key: tuple(_to_uint8_chw(first["rgb"][key]).shape)
+            for key in RGB_FEATURE_TO_BUFFER
+        },
+        "depth_shapes": {},
+        "depth_dtypes": {},
+    }
+    if use_depth:
+        info["depth_shapes"] = {
+            key: tuple(first["depth"][key].shape)
+            for key in DEPTH_FEATURE_TO_BUFFER
+        }
+        info["depth_dtypes"] = {
+            key: np.dtype(first["depth"][key].dtype)
+            for key in DEPTH_FEATURE_TO_BUFFER
+        }
+    del first
+    direct_config = dict(config)
+    direct_config.setdefault("overwrite", False)
+    return _run_build_db_from_infos(
+        direct_config,
+        [info],
+        lambda source: _iter_lerobot_frames(
+            dataset, episodes, config, reward_mode, reward_offsets, batch_decode
+        ),
+    )
+
+
 def run_build_db(config):
     """build_db: merge processed NPY source(s) into compressed Offline RL Zarr."""
     output_path = config.get("zarr_output_path")
@@ -1212,6 +1340,27 @@ def run_build_db(config):
     if total_frames <= 0:
         raise RuntimeError("processed npy sources contain no frames")
 
+    return _run_build_db_from_infos(
+        config, infos, lambda info: _iter_processed_frames(info["path"], use_depth)
+    )
+
+
+def _run_build_db_from_infos(config, infos, iter_source_frames):
+    """Write the existing Offline RL Zarr schema from a streaming frame source."""
+    output_path = config.get("zarr_output_path")
+    use_depth = bool(config.get("use_depth", False))
+    overwrite = bool(config.get("overwrite", True))
+    batch_size = int(config.get("stream_batch_size", ZARR_CHUNK_LEAD))
+    jpeg_quality = int(config.get("jpeg_quality", DEFAULT_JPEG_QUALITY))
+    if not output_path:
+        raise ValueError("Zarr output path is required")
+    if batch_size <= 0 or not 1 <= jpeg_quality <= 100:
+        raise ValueError("invalid stream_batch_size or jpeg_quality")
+    _validate_source_shapes(infos, use_depth)
+    total_frames = sum(info["num_frames"] for info in infos)
+    total_episodes = sum(info["num_episodes"] for info in infos)
+    if total_frames <= 0:
+        raise RuntimeError("source contains no frames")
     output_path, root, meta, arrays = _build_zarr_arrays(
         output_path, total_frames, infos[0], use_depth, overwrite
     )
@@ -1242,7 +1391,7 @@ def run_build_db(config):
         pending = None
         source_episode_count = 0
         source_frame_count = 0
-        for current in _iter_processed_frames(info["path"], use_depth):
+        for current in iter_source_frames(info):
             source_frame_count += 1
             if pending is None:
                 pending = current
@@ -1372,9 +1521,11 @@ def main():
         process_raw_teleop_to_npy(config)
     elif mode == "build_db":
         run_build_db(config)
+    elif mode == "lerobot_to_zarr":
+        run_lerobot_to_zarr(config)
     else:
         raise ValueError(
-            f"unknown mode: {mode!r}. expected 'raw_to_npy' or 'build_db'."
+            f"unknown mode: {mode!r}. expected 'raw_to_npy', 'build_db', or 'lerobot_to_zarr'."
         )
 
 
