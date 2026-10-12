@@ -152,7 +152,7 @@ def _read_template(template_root, use_depth):
 
 def convert_staging_to_lerobot(
     staging_sources, template_root, output_root, repo_id, task,
-    *, use_depth=False, require_valid_reward=False,
+    *, use_depth=True, require_valid_reward=False,
 ):
     paths = discover_staging(staging_sources)
     accepted = []
@@ -254,13 +254,14 @@ def main():
     parser.add_argument("--output-root", required=True)
     parser.add_argument("--repo-id", required=True)
     parser.add_argument("--task", default="ARBiM Data Wheel")
-    parser.add_argument("--use-depth", action="store_true")
+    parser.add_argument("--rgb-only-legacy", action="store_true",
+                        help="Allow legacy Staging without Depth; archival default preserves Depth")
     parser.add_argument("--require-valid-reward", action="store_true")
     args = parser.parse_args()
     print(convert_staging_to_lerobot(
         args.staging, args.template_lerobot_root, args.output_root,
         args.repo_id, args.task,
-        use_depth=args.use_depth,
+        use_depth=not args.rgb_only_legacy,
         require_valid_reward=args.require_valid_reward,
     ))
 

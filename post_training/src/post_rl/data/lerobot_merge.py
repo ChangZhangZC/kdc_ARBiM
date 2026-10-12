@@ -1,25 +1,25 @@
-"""Merge LeRobot datasets for ACT imitation learning, preserving episode boundaries.
+"""Fast lossless merge of full-schema LeRobot datasets for ACT / IL.
 
-Copies selected common training features (16D state/action, 3 RGB, optional 3 Depth)
-using the installed LeRobot writer rather than concatenating video/Parquet files.
+Uses LeRobot's official merge_datasets() (Parquet metadata rewrite + video
+copy/remux, never framewise decode/re-encode) and preserves ARBiM Reward V2
+provenance for later Offline RL conversion. Physical merging is intentionally
+strict: incompatible full schemas are rejected, not silently projected.
 """
 from __future__ import annotations
 
 import argparse
-import copy
 import json
 from pathlib import Path
 import sys
 
 import numpy as np
-import torch
 
 REPO_ROOT = Path(__file__).resolve().parents[4]
 for folder in (REPO_ROOT, REPO_ROOT / "third_party" / "lerobot" / "src"):
     if str(folder) not in sys.path:
         sys.path.insert(0, str(folder))
 import lerobot_patches.custom_patches  # noqa: F401
-from lerobot.datasets.lerobot_dataset import LeRobotDataset
+from lerobot.datasets.dataset_tools import merge_datasets
 
 from post_rl.data import data_prepare as dp
 
@@ -27,69 +27,88 @@ from post_rl.data import data_prepare as dp
 RGB_KEYS = tuple(dp.RGB_FEATURE_TO_BUFFER)
 DEPTH_KEYS = tuple(dp.DEPTH_FEATURE_TO_BUFFER)
 MERGE_METADATA = "arbim_merge_provenance.json"
+STAGING_FORMAT = "arbim_lerobot_staging_provenance_v1"
+MERGED_FORMAT = "arbim_lerobot_merge_provenance_v1"
 
 
-def _schema(dataset, use_depth):
-    keys = ("observation.state", "action", *RGB_KEYS)
-    if use_depth:
-        keys += DEPTH_KEYS
-    features = {}
-    for key in keys:
-        if key not in dataset.meta.features:
-            raise ValueError(f"{dataset.repo_id}: missing LeRobot feature {key}")
-        features[key] = copy.deepcopy(dataset.meta.features[key])
+def _validate_dataset(dataset, path, use_depth):
+    features = dataset.meta.features
+    for key in ("observation.state", "action", *RGB_KEYS, *(DEPTH_KEYS if use_depth else ())):
+        if key not in features:
+            raise ValueError(f"{path}: missing required LeRobot feature {key}")
     if tuple(features["observation.state"]["shape"]) != (16,):
-        raise ValueError("Expected 16D observation.state")
+        raise ValueError(f"{path}: observation.state must be 16D")
     if tuple(features["action"]["shape"]) != (16,):
-        raise ValueError("Expected 16D action")
-    cameras = (*RGB_KEYS, *(DEPTH_KEYS if use_depth else ()))
-    modes = {features[key]["dtype"] for key in cameras}
+        raise ValueError(f"{path}: action must be 16D")
+    camera_keys = (*RGB_KEYS, *(DEPTH_KEYS if use_depth else ()))
+    modes = {features[key]["dtype"] for key in camera_keys}
     if modes not in ({"video"}, {"image"}):
-        raise ValueError("All camera features must share image or video dtype")
-    for key in cameras:
+        raise ValueError(f"{path}: camera storage modes must match")
+    for key in camera_keys:
         shape = tuple(features[key]["shape"])
         if len(shape) != 3 or shape[0] != 3:
-            raise ValueError(f"Expected CHW 3-channel camera feature {key}")
-    metadata = dataset.meta.info
-    fps_value = float(metadata["fps"])
-    if not np.isfinite(fps_value) or fps_value <= 0:
-        raise ValueError("LeRobot FPS must be finite and positive")
-    if not fps_value.is_integer():
-        raise ValueError(f"LeRobot FPS must be an integer for video encoding, got {fps_value}")
-    fps = int(fps_value)
+            raise ValueError(f"{path}: {key} must have 3-channel CHW shape")
+    fps = float(dataset.meta.info["fps"])
+    if not np.isfinite(fps) or fps <= 0:
+        raise ValueError(f"{path}: invalid FPS {fps}")
     return {
         "features": features,
         "fps": fps,
-        "robot_type": metadata.get("robot_type", "kuavo4pro"),
-        "use_videos": modes == {"video"},
+        "robot_type": dataset.meta.info.get("robot_type"),
     }
 
 
-def _check_compatible(sources, use_depth):
-    first = sources[0]["contract"]
-    for source in sources[1:]:
-        current = source["contract"]
-        for name in ("fps", "robot_type", "use_videos"):
-            if current[name] != first[name]:
-                raise ValueError(f"{source['path']}: incompatible LeRobot {name}")
-        for key, template in first["features"].items():
-            other = current["features"][key]
-            if (
-                tuple(other["shape"]) != tuple(template["shape"])
-                or other["dtype"] != template["dtype"]
-                or other.get("names") != template.get("names")
-            ):
-                raise ValueError(
-                    f"{source['path']}: incompatible LeRobot feature {key}"
-                )
+def _read_reward_rows(path, episode_items):
+    """Read direct Staging or recursively merged Reward V2 annotations."""
+    meta = path / "meta"
+    staging_path = meta / "arbim_staging_provenance.json"
+    merged_path = meta / MERGE_METADATA
+    rows = None
+    if staging_path.is_file():
+        saved = json.loads(staging_path.read_text(encoding="utf-8"))
+        if saved.get("format") != STAGING_FORMAT:
+            raise ValueError(f"{path}: unrecognized Staging provenance")
+        rows = saved.get("episodes")
+        if not isinstance(rows, list):
+            raise ValueError(f"{path}: invalid Staging episode records")
+        direct = True
+    elif merged_path.is_file():
+        saved = json.loads(merged_path.read_text(encoding="utf-8"))
+        if saved.get("format") != MERGED_FORMAT:
+            raise ValueError(f"{path}: unrecognized merged provenance")
+        rows = saved.get("episodes")
+        if not isinstance(rows, list):
+            raise ValueError(f"{path}: invalid merged episode records")
+        direct = False
+    if rows is None:
+        return None
+    if len(rows) != len(episode_items):
+        raise ValueError(f"{path}: Reward provenance episode count mismatch")
+    result = []
+    for ordinal, ((episode_id, indices), record) in enumerate(zip(episode_items, rows, strict=True)):
+        if not isinstance(record, dict):
+            raise ValueError(f"{path}: malformed provenance entry {ordinal}")
+        if direct:
+            if (record.get("lerobot_episode_index") != int(episode_id)
+                or record.get("num_frames") != len(indices)):
+                raise ValueError(f"{path}: Staging provenance Episode {episode_id} mismatch")
+            reward = record
+        else:
+            if (record.get("output_episode_index") != int(episode_id)
+                or record.get("frames") != len(indices)):
+                raise ValueError(f"{path}: merged provenance Episode {episode_id} mismatch")
+            reward = record.get("staging_reward")
+        if reward is not None:
+            if not isinstance(reward, dict) or reward.get("reward_status") not in ("valid", "invalid"):
+                raise ValueError(f"{path}: invalid Reward provenance status")
+            if reward.get("reward_status") == "valid":
+                dp._validate_recorded_reward(episode_id, indices, reward)
+        result.append(reward)
+    return result
 
 
 def _episode_task(dataset, first_index, fallback):
-    """Resolve task_index to text from LeRobot's task metadata.
-
-    LeRobot v0.4.x stores meta.tasks as a pandas DataFrame indexed by task
-    text, with a 'task_index' column. Older test fixtures may use a dict.
-    """
+    """Resolve real LeRobot DataFrame tasks; retain support for dict fixtures."""
     hf = getattr(dataset, "hf_dataset", None)
     tasks = getattr(dataset.meta, "tasks", None)
     if hf is not None and tasks is not None:
@@ -102,10 +121,8 @@ def _episode_task(dataset, first_index, fallback):
                     return task
             elif "task_index" in tasks.columns:
                 matches = tasks.index[tasks["task_index"] == task_index]
-                if len(matches) == 1:
-                    task = matches[0]
-                    if isinstance(task, str) and task:
-                        return task
+                if len(matches) == 1 and isinstance(matches[0], str) and matches[0]:
+                    return matches[0]
         except (IndexError, KeyError, TypeError, ValueError, AttributeError):
             pass
     if not fallback:
@@ -113,46 +130,26 @@ def _episode_task(dataset, first_index, fallback):
     return fallback
 
 
-def _to_hwc_rgb(value, key, reference_shape):
-    chw = dp._to_uint8_chw(value)
-    if tuple(chw.shape) != tuple(reference_shape):
-        raise ValueError(
-            f"Decoded LeRobot {key} shape {chw.shape} != {reference_shape}"
-        )
-    return np.ascontiguousarray(np.moveaxis(chw, 0, -1))
-
-
-def _to_hwc_depth(value, key, reference_shape):
-    depth = np.asarray(value)
-    if depth.ndim != 3 or depth.shape[0] != 3:
-        raise ValueError(f"{key}: expected 3-channel CHW Depth")
-    if tuple(depth.shape) != tuple(reference_shape):
-        raise ValueError(f"{key}: incompatible Depth shape")
-    if np.issubdtype(depth.dtype, np.floating):
-        if not np.isfinite(depth).all() or depth.min() < -1e-6 or depth.max() > 1 + 1e-6:
-            raise ValueError(f"{key}: Depth float must be in [0,1]")
-        # Match staging Depth's lossless per-frame uint8 quantization.
-        depth = (np.clip(depth, 0, 1) * 255).astype(np.uint8)
-    elif depth.dtype != np.uint8:
-        raise ValueError(f"{key}: unsupported Depth dtype {depth.dtype}")
-    return np.ascontiguousarray(np.moveaxis(depth, 0, -1))
-
-
 def merge_lerobot_datasets(
     source_roots, output_root, repo_id, *,
-    use_depth=False, batch_size=25, fallback_task="ARBiM",
+    use_depth=True, batch_size=25, fallback_task="ARBiM",
 ):
+    """Merge complete LeRobot schemas; Depth is mandatory for archival by default.
+
+    batch_size retained only for backward call compatibility; official
+    merge_datasets() operates on Parquet/video files rather than frame batches.
+    """
     if not isinstance(source_roots, (list, tuple)) or len(source_roots) < 2:
         raise ValueError("merge_lerobot requires at least two input datasets")
     if int(batch_size) < 1:
         raise ValueError("batch_size must be positive")
-    paths = [Path(root).expanduser().resolve() for root in source_roots]
+    paths = [Path(p).expanduser().resolve() for p in source_roots]
     if len(set(paths)) != len(paths):
         raise ValueError("duplicate LeRobot input datasets")
     target = Path(output_root).expanduser().resolve()
     if target.exists():
         raise FileExistsError(f"LeRobot output already exists: {target}")
-    if any(target == path or path in target.parents for path in paths):
+    if any(target == p or p in target.parents for p in paths):
         raise ValueError("output LeRobot cannot overwrite or nest inside an input")
     sources = []
     for path in paths:
@@ -162,134 +159,88 @@ def merge_lerobot_datasets(
         episodes = dp._group_episode_indices(dataset)
         if not episodes:
             raise ValueError(f"{path}: no episodes")
+        contract = _validate_dataset(dataset, path, use_depth)
         sources.append({
-            "path": str(path),
-            "dataset": dataset,
-            "episodes": episodes,
-            "contract": _schema(dataset, use_depth),
+            "path": path, "dataset": dataset, "episodes": episodes,
+            "contract": contract,
+            "reward_rows": _read_reward_rows(path, list(episodes.items())),
         })
-    _check_compatible(sources, use_depth)
-    contract = sources[0]["contract"]
-    target.parent.mkdir(parents=True, exist_ok=True)
-    destination = LeRobotDataset.create(
-        repo_id=repo_id,
-        root=str(target),
-        robot_type=contract["robot_type"],
-        fps=contract["fps"],
-        features=contract["features"],
-        use_videos=contract["use_videos"],
-    )
-    output_episode_id = 0
-    total_frames = 0
+
+    reference = sources[0]["contract"]
+    for source in sources[1:]:
+        current = source["contract"]
+        for key in ("fps", "robot_type"):
+            if current[key] != reference[key]:
+                raise ValueError(f"{source['path']}: incompatible {key}")
+        # Official aggregate_datasets requires *complete* feature equality.
+        if current["features"] != reference["features"]:
+            missing = sorted(set(reference["features"]) - set(current["features"]))
+            extra = sorted(set(current["features"]) - set(reference["features"]))
+            raise ValueError(
+                f"{source['path']}: incompatible full LeRobot schema "
+                f"(missing={missing}, extra={extra}); archive Depth, do not drop it"
+            )
+
     records = []
+    ordinal = 0
+    total_frames = 0
     for source in sources:
-        dataset = source["dataset"]
-        use_batch = dp._can_batch_decode(dataset)
-        source_meta = Path(source["path"]) / "meta"
-        staging_metadata = source_meta / "arbim_staging_provenance.json"
-        merged_metadata = source_meta / MERGE_METADATA
-        source_reward_rows = None
-        if staging_metadata.is_file():
-            recorded = json.loads(staging_metadata.read_text(encoding="utf-8"))
-            if recorded.get("format") != "arbim_lerobot_staging_provenance_v1":
-                raise ValueError(f"{source['path']}: unrecognized Staging provenance")
-            source_reward_rows = recorded.get("episodes", [])
-        elif merged_metadata.is_file():
-            recorded = json.loads(merged_metadata.read_text(encoding="utf-8"))
-            if recorded.get("format") != "arbim_lerobot_merge_provenance_v1":
-                raise ValueError(f"{source['path']}: unrecognized merged provenance")
-            source_reward_rows = [
-                row.get("staging_reward") for row in recorded.get("episodes", [])
-            ]
-        if source_reward_rows is not None and len(source_reward_rows) != len(source["episodes"]):
-            raise ValueError(f"{source['path']}: Reward provenance episode count mismatch")
-        for episode_position, (episode_id, indices) in enumerate(source["episodes"].items()):
-            task = _episode_task(dataset, indices[0], fallback_task)
-            for start in range(0, len(indices), batch_size):
-                frame_indices = indices[start:start + batch_size]
-                if use_batch:
-                    items = dp._load_lerobot_frame_batch(
-                        dataset, episode_id, frame_indices, use_depth
-                    )
-                else:
-                    items = [
-                        dp._frame_arrays(dataset[index], index, use_depth)
-                        for index in frame_indices
-                    ]
-                for item in items:
-                    frame = {
-                        "observation.state": torch.tensor(
-                            np.asarray(item["agent_pos"], dtype=np.float32).copy()
-                        ),
-                        "action": torch.tensor(
-                            np.asarray(item["action"], dtype=np.float32).copy()
-                        ),
-                    }
-                    for key in RGB_KEYS:
-                        frame[key] = _to_hwc_rgb(
-                            item["rgb"][key], key,
-                            contract["features"][key]["shape"],
-                        )
-                    if use_depth:
-                        for key in DEPTH_KEYS:
-                            frame[key] = _to_hwc_depth(
-                                item["depth"][key], key,
-                                contract["features"][key]["shape"],
-                            )
-                    frame["task"] = task
-                    destination.add_frame(frame)
-                del items
-            destination.save_episode()
-            total_frames += len(indices)
+        for position, (episode_id, indices) in enumerate(source["episodes"].items()):
             record = {
-                "output_episode_index": output_episode_id,
-                "source_root": source["path"],
+                "output_episode_index": ordinal,
+                "source_root": str(source["path"]),
                 "source_episode_index": int(episode_id),
                 "frames": len(indices),
-                "task": task,
+                "task": _episode_task(source["dataset"], indices[0], fallback_task),
             }
-            if source_reward_rows is not None:
-                staging_row = source_reward_rows[episode_position]
-                if staging_row is not None:
-                    if staging_row.get("reward_status") not in {"valid", "invalid"}:
-                        raise ValueError(f"{source['path']}: invalid source Reward status")
-                    record["staging_reward"] = staging_row
+            if source["reward_rows"] is not None:
+                event = source["reward_rows"][position]
+                if event is not None:
+                    record["staging_reward"] = event
             records.append(record)
-            output_episode_id += 1
-            # Keep parity with the existing Rosbag -> LeRobot writer.
-            destination.hf_dataset = destination.create_hf_dataset()
+            total_frames += len(indices)
+            ordinal += 1
 
-    metadata = {
-        "format": "arbim_lerobot_merge_provenance_v1",
-        "use_depth": bool(use_depth),
-        "sources": [source["path"] for source in sources],
+    # This is LeRobot's official metadata/video-copy/remux implementation.
+    target.parent.mkdir(parents=True, exist_ok=True)
+    combined = merge_datasets(
+        datasets=[source["dataset"] for source in sources],
+        output_repo_id=repo_id, output_dir=target,
+    )
+    if len(combined) != total_frames or int(combined.meta.total_episodes) != ordinal:
+        raise RuntimeError("Official LeRobot merge produced mismatched Episode/frame counts")
+    if combined.meta.features != reference["features"]:
+        raise RuntimeError("Official LeRobot merge changed the feature schema")
+    manifest = {
+        "format": MERGED_FORMAT,
+        "use_depth": bool(set(DEPTH_KEYS).issubset(reference["features"])),
+        "sources": [str(s["path"]) for s in sources],
         "episodes": records,
         "total_frames": total_frames,
-        "total_episodes": output_episode_id,
+        "total_episodes": ordinal,
+        "merge_backend": "lerobot.datasets.dataset_tools.merge_datasets",
     }
     provenance = target / "meta" / MERGE_METADATA
-    provenance.write_text(json.dumps(metadata, indent=2), encoding="utf-8")
+    provenance.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
     return {
-        "lerobot_root": str(target),
-        "num_frames": total_frames,
-        "num_episodes": output_episode_id,
-        "provenance": str(provenance),
+        "lerobot_root": str(target), "num_frames": total_frames,
+        "num_episodes": ordinal, "provenance": str(provenance),
     }
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("sources", nargs="+", help="Two or more input LeRobot directories")
+    parser.add_argument("sources", nargs="+", help="Two or more LeRobot directories")
     parser.add_argument("--output-root", required=True)
     parser.add_argument("--repo-id", required=True)
     parser.add_argument("--fallback-task", default="ARBiM")
-    parser.add_argument("--batch-size", type=int, default=25)
-    parser.add_argument("--use-depth", action="store_true")
+    parser.add_argument("--batch-size", type=int, default=25, help="Legacy compatibility only")
+    parser.add_argument("--allow-rgb-only", action="store_true",
+                        help="Legacy archive only; default requires all 3 Depth cameras")
     args = parser.parse_args()
     print(merge_lerobot_datasets(
         args.sources, args.output_root, args.repo_id,
-        use_depth=args.use_depth,
-        batch_size=args.batch_size,
+        use_depth=not args.allow_rgb_only, batch_size=args.batch_size,
         fallback_task=args.fallback_task,
     ))
 

@@ -41,7 +41,8 @@ def main():
     parser.add_argument("--expected-rollout-episodes", type=int, default=4)
     parser.add_argument("--expected-rollout-frames", type=int, default=600)
     parser.add_argument("--fallback-task", default="ARBiM Data Wheel")
-    parser.add_argument("--use-depth", action="store_true")
+    parser.add_argument("--zarr-use-depth", action="store_true",
+                        help="Opt in to Depth in Zarr (default RGB-only)")
     args = parser.parse_args()
 
     original = resolve_lerobot(args)
@@ -69,15 +70,17 @@ def main():
         raise FileNotFoundError(f"Missing Staging reward provenance: {wheel_provenance}")
 
     base, base_ends, base_rewards = verify_zarr(
-        teleop_zarr, args.expected_teleop_frames, args.expected_teleop_episodes
+        teleop_zarr, args.expected_teleop_frames, args.expected_teleop_episodes,
+        use_depth=args.zarr_use_depth,
     )
     wheel, wheel_ends, wheel_rewards = verify_zarr(
-        wheel_zarr, args.expected_rollout_frames, args.expected_rollout_episodes
+        wheel_zarr, args.expected_rollout_frames, args.expected_rollout_episodes,
+        use_depth=args.zarr_use_depth,
     )
     total_frames = args.expected_teleop_frames + args.expected_rollout_frames
     total_episodes = args.expected_teleop_episodes + args.expected_rollout_episodes
     combined, ends, combined_rewards = verify_zarr(
-        merged_zarr, total_frames, total_episodes
+        merged_zarr, total_frames, total_episodes, use_depth=args.zarr_use_depth,
     )
     np.testing.assert_array_equal(ends[:len(base_ends)], base_ends)
     np.testing.assert_array_equal(
@@ -90,6 +93,8 @@ def main():
         combined_rewards[args.expected_teleop_frames:], wheel_rewards
     )
     manifest = json.loads(wheel_provenance.read_text(encoding="utf-8"))
+    if not manifest.get("use_depth"):
+        raise ValueError("Archived Rollout LeRobot must preserve Depth")
     if manifest.get("format") != "arbim_lerobot_staging_provenance_v1":
         raise ValueError("Rollout LeRobot has unexpected Reward provenance")
     records = manifest.get("episodes", [])
@@ -129,7 +134,7 @@ def main():
     print(f"\n[5/6] Resume LeRobot IL merge → {dest}", flush=True)
     result = merge_lerobot_datasets(
         [original, wheel_lerobot], dest, "arbim/il_contract_resume",
-        use_depth=args.use_depth, batch_size=25, fallback_task=args.fallback_task,
+        use_depth=True, batch_size=25, fallback_task=args.fallback_task,
     )
     assert result["num_episodes"] == total_episodes
     assert result["num_frames"] == total_frames
@@ -138,6 +143,15 @@ def main():
     final_il = load_lerobot_dataset(result["lerobot_root"])
     assert len(final_il) == total_frames
     assert int(final_il.meta.total_episodes) == total_episodes
+    assert set(("observation.depth_h", "observation.depth_l",
+                "observation.depth_r")).issubset(final_il.meta.features)
+    for frame_id in (0, args.expected_teleop_frames):
+        frame = final_il[frame_id]  # Decode one original and one Data Wheel video sample.
+        for key in ("observation.depth_h", "observation.depth_l", "observation.depth_r"):
+            depth = np.asarray(frame[key])
+            assert depth.ndim == 3 and depth.shape[0] == 3, (key, depth.shape)
+            assert np.isfinite(depth).all(), (frame_id, key)
+    print("[PASS] merged LeRobot depth video decodes at Teleop/Rollout boundaries", flush=True)
     assert combined["data"]["next_index"].shape == (total_frames,)
     print("\nDATA CONTRACT REAL E2E RESUME PASSED", flush=True)
     print(f"LeRobot IL: {result['lerobot_root']}", flush=True)

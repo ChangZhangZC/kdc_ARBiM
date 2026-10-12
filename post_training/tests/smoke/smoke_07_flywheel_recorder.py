@@ -225,6 +225,13 @@ class TestRolloutRecorder(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "normalized to"):
                 recorder.start_episode(sample)
 
+    def test_depth_required_for_archival_recorder(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            recorder = RolloutRecorder(tmp, episode=14, require_depth=True)
+            with self.assertRaisesRegex(ValueError, "requires all three Depth"):
+                recorder.start_episode(observation(0))
+            assert not list(pathlib.Path(tmp).glob("*_staging.npy"))
+
 
 if __name__ == "__main__":
     unittest.main()

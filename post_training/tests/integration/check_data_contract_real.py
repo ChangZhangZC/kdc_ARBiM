@@ -39,7 +39,7 @@ def resolve_lerobot(args):
     return result
 
 
-def verify_zarr(path, frames, episodes, reward_v2=True):
+def verify_zarr(path, frames, episodes, reward_v2=True, use_depth=False):
     root = zarr.open_group(str(path), mode="r")
     data = root["data"]
     ep_ends = np.asarray(root["meta"]["episode_ends"][:], dtype=np.int64)
@@ -49,6 +49,9 @@ def verify_zarr(path, frames, episodes, reward_v2=True):
         raise AssertionError(f"{path}: action/state contract mismatch")
     for name in ("head_rgb", "wrist_left_rgb", "wrist_right_rgb"):
         assert len(data[f"{name}_jpeg_offsets"]) == frames + 1
+    for name in ("head_depth", "wrist_left_depth", "wrist_right_depth"):
+        if (name in data) != use_depth or (f"next_{name}" in data) != use_depth:
+            raise AssertionError(f"{path}: Depth storage for {name} differs from use_depth={use_depth}")
     reward = np.asarray(data["reward"][:]).reshape(-1)
     done = np.asarray(data["done"][:]).reshape(-1)
     returns = np.asarray(data["return"][:]).reshape(-1)
@@ -87,11 +90,14 @@ def main():
     parser.add_argument("--source-npy", help="Optional historical NPY to resolve source_root only")
     parser.add_argument("--staging-dir", required=True)
     parser.add_argument("--reference-zarr", help="Previously migrated Reward V2 Teleop Zarr")
+    parser.add_argument("--reuse-teleop-zarr",
+                        help="Already validated Teleop Reward V2 Zarr: skip expensive Step 2 rebuild")
     parser.add_argument("--work-root", required=True, help="NEW output directory")
     parser.add_argument("--expected-teleop-frames", type=int, default=90144)
     parser.add_argument("--expected-teleop-episodes", type=int, default=600)
     parser.add_argument("--task", default="ARBiM Data Wheel")
-    parser.add_argument("--use-depth", action="store_true")
+    parser.add_argument("--zarr-use-depth", action="store_true",
+                        help="Opt in to writing Depth in Zarr (default RGB-only)")
     args = parser.parse_args()
 
     original = resolve_lerobot(args)
@@ -108,15 +114,18 @@ def main():
     result = convert_staging_to_lerobot(
         [stage], original, output / "rollout_lerobot",
         "arbim/flywheel_contract_check", args.task,
-        use_depth=args.use_depth, require_valid_reward=True,
+        use_depth=True, require_valid_reward=True,
     )
+    import json
+    manifest = json.loads(Path(result["provenance"]).read_text(encoding="utf-8"))
+    assert manifest["use_depth"], "Staging -> LeRobot must archive Depth"
     rollout_count = result["num_episodes"]
     rollout_frames = result["num_frames"]
     assert rollout_count > 0 and rollout_frames > 0
     print(f"  Data Wheel: {rollout_count} episodes, {rollout_frames} frames")
 
     common = {
-        "overwrite": False, "use_depth": args.use_depth,
+        "overwrite": False, "use_depth": args.zarr_use_depth,
         "stream_batch_size": 50, "jpeg_quality": 95,
         "reward_mode": "last_gripper_release_sparse",
         "reward_source": "auto",
@@ -125,13 +134,22 @@ def main():
         "reward_open_infer_frames": 5, "reward_min_dwell": 3,
         "reward_expected_cycles": 1,
     }
-    print("\n[2/6] Original Teleop LeRobot -> Zarr")
-    teleop_zarr = output / "teleop_reward_v2.zarr"
-    run_lerobot_to_zarr({
-        **common, "lerobot_root": str(original), "zarr_output_path": str(teleop_zarr),
-    })
+    if args.reuse_teleop_zarr:
+        print("\n[2/6] Reuse previously validated Teleop Zarr (no rebuild)")
+        teleop_zarr = Path(args.reuse_teleop_zarr).expanduser().resolve()
+        if not teleop_zarr.is_dir():
+            raise FileNotFoundError(f"reused Teleop Zarr missing: {teleop_zarr}")
+        if teleop_zarr == output or output in teleop_zarr.parents:
+            raise ValueError("Reused Teleop Zarr must be external to the new work-root")
+    else:
+        print("\n[2/6] Original Teleop LeRobot -> Zarr")
+        teleop_zarr = output / "teleop_reward_v2.zarr"
+        run_lerobot_to_zarr({
+            **common, "lerobot_root": str(original), "zarr_output_path": str(teleop_zarr),
+        })
     teleop, _, _ = verify_zarr(
         teleop_zarr, args.expected_teleop_frames, args.expected_teleop_episodes,
+        use_depth=args.zarr_use_depth,
     )
     if args.reference_zarr:
         compare_reference(teleop, Path(args.reference_zarr).expanduser().resolve())
@@ -143,7 +161,7 @@ def main():
         "zarr_output_path": str(rollout_zarr),
     })
     wheel, wheel_ends, wheel_reward = verify_zarr(
-        rollout_zarr, rollout_frames, rollout_count
+        rollout_zarr, rollout_frames, rollout_count, use_depth=args.zarr_use_depth,
     )
     # Verify recorded reward indices per episode, not just the reward sum.
     import json
@@ -169,7 +187,9 @@ def main():
     total_episodes = args.expected_teleop_episodes + rollout_count
     assert merge_result["num_frames"] == total_frames
     assert merge_result["num_episodes"] == total_episodes
-    merged, ends, rewards = verify_zarr(merged_zarr, total_frames, total_episodes)
+    merged, ends, rewards = verify_zarr(
+        merged_zarr, total_frames, total_episodes, use_depth=args.zarr_use_depth
+    )
     np.testing.assert_array_equal(
         rewards[args.expected_teleop_frames:], wheel_reward,
     )
@@ -183,7 +203,7 @@ def main():
     merged_lerobot_result = merge_lerobot_datasets(
         [original, result["lerobot_root"]],
         output / "merged_il_lerobot", "arbim/il_contract_check",
-        use_depth=args.use_depth, batch_size=25, fallback_task=args.task,
+        use_depth=True, batch_size=25, fallback_task=args.task,
     )
     assert merged_lerobot_result["num_frames"] == total_frames
     assert merged_lerobot_result["num_episodes"] == total_episodes
@@ -192,6 +212,15 @@ def main():
     combined_il = load_lerobot_dataset(merged_lerobot_result["lerobot_root"])
     assert len(combined_il) == total_frames
     assert int(combined_il.meta.total_episodes) == total_episodes
+    assert set(("observation.depth_h", "observation.depth_l",
+                "observation.depth_r")).issubset(combined_il.meta.features)
+    for frame_id in (0, args.expected_teleop_frames):
+        frame = combined_il[frame_id]  # Decode one original and one Data Wheel video sample.
+        for key in ("observation.depth_h", "observation.depth_l", "observation.depth_r"):
+            depth = np.asarray(frame[key])
+            assert depth.ndim == 3 and depth.shape[0] == 3, (key, depth.shape)
+            assert np.isfinite(depth).all(), (frame_id, key)
+    print("[PASS] merged LeRobot depth video decodes at Teleop/Rollout boundaries", flush=True)
     assert merged["data"]["next_index"].shape == (total_frames,)
     print("\nDATA CONTRACT FULL REAL-DATA TEST PASSED")
     print(f"LeRobot IL: {merged_lerobot_result['lerobot_root']}")

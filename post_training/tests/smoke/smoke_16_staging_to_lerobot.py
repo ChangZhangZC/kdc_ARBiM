@@ -89,7 +89,7 @@ def test_convert(depth):
         with patch.object(converter, "LeRobotDataset", FakeLeRobot):
             result = converter.convert_staging_to_lerobot(
                 [stage], template, root / "il_dataset", "lerobot/arbim_il",
-                "sort toy", use_depth=depth,
+                "sort toy", **({} if depth else {"use_depth": False}),
             )
         assert result["num_episodes"] == 3
         assert result["num_frames"] == 35  # 14 + 7 + 14
@@ -123,7 +123,8 @@ def test_convert(depth):
         with patch.object(converter, "LeRobotDataset", FakeLeRobot):
             result_rl = converter.convert_staging_to_lerobot(
                 [stage], template, root / "rl_dataset", "lerobot/arbim_rl",
-                "sort toy", use_depth=depth, require_valid_reward=True,
+                "sort toy", require_valid_reward=True,
+                **({} if depth else {"use_depth": False}),
             )
         assert result_rl["num_episodes"] == 2
         assert result_rl["skipped_invalid"] == 1
@@ -174,7 +175,25 @@ def test_reject_noninteger_video_fps():
                 raise AssertionError("Fractional FPS silently reached video encoding")
 
 
+def test_default_requires_depth():
+    with tempfile.TemporaryDirectory(prefix="arbim_staging_depth_required_") as name:
+        root = pathlib.Path(name)
+        stage, template, *_ = create_sources(root, depth=False)
+        with patch.object(converter, "LeRobotDataset", FakeLeRobot):
+            try:
+                converter.convert_staging_to_lerobot(
+                    [stage], template, root / "no_depth_archive",
+                    "arbim/depth_required", "sort toy",
+                )
+            except ValueError as exc:
+                assert "Depth requested but missing" in str(exc)
+            else:
+                raise AssertionError("Depth-less Staging silently entered archive")
+        assert not (root / "no_depth_archive").exists()
+
+
 def main():
+    test_default_requires_depth()
     test_convert(False)
     test_convert(True)
     test_reject_noninteger_video_fps()

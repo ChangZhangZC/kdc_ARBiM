@@ -20,7 +20,10 @@ bash post_training/tests/run_batch04.sh
 echo "=== Contract Reward provenance ==="
 python -m py_compile \
   post_training/tests/smoke/smoke_18_contract_provenance.py \
-  post_training/tests/integration/check_data_contract_real.py
+  post_training/tests/integration/check_data_contract_real.py \
+  post_training/tests/integration/resume_data_contract_merge_lerobot.py \
+  kuavo_deploy/src/eval/sim_auto_test.py \
+  kuavo_deploy/src/eval/rollout_recorder.py
 python post_training/tests/smoke/smoke_18_contract_provenance.py
 
 echo "=== Existing Data Wheel regression suite ==="
