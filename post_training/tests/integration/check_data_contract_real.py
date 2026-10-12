@@ -91,7 +91,8 @@ def main():
     parser.add_argument("--expected-teleop-frames", type=int, default=90144)
     parser.add_argument("--expected-teleop-episodes", type=int, default=600)
     parser.add_argument("--task", default="ARBiM Data Wheel")
-    parser.add_argument("--use-depth", action="store_true")
+    parser.add_argument("--zarr-use-depth", action="store_true",
+                        help="Opt in to writing Depth in Zarr (default RGB-only)")
     args = parser.parse_args()
 
     original = resolve_lerobot(args)
@@ -108,15 +109,18 @@ def main():
     result = convert_staging_to_lerobot(
         [stage], original, output / "rollout_lerobot",
         "arbim/flywheel_contract_check", args.task,
-        use_depth=args.use_depth, require_valid_reward=True,
+        use_depth=True, require_valid_reward=True,
     )
+    import json
+    manifest = json.loads(Path(result["provenance"]).read_text(encoding="utf-8"))
+    assert manifest["use_depth"], "Staging -> LeRobot must archive Depth"
     rollout_count = result["num_episodes"]
     rollout_frames = result["num_frames"]
     assert rollout_count > 0 and rollout_frames > 0
     print(f"  Data Wheel: {rollout_count} episodes, {rollout_frames} frames")
 
     common = {
-        "overwrite": False, "use_depth": args.use_depth,
+        "overwrite": False, "use_depth": args.zarr_use_depth,
         "stream_batch_size": 50, "jpeg_quality": 95,
         "reward_mode": "last_gripper_release_sparse",
         "reward_source": "auto",
@@ -183,7 +187,7 @@ def main():
     merged_lerobot_result = merge_lerobot_datasets(
         [original, result["lerobot_root"]],
         output / "merged_il_lerobot", "arbim/il_contract_check",
-        use_depth=args.use_depth, batch_size=25, fallback_task=args.task,
+        use_depth=True, batch_size=25, fallback_task=args.task,
     )
     assert merged_lerobot_result["num_frames"] == total_frames
     assert merged_lerobot_result["num_episodes"] == total_episodes
