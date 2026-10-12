@@ -212,6 +212,15 @@ def main():
     combined_il = load_lerobot_dataset(merged_lerobot_result["lerobot_root"])
     assert len(combined_il) == total_frames
     assert int(combined_il.meta.total_episodes) == total_episodes
+    assert set(("observation.depth_h", "observation.depth_l",
+                "observation.depth_r")).issubset(combined_il.meta.features)
+    for frame_id in (0, args.expected_teleop_frames):
+        frame = combined_il[frame_id]  # Decode one original and one Data Wheel video sample.
+        for key in ("observation.depth_h", "observation.depth_l", "observation.depth_r"):
+            depth = np.asarray(frame[key])
+            assert depth.ndim == 3 and depth.shape[0] == 3, (key, depth.shape)
+            assert np.isfinite(depth).all(), (frame_id, key)
+    print("[PASS] merged LeRobot depth video decodes at Teleop/Rollout boundaries", flush=True)
     assert merged["data"]["next_index"].shape == (total_frames,)
     print("\nDATA CONTRACT FULL REAL-DATA TEST PASSED")
     print(f"LeRobot IL: {merged_lerobot_result['lerobot_root']}")
