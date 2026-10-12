@@ -58,70 +58,50 @@ The existing Reward V2 assigns a sparse +1 at the later of two detected
 gripper-release actions. A successful episode whose reward cannot be validated
 is still saved, but marked `reward_status="invalid"` and `reward=None`.
 
-## 2. Manually convert staging to Processed NPY
+## 2. Export successful rollouts to LeRobot (new canonical path)
 
-Run from the repository root:
+The **long-term format is now LeRobot**, not Processed NPY. For the new
+data-format contract and merge options, see [DATA_CONTRACT.md](DATA_CONTRACT.md).
 
 ```bash
-python post_training/src/post_rl/data/rollout_to_npy.py \
+python post_training/src/post_rl/data/staging_to_lerobot.py \
   outputs/eval/<task>/<method>/<timestamp>/epoch<epoch>_flywheel/data_wheel/staging \
-  --output /path/to/processed/rollout_round_01.npy
+  --template-lerobot-root /path/to/teleop_lerobot \
+  --output-root /path/to/new_rollout_lerobot \
+  --repo-id lerobot/arbim_rollout_round_01 \
+  --task "ARBiM Data Wheel" \
+  --require-valid-reward
 ```
 
-Only successful staging episodes with valid Reward V2 are included. The
-converter reports counts and skipped-invalid paths. The output is one
-`arbim_processed_npy_stream_v2` file containing multiple episodes; it
-preserves the existing JPEG bytes. By default Depth is **excluded**, like
-`data_prepare.yaml: use_depth=false`. Pass `--use-depth` to export all
-three Depth cameras as `float32 [3,H,W]` in `[0,1]`, matching the tensors
-decoded by LeRobot v0.4.2 from its three-channel uint8 videos (except video
-compression artifacts). All selected staging files must contain compatible
-Depth when `--use-depth` is enabled. It refuses to overwrite by default
-(`--overwrite` explicitly replaces a prior output).
+Omit `--require-valid-reward` if collecting successful demonstrations for **IL**,
+including those that have an invalid Reward V2. For RL, only episodes with
+validated Reward V2 are eligible. LeRobot stores T action-aligned frames; the
+original Staging preserves the final extra observation T+1.
 
-If no episodes have a valid reward, conversion fails rather than generating
-unlabeled training data. The final T+1 observation remains in staging; the
-current `run_build_db` follows the existing terminal transition convention
-and repeats the final processed state at the terminal index.
+## 3. Create and combine Offline RL Zarr datasets
 
-## 3. Manually build a new Offline RL Zarr
-
-Edit **only** `post_training/configs/data/data_prepare.yaml`; set:
-
-```yaml
-mode: build_db
-use_depth: false  # set true only if conversion used --use-depth for all sources
-overwrite: false
-zarr_output_path: /path/to/output/offline_rl_flywheel_round_01.zarr
-
-teleop_sources:
-  - name: original_teleop
-    kind: teleop_npy
-    path: /path/to/processed/original_teleop.npy
-  - name: flywheel_round_01
-    kind: rollout_npy
-    path: /path/to/processed/rollout_round_01.npy
-```
-
-Then run:
+First use `mode: lerobot_to_zarr` with `reward_source: auto` to convert
+each original Teleop / Data Wheel LeRobot dataset directly to a Zarr. Then use
+`mode: merge_zarr` to combine the resulting compatible Zarrs.
+This avoids the former Staging → Processed NPY → Zarr intermediate path.
 
 ```bash
 python post_training/src/post_rl/data/data_prepare.py \
-  --config post_training/configs/data/data_prepare.yaml
+  --config post_training/configs/data/lerobot_to_zarr.yaml
+
+python post_training/src/post_rl/data/data_prepare.py \
+  --config post_training/configs/data/merge_zarr.yaml
 ```
 
-`teleop_sources` is the existing interface name and supports both source
-types; `kind` is optional provenance metadata. The two NPY sources must have
-compatible 16D state/action and camera dimensions. With `use_depth: true`,
-all sources must contain the three Depth cameras with matching spatial
-shapes and compatible numeric conventions; do not mix Depth-enabled and
-RGB-only NPYs. Source rewards are preserved; `run_build_db` recomputes
-discounted returns. Use a
-**new** `zarr_output_path` on every round to avoid replacing the old dataset.
+Edit the example paths before running. Both conversions refuse overwrite by
+default and leave previous RL datasets untouched. For ACT, use
+`post_training/src/post_rl/data/lerobot_merge.py` to combine multiple LeRobot
+sources.
 
-For the default horizon=50 without padding, any individual episode shorter
-than 50 frames contributes **zero** training windows. The sampler does not
-cross episode boundaries.
+The old `rollout_to_npy.py` / `raw_to_npy` / `build_db` adapters remain
+temporarily for compatibility and regression testing, but are **deprecated**.
+Do not use them for new Data Wheel rounds. Without sampler padding, trajectories
+under the configured action horizon (normally 50) provide no training windows.
 
 ## 4. Smoke tests
 
@@ -135,12 +115,15 @@ python post_training/tests/smoke/smoke_10_flywheel_eval.py
 python post_training/tests/smoke/smoke_11_flywheel_target.py
 ```
 
-The tests cover the Recorder/Reward, NPY converter, mixed-source
+These legacy tests cover the Recorder/Reward, NPY converter,
 Zarr/OfflineBuffer/50-step sampling, optional LeRobot-format Depth,
 and mocked evaluation success/failure, Stop, exception, and normal-mode paths.
 The quota test verifies success-target
 behavior separately. The Eval test uses fake ROS/MuJoCo objects; it is **not** a
 substitute for a live MuJoCo + ROS evaluation.
+
+For the new contract run `bash post_training/tests/run_data_contract.sh`
+and both real-data integration scripts documented in DATA_CONTRACT.md.
 
 Before declaring real-world integration complete, use a short real MuJoCo
 evaluation to confirm `/simulator/success`, correct 16D command/state
