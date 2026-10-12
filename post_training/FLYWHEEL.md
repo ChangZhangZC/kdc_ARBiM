@@ -7,10 +7,11 @@ dataset builds are **manual**. No dedicated Data Wheel YAML is used.
 ## 1. Evaluate and record
 
 Use `kuavo_deploy/eval_kuavo.py` and open the task menu. Choose
-`9. data_wheel`. The menu then prompts for the Data Wheel YAML path (Enter
-reuses the config already chosen on entering the menu), followed by a
-**positive integer number of successful rollouts to collect**. Ordinary
-`8. auto_test` remains capped by `inference.eval_episodes`.
+`9. data_wheel`. After selecting a task, the menu prompts for a YAML
+config path (Enter can reuse a previously selected path). Data Wheel then
+prompts for a **positive integer number of successful rollouts to collect**.
+Ordinary `8. auto_test` requests only the YAML path and remains capped by
+`inference.eval_episodes`.
 
 In Data Wheel mode `inference.eval_episodes` is **not** the attempt limit:
 the evaluator retries failed episodes until the requested success count is
