@@ -1,4 +1,5 @@
 import argparse
+import json
 import os
 import shutil
 import sys
@@ -1231,6 +1232,57 @@ def _iter_lerobot_frames(dataset, episodes, config, reward_mode, reward_offsets,
             del items
 
 
+def _staging_reward_offsets(lerobot_root, episodes, config):
+    """Use recorded Reward V2 annotations when exporting Data Wheel LeRobot."""
+    reward_source = str(config.get("reward_source", "auto"))
+    if reward_source not in {"auto", "computed", "recorded"}:
+        raise ValueError("reward_source must be auto/computed/recorded")
+    if reward_source == "computed":
+        return None
+    manifest_path = Path(lerobot_root).expanduser().resolve() / "meta" / "arbim_staging_provenance.json"
+    if not manifest_path.is_file():
+        if reward_source == "recorded":
+            raise FileNotFoundError(f"recorded Staging Reward metadata missing: {manifest_path}")
+        return None
+    with manifest_path.open("r", encoding="utf-8") as fp:
+        manifest = json.load(fp)
+    if manifest.get("format") != "arbim_lerobot_staging_provenance_v1":
+        raise ValueError("unexpected Staging Reward provenance format")
+    records = manifest.get("episodes", [])
+    if len(records) != len(episodes):
+        raise ValueError("Staging Reward episode count differs from LeRobot episodes")
+    offsets = {}
+    for (episode_id, indices), row in zip(episodes.items(), records, strict=True):
+        if (
+            row.get("lerobot_episode_index") != int(episode_id)
+            or row.get("num_frames") != len(indices)
+            or row.get("reward_mode") != REWARD_MODE_LAST_GRIPPER_RELEASE_SPARSE
+        ):
+            raise ValueError(f"Staging Reward metadata mismatch for episode {episode_id}")
+        if row.get("reward_status") != "valid":
+            raise ValueError(
+                f"Episode {episode_id} has invalid Staging Reward V2; "
+                "use --require-valid-reward during Staging -> LeRobot conversion "
+                "for an RL-ready subset"
+            )
+        offset = row.get("reward_index")
+        event = row.get("reward_event")
+        if (
+            not isinstance(offset, int) or not 0 <= offset < len(indices) - 1
+            or not isinstance(event, dict) or event.get("frame_offset") != offset
+        ):
+            raise ValueError(f"Invalid recorded Reward index for episode {episode_id}")
+        offsets[episode_id] = offset
+    return offsets, {
+        "source": "staging_recorded_v1",
+        "provenance": str(manifest_path),
+        "episodes": [
+            {"episode_index": int(ep), "reward_offset": int(offset)}
+            for ep, offset in offsets.items()
+        ],
+    }
+
+
 def run_lerobot_to_zarr(config):
     """Convert LeRobot directly to the current Offline RL Zarr schema."""
     lerobot_root = config.get("lerobot_root")
@@ -1257,9 +1309,13 @@ def run_lerobot_to_zarr(config):
     reward_offsets = None
     reward_metadata = None
     if reward_mode == REWARD_MODE_LAST_GRIPPER_RELEASE_SPARSE:
-        reward_offsets, reward_metadata = _last_gripper_release_offsets(
-            dataset, episodes, config
-        )
+        recorded = _staging_reward_offsets(lerobot_root, episodes, config)
+        if recorded is not None:
+            reward_offsets, reward_metadata = recorded
+        else:
+            reward_offsets, reward_metadata = _last_gripper_release_offsets(
+                dataset, episodes, config
+            )
     batch_decode = _can_batch_decode(dataset)
     first_episode, first_indices = next(iter(episodes.items()))
     first_index = first_indices[0]
