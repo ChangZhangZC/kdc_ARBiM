@@ -177,8 +177,28 @@ python post_training/tests/integration/check_data_contract_real.py \
   --expected-teleop-frames 90144
 ```
 
-Requires substantial temporary disk space for a Teleop Zarr, Rollout Zarr,
-merged Zarr and a file-level merged LeRobot. Work on a new directory; it
+For a fast rerun after the 90,144-frame Teleop Zarr has already passed
+the historical reference comparison, reuse that **unchanged** RGB-only Zarr:
+
+```bash
+python post_training/tests/integration/check_data_contract_real.py \
+  --source-npy data/sim_task1.npy \
+  --staging-dir /path/to/new/depth_enabled_flywheel/staging \
+  --reference-zarr data/sim_task1.zarr \
+  --reuse-teleop-zarr outputs/data_contract_e2e_03/teleop_reward_v2.zarr \
+  --work-root outputs/data_contract_e2e_depth_01 \
+  --expected-teleop-episodes 600 \
+  --expected-teleop-frames 90144
+```
+
+The resumed test still creates and validates the new **Depth-enabled**
+Data Wheel LeRobot, RGB-only Rollout Zarr, merged PPO Zarr and the new
+full-Depth official LeRobot archive. Only Teleop Zarr conversion is skipped.
+Use a new work root, never overwrite the old artifact. It also decodes real
+Depth video frames at the boundary between Teleop and Rollout Episodes.
+
+Requires substantial temporary disk space for a Teleop Zarr (unless reused),
+Rollout Zarr, merged Zarr and a file-level merged LeRobot. Work on a new directory; it
 does **not overwrite** Teleop source, historic NPY or the previous PPO Zarr.
 Always verify Rollout Reward indices, Episode boundaries, and source provenance.
 
