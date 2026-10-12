@@ -24,6 +24,14 @@ in `data_prepare.yaml` (or `--zarr-use-depth` in real E2E) to add
 Depth to a new Zarr. Both ACT/IL and PPO training use RGB-only by default
 unless the *model/dataset* configuration is explicitly Depth-enabled.
 A training setting never controls whether Depth was archived.
+For the six-camera dual-arm Teleop source, configure Rosbag conversion
+with `dataset.which_arm: both` and `dataset.use_depth: true` in
+`configs/data/KuavoRosbag2Lerobot.yaml` when collecting new Teleop data;
+its generic example configuration may use a different arm setup.
+The ACT example `configs/policy/act_config.yaml` and Offline PPO
+`post_training/configs/rl/offline_rl.yaml` default to Depth **off**.
+Depth-enabled pre-existing checkpoints require explicitly restoring their
+matching Depth configuration before training or evaluation.
 
 ## Pipeline
 
