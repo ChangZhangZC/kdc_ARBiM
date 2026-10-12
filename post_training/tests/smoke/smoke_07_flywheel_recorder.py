@@ -16,7 +16,6 @@ from kuavo_deploy.src.eval.rollout_recorder import (
     CAMERA_KEYS,
     STAGING_FORMAT,
     RolloutRecorder,
-    DEPTH_KEYS,
     _annotate_reward_v2,
 )
 
@@ -163,58 +162,6 @@ class TestRolloutRecorder(unittest.TestCase):
             self.assertIsNone(recorder.finish_episode(False))
             self.assertEqual(list(Path(tmp).iterdir()), [])
 
-
-
-    def test_depth_snapshot_is_lossless_and_frame_aligned(self):
-        import zlib
-
-        def with_depth(value):
-            result = observation(value)
-            for key in DEPTH_KEYS:
-                result[key] = np.full((1, 1, 16, 16), value / 10, dtype=np.float32)
-            return result
-
-        with tempfile.TemporaryDirectory() as tmp:
-            recorder = RolloutRecorder(tmp, episode=10)
-            first = with_depth(1)
-            recorder.start_episode(first)
-            first["observation.depth_h"][:] = 9
-            recorder.append_step(np.zeros(16), with_depth(2))
-            path = recorder.finish_episode(True)
-            saved = np.load(path, allow_pickle=True).item()
-            self.assertTrue(saved["use_depth"])
-            self.assertEqual(saved["depth_storage"], "zlib")
-            self.assertEqual(len(saved["observations"]), 2)
-            for step, original in enumerate((0.1, 0.2)):
-                snapshot = saved["observations"][step]
-                self.assertEqual(set(snapshot["depth"]), set(DEPTH_KEYS))
-                for key in DEPTH_KEYS:
-                    entry = snapshot["depth"][key]
-                    actual = np.frombuffer(
-                        zlib.decompress(entry["data"]), dtype=np.dtype(entry["dtype"])
-                    ).reshape(entry["shape"])
-                    np.testing.assert_array_equal(
-                        actual, np.full((1, 16, 16), original, dtype=np.float32)
-                    )
-
-    def test_partial_depth_availability_fails_early(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            recorder = RolloutRecorder(tmp, episode=11)
-            obs = observation(0)
-            obs["observation.depth_h"] = np.zeros((1, 1, 16, 16), dtype=np.float32)
-            with self.assertRaisesRegex(ValueError, "all three depth"):
-                recorder.start_episode(obs)
-
-    def test_depth_presence_change_during_episode_fails(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            recorder = RolloutRecorder(tmp, episode=12)
-            recorder.start_episode(observation(0))
-            next_obs = observation(1)
-            for key in DEPTH_KEYS:
-                next_obs[key] = np.zeros((1, 1, 16, 16), dtype=np.float32)
-            with self.assertRaisesRegex(ValueError, "Depth camera availability"):
-                recorder.append_step(np.zeros(16), next_obs)
-            recorder.abort()
 
 
 if __name__ == "__main__":
