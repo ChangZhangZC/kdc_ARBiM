@@ -150,7 +150,7 @@ class TestStagingToProcessed(unittest.TestCase):
             stage_dir = directory / "staging"
             stage_file = save_rollout(stage_dir, 1, use_depth=True)
             processed = directory / "depth.npy"
-            convert_staging_to_npy([stage_dir], processed, batch_size=6)
+            convert_staging_to_npy([stage_dir], processed, batch_size=6, use_depth=True)
             staging = np.load(stage_file, allow_pickle=True).item()
             self.assertTrue(staging["use_depth"])
 
@@ -186,13 +186,28 @@ class TestStagingToProcessed(unittest.TestCase):
                 np.testing.assert_array_equal(z["data"][key][0], expected)
                 self.assertEqual(z["data"][f"next_{key}"].shape, (14, 3, 16, 16))
 
-    def test_mixed_rgb_only_and_depth_rollouts_rejected(self):
+    def test_depth_export_requires_all_rollouts_to_have_depth(self):
         with tempfile.TemporaryDirectory() as tmp:
             directory = pathlib.Path(tmp)
             save_rollout(directory, 1, use_depth=False)
             save_rollout(directory, 2, use_depth=True)
-            with self.assertRaisesRegex(ValueError, "mismatched camera"):
-                convert_staging_to_npy([directory], directory / "mixed.npy")
+            with self.assertRaisesRegex(ValueError, "Depth requested"):
+                convert_staging_to_npy(
+                    [directory], directory / "mixed.npy", use_depth=True
+                )
+
+    def test_rgb_only_export_from_depth_rollouts(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = pathlib.Path(tmp)
+            save_rollout(directory, 1, use_depth=True)
+            output = directory / "rgb_only.npy"
+            convert_staging_to_npy([directory], output)
+            with output.open("rb") as handle:
+                header = np.load(handle, allow_pickle=True).item()
+                chunk = np.load(handle, allow_pickle=True).item()
+            self.assertFalse(header["use_depth"])
+            self.assertNotIn("depth_shapes", header)
+            self.assertNotIn("depth", chunk)
 
     def test_incomplete_depth_staging_rejected(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -203,7 +218,7 @@ class TestStagingToProcessed(unittest.TestCase):
             with original.open("wb") as fp:
                 np.save(fp, staged, allow_pickle=True)
             with self.assertRaisesRegex(ValueError, "missing Depth camera"):
-                convert_staging_to_npy([original], directory / "processed.npy")
+                convert_staging_to_npy([original], directory / "processed.npy", use_depth=True)
 
     def test_readers_and_build_db_compatibility(self):
         from post_rl.data import data_prepare as dp
