@@ -17,7 +17,7 @@ from kuavo_deploy.src.eval.rollout_recorder import RolloutRecorder
 from post_rl.data.rollout_to_npy import convert_staging_to_npy, PROCESSED_FORMAT
 
 
-def obs(value, image_size=16):
+def obs(value, image_size=16, use_depth=False):
     sample = {"observation.state": np.full((1, 16), value, dtype=np.float32)}
     for name in (
         "observation.images.head_cam_h",
@@ -26,6 +26,11 @@ def obs(value, image_size=16):
     ):
         pixels = np.full((1, 3, image_size, image_size), 0.25, dtype=np.float32)
         sample[name] = pixels
+    if use_depth:
+        for name in ("observation.depth_h", "observation.depth_l", "observation.depth_r"):
+            sample[name] = np.full(
+                (1, 1, image_size, image_size), value * 0.001, dtype=np.float32
+            )
     return sample
 
 
@@ -36,11 +41,11 @@ def actions():
     return result
 
 
-def save_rollout(folder, episode, *, valid=True, image_size=16):
+def save_rollout(folder, episode, *, valid=True, image_size=16, use_depth=False):
     rec = RolloutRecorder(folder, episode)
-    rec.start_episode(obs(episode * 100, image_size))
+    rec.start_episode(obs(episode * 100, image_size, use_depth=use_depth))
     for step, command in enumerate(actions() if valid else np.zeros((7, 16))):
-        rec.append_step(command, obs(episode * 100 + step + 1, image_size))
+        rec.append_step(command, obs(episode * 100 + step + 1, image_size, use_depth=use_depth))
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", RuntimeWarning)
         return rec.finish_episode(True)
@@ -132,6 +137,46 @@ class TestStagingToProcessed(unittest.TestCase):
             folder = pathlib.Path(tmp)
             save_rollout(folder, 1, image_size=16)
             save_rollout(folder, 2, image_size=20)
+            with self.assertRaisesRegex(ValueError, "mismatched camera"):
+                convert_staging_to_npy([folder], folder / "processed.npy")
+
+
+    def test_three_depth_cameras_export_with_valid_header_and_frames(self):
+        from post_rl.data import data_prepare as dp
+
+        with tempfile.TemporaryDirectory() as tmp:
+            folder = pathlib.Path(tmp)
+            stage = folder / "staging"
+            original = save_rollout(stage, 10, use_depth=True)
+            processed = folder / "with_depth.npy"
+            result = convert_staging_to_npy([stage], processed)
+            self.assertEqual(result["num_frames"], 14)
+            self.assertEqual(result["num_episodes"], 1)
+            first = np.load(original, allow_pickle=True).item()
+            self.assertTrue(first["use_depth"])
+            meta = dp._read_source_header(processed, use_depth=True)
+            self.assertEqual(meta["depth_shapes"], {
+                key: (1, 16, 16) for key in (
+                    "observation.depth_h", "observation.depth_l", "observation.depth_r"
+                )
+            })
+            self.assertEqual(
+                meta["depth_dtypes"]["observation.depth_h"], np.dtype("float32")
+            )
+            frames = list(dp._iter_processed_frames(processed, use_depth=True))
+            self.assertEqual(len(frames), 14)
+            for i, frame in enumerate(frames):
+                for key in ("observation.depth_h", "observation.depth_l", "observation.depth_r"):
+                    np.testing.assert_array_equal(
+                        frame["depth"][key],
+                        np.full((1, 16, 16), (1000 + i) * 0.001, dtype=np.float32),
+                    )
+
+    def test_mixed_depth_availability_rejected(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            folder = pathlib.Path(tmp)
+            save_rollout(folder, 1, use_depth=True)
+            save_rollout(folder, 2, use_depth=False)
             with self.assertRaisesRegex(ValueError, "mismatched camera"):
                 convert_staging_to_npy([folder], folder / "processed.npy")
 
