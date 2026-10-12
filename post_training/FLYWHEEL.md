@@ -20,11 +20,16 @@ reached or the user stops the task. Success means the existing MuJoCo
 Reward are still counted as collected staging files, but the manual converter
 will skip them.
 
+Normal `8. auto_test` writes to `epoch<epoch>/`. Data Wheel `9`
+writes **all evaluation outputs** (logs, rollout videos and staging) under
+`epoch<epoch>_flywheel/` instead, so the two modes do not share filenames.
+The policy checkpoint lookup is unchanged.
+
 The existing evaluation writes videos and logs as usual, and additionally
 stores successful rollout records in:
 
 ```text
-outputs/eval/<task>/<method>/<timestamp>/epoch<epoch>/data_wheel/staging/
+outputs/eval/<task>/<method>/<timestamp>/epoch<epoch>_flywheel/data_wheel/staging/
   rollout_<episode>_<time_ns>_staging.npy
 ```
 
