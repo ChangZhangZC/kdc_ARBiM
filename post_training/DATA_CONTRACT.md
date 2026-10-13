@@ -148,7 +148,22 @@ Archival merge **requires all three Depth features by default**, and official
 the **complete** feature schema, FPS and robot type to match across sources.
 No features are silently removed. LeRobot copies existing video streams,
 remuxing only when needed (no framewise AV1 re-encode), then rewrites
-Parquet indices/tasks/metadata. ARBiM writes
+Parquet indices/tasks/metadata.
+
+**LeRobot v0.4.2 shard compatibility:** Its official `aggregate.py` loses
+source→destination MP4 shard mapping for multi-file inputs, so an apparently
+successful merge can decode invalid video frames at the Teleop/Rollout boundary
+(for example, absolute frame 90144 of 90744). ARBiM wraps the official
+`merge_datasets()` with scoped v0.4.2 patches in
+`post_training/src/post_rl/data/lerobot_v042_fast_merge.py`. The patch keeps
+one output video shard per source MP4 and directly copies compressed MP4 files
+(no decode/re-encode/remux), updates per-Episode video and Parquet indices, and
+restores the original LeRobot functions after the call. The long-lived full
+Depth archive remains the default; the legacy `--allow-rgb-only` flag can
+exercise existing test artifacts. A **successful count or provenance check
+alone does not prove a valid LeRobot merge**: decode source-vs-merged videos at
+the first frame of each appended dataset and several old video shards.
+Regression test: `python post_training/tests/smoke/smoke_19_fast_lerobot_shards.py`. ARBiM writes
 `meta/arbim_merge_provenance.json` to preserve Reward V2 source events,
 including on repeated merges. `--allow-rgb-only` exists for intentional
 legacy RGB-only archives; `--batch-size` is retained only for API

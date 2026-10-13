@@ -17,6 +17,12 @@ bash post_training/tests/run_batch03.sh
 echo "=== Batch 04: merge LeRobot ==="
 bash post_training/tests/run_batch04.sh
 
+echo "=== Regression: LeRobot v0.4.2 fast merge shard mappings ==="
+python -m py_compile \
+  post_training/src/post_rl/data/lerobot_v042_fast_merge.py \
+  post_training/tests/smoke/smoke_19_fast_lerobot_shards.py
+python post_training/tests/smoke/smoke_19_fast_lerobot_shards.py
+
 echo "=== Contract Reward provenance ==="
 python -m py_compile \
   post_training/tests/smoke/smoke_18_contract_provenance.py \
