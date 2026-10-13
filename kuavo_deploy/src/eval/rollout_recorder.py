@@ -1,7 +1,7 @@
-"""Capture successful MuJoCo episodes for later Processed NPY conversion.
+"""Capture successful MuJoCo episodes as Data Wheel Staging NPY.
 
-This is an intermediate staging format, NOT arbim_processed_npy_stream_v2.
-Reward V2 is annotated here; training-ready NPY export belongs to Batch 04.
+Staging keeps observations, actions and current Reward V2 annotations;
+staging_to_lerobot.py exports valid episodes into the training data pipeline.
 """
 
 import os
