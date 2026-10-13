@@ -114,7 +114,7 @@ def run_case(depth=True):
         assert called == ["arbim/combined"]
         assert result["num_frames"] == 54 and result["num_episodes"] == 4
         payload = json.loads(pathlib.Path(result["provenance"]).read_text())
-        assert payload["merge_backend"] == "lerobot.datasets.dataset_tools.merge_datasets"
+        assert payload["merge_backend"] == "lerobot.dataset_tools.merge_datasets+v0.4.2_shard_fix"
         assert payload["use_depth"] == depth
         assert [r["output_episode_index"] for r in payload["episodes"]] == [0, 1, 2, 3]
         assert "staging_reward" not in payload["episodes"][0]
