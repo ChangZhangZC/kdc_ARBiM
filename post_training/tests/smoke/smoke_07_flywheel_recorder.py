@@ -230,7 +230,7 @@ class TestRolloutRecorder(unittest.TestCase):
             recorder = RolloutRecorder(tmp, episode=14, require_depth=True)
             with self.assertRaisesRegex(ValueError, "requires all three Depth"):
                 recorder.start_episode(observation(0))
-            assert not list(pathlib.Path(tmp).glob("*_staging.npy"))
+            assert not list(Path(tmp).glob("*_staging.npy"))
 
 
 if __name__ == "__main__":
