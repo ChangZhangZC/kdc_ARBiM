@@ -12,6 +12,12 @@ PREV_ZARR=""        # 上一轮已合并的 Offline PPO Zarr
 OUTPUT_ROOT=""      # 本轮新的输出目录，例如 outputs/flywheel_round_02
 
 # ====================== 2. 可选参数 ======================
+# 四个输出名称仅控制 OUTPUT_ROOT 下的子目录，可以按轮次调整
+ROLLOUT_LEROBOT_NAME="rollout_lerobot"
+ROLLOUT_ZARR_NAME="rollout.zarr"
+MERGED_LEROBOT_NAME="merged_il_lerobot"
+MERGED_ZARR_NAME="merged_offline_rl.zarr"
+
 USE_DEPTH=false     # 新 PPO Zarr 是否保存 Depth：false / true；需与上一轮 Zarr 一致
 TASK="ARBiM Data Wheel"
 ROLLOUT_REPO_ID="arbim/flywheel_rollout"
@@ -42,10 +48,10 @@ done
 [[ -d "$PREV_ZARR" ]] || { echo "[ERROR] 上一轮 Zarr 不存在: $PREV_ZARR" >&2; exit 1; }
 [[ ! -e "$OUTPUT_ROOT" ]] || { echo "[ERROR] 输出目录已存在，拒绝覆盖: $OUTPUT_ROOT" >&2; exit 1; }
 
-ROLLOUT_LEROBOT="$OUTPUT_ROOT/rollout_lerobot"
-ROLLOUT_ZARR="$OUTPUT_ROOT/rollout_reward_v2.zarr"
-MERGED_LEROBOT="$OUTPUT_ROOT/merged_il_lerobot"
-MERGED_ZARR="$OUTPUT_ROOT/merged_offline_rl.zarr"
+ROLLOUT_LEROBOT="$OUTPUT_ROOT/$ROLLOUT_LEROBOT_NAME"
+ROLLOUT_ZARR="$OUTPUT_ROOT/$ROLLOUT_ZARR_NAME"
+MERGED_LEROBOT="$OUTPUT_ROOT/$MERGED_LEROBOT_NAME"
+MERGED_ZARR="$OUTPUT_ROOT/$MERGED_ZARR_NAME"
 
 mkdir -p "$OUTPUT_ROOT"
 
