@@ -22,7 +22,7 @@ import torch
 ROOT = pathlib.Path(__file__).resolve().parents[3]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
-from kuavo_deploy.src.eval.rollout_recorder import CAMERA_KEYS
+from kuavo_deploy.src.eval.rollout_recorder import CAMERA_KEYS, DEPTH_KEYS
 
 SCRIPT = ROOT / "kuavo_deploy" / "src" / "eval" / "sim_auto_test.py"
 
@@ -31,6 +31,8 @@ def observation(value):
     obs = {"observation.state": torch.full((1, 16), float(value))}
     for key in CAMERA_KEYS:
         obs[key] = torch.full((1, 3, 12, 12), 0.4)
+    for key in DEPTH_KEYS:
+        obs[key] = torch.full((1, 1, 12, 12), 0.5)
     return obs
 
 
@@ -194,6 +196,8 @@ class TestFlywheelEpisodeIntegration(unittest.TestCase):
             self.assertEqual(len(files), 1)
             saved = np.load(files[0], allow_pickle=True).item()
             self.assertEqual(saved["num_steps"], 14)
+            self.assertTrue(saved["use_depth"])
+            self.assertTrue(all(set(obs["depth"]) == set(DEPTH_KEYS) for obs in saved["observations"]))
             self.assertEqual(len(saved["observations"]), 15)
             self.assertEqual(saved["reward_status"], "valid")
             self.assertEqual(np.flatnonzero(saved["reward"]).tolist(), [8])
@@ -273,7 +277,7 @@ class TestFlywheelEpisodeIntegration(unittest.TestCase):
             self.assertEqual(result, 1)
             self.assert_clean(env)
             self.assertFalse(list(directory.glob("**/*_staging.npy")))
-            self.assertEqual(len(list(directory.glob("*.mp4"))), len(CAMERA_KEYS))
+            self.assertEqual(len(list(directory.glob("*.mp4"))), len(CAMERA_KEYS) + len(DEPTH_KEYS))
 
 
 if __name__ == "__main__":

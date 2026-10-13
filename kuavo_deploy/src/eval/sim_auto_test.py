@@ -202,7 +202,9 @@ def run_single_episode(config, policy, preprocessor, postprocessor, episode, out
     try:
         if os.environ.get("ARBIM_DATA_WHEEL") == "1":
             from kuavo_deploy.src.eval.rollout_recorder import RolloutRecorder
-            recorder = RolloutRecorder(output_directory / "data_wheel" / "staging", episode)
+            recorder = RolloutRecorder(
+                output_directory / "data_wheel" / "staging", episode, require_depth=True
+            )
 
         run_single_ros_manager = ROSManager()
         # Setup ROS subscribers and services

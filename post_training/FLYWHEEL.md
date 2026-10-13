@@ -1,5 +1,10 @@
 # ARBiM Data Wheel V1
 
+> **Data contract update:** For new Data Wheel rounds, use
+> [DATA_CONTRACT.md](DATA_CONTRACT.md): Staging NPY → LeRobot → Zarr,
+> LeRobot Merge for IL, and Zarr Merge for PPO. The Processed NPY bridge
+> below is **legacy compatibility**, not the recommended path.
+
 Data Wheel is an opt-in MuJoCo evaluation mode. It **only records successful
 rollouts during evaluation**; all post-evaluation data conversion and Offline RL
 dataset builds are **manual**. No dedicated Data Wheel YAML is used.
@@ -44,9 +49,10 @@ outputs/eval/<task>/<method>/<timestamp>/epoch<epoch>_flywheel/data_wheel/stagin
 
 Each staging file uses `arbim_rollout_staging_v2` and contains T actions,
 T+1 observations (16D state and three JPEG RGB cameras), and Reward V2
-annotations. If the configured environment exposes all three normalized
-Depth observations (`observation.depth_h/l/r`), the Recorder also stores
-them as lossless **single-channel PNG uint8** in staging. This mirrors the
+annotations. In Data Wheel mode the environment **must** expose all three
+normalized Depth observations (`observation.depth_h/l/r`). The Recorder
+fails immediately if they are missing and stores them as lossless
+**single-channel PNG uint8** in staging. This mirrors the
 existing Rosbag→LeRobot per-frame depth quantization (`[0,1]*255` cast to
 uint8) while avoiding redundant three-channel storage. It does not store
 raw millimeter Depth. No missing Depth frames are synthesized; partial
@@ -58,7 +64,23 @@ The existing Reward V2 assigns a sparse +1 at the later of two detected
 gripper-release actions. A successful episode whose reward cannot be validated
 is still saved, but marked `reward_status="invalid"` and `reward=None`.
 
-## 2. Manually convert staging to Processed NPY
+## 2. New archive and optional Zarr data contract
+
+Staging NPY → LeRobot preserves three Depth cameras **by default**, regardless
+of the ACT checkpoint's `use_depth` setting. LeRobot → LeRobot merge uses
+LeRobot's official `merge_datasets()` implementation to copy/remux video
+streams without framewise re-encoding; both inputs must have the same **full**
+schema, including Depth. Missing Depth is not silently synthesized or
+removed. Historic RGB-only staging may be converted with the explicit
+`--rgb-only-legacy` flag but cannot enter the new full-Depth archive.
+
+Staging NPY → LeRobot → Zarr has a **separate choice**: `use_depth: false`
+is the default in `post_training/configs/data/data_prepare.yaml`.
+Set `use_depth: true` only when intentionally producing Depth arrays in
+the derived PPO Zarr. This never alters the full Depth in the LeRobot archive.
+ACT/IL and PPO training continue to load only RGB by default.
+
+## 3. Legacy: manually convert staging to Processed NPY (deprecated)
 
 Run from the repository root:
 
@@ -84,7 +106,7 @@ unlabeled training data. The final T+1 observation remains in staging; the
 current `run_build_db` follows the existing terminal transition convention
 and repeats the final processed state at the terminal index.
 
-## 3. Manually build a new Offline RL Zarr
+## 4. Legacy: manually build a Zarr from Processed NPY (deprecated)
 
 Edit **only** `post_training/configs/data/data_prepare.yaml`; set:
 
@@ -123,7 +145,7 @@ For the default horizon=50 without padding, any individual episode shorter
 than 50 frames contributes **zero** training windows. The sampler does not
 cross episode boundaries.
 
-## 4. Smoke tests
+## 5. Smoke tests
 
 In the configured ARBiM Python environment, from the repository root:
 

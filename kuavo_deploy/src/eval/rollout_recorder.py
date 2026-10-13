@@ -255,8 +255,9 @@ def _annotate_reward_v2(actions):
 class RolloutRecorder:
     """Capture (obs_t, executed_action_t, obs_t+1); persist successes only."""
 
-    def __init__(self, output_dir, episode, jpeg_quality=95):
+    def __init__(self, output_dir, episode, jpeg_quality=95, require_depth=False):
         self.output_dir = Path(output_dir)
+        self.require_depth = bool(require_depth)
         self.episode = int(episode)
         self.jpeg_quality = int(jpeg_quality)
         if not 1 <= self.jpeg_quality <= 100:
@@ -268,7 +269,13 @@ class RolloutRecorder:
     def start_episode(self, observation):
         if self._active:
             raise RuntimeError("Recorder episode already active")
-        self._observations = [_snapshot(observation, self.jpeg_quality)]
+        first = _snapshot(observation, self.jpeg_quality)
+        if self.require_depth and "depth" not in first:
+            raise ValueError(
+                "Data Wheel archival requires all three Depth observations; "
+                "enable depth cameras in the environment before collecting"
+            )
+        self._observations = [first]
         self._actions = []
         self._active = True
 
@@ -281,6 +288,8 @@ class RolloutRecorder:
         if self._actions and action.shape != self._actions[0].shape:
             raise ValueError("Action dimension changed within episode")
         following = _snapshot(next_observation, self.jpeg_quality)
+        if self.require_depth and "depth" not in following:
+            raise ValueError("Data Wheel archival requires all three Depth observations at every step")
         first = self._observations[0]
         if ("depth" in first) != ("depth" in following):
             raise ValueError("Depth availability changed within episode")
