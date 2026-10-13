@@ -1,65 +1,32 @@
 #!/usr/bin/env bash
-# ARBiM Data Wheel: one new rollout round -> 4 training-ready artifacts.
-# Run with a trusted Staging NPY and the PREVIOUS round's merged LeRobot + Zarr.
+# ARBiM Data Wheel: prepare one more data round, using last round's merged data.
 set -Eeuo pipefail
 
-usage() {
-  cat <<'HELP'
-Usage:
-  bash scripts/flywheel_next_round.sh \
-    --staging PATH \
-    --previous-lerobot PATH \
-    --previous-zarr PATH \
-    --output-root NEW_DIRECTORY [options]
+# =====================================================================
+# EDIT THESE SETTINGS BEFORE EACH RUN. No command-line args required.
+# All relative paths are relative to the kdc_ARBiM repository root.
+# =====================================================================
 
-Required:
-  --staging PATH              A directory of *_staging.npy files or one staging file.
-  --previous-lerobot PATH     Previous round's merged IL LeRobot (full RGB+Depth).
-  --previous-zarr PATH        Previous round's merged Offline RL Zarr.
-  --output-root PATH          NEW directory; never overwritten.
-
-Options:
-  --zarr-depth auto|on|off    Default: auto (inherit previous Zarr); mismatch fails.
-                             All LeRobot archives ALWAYS retain three Depth cameras.
-  --invalid-reward error|skip
-                             Default: error; skip omits Reward-invalid successes
-                             from BOTH the new IL and RL datasets.
-  --expected-rollouts N       Require exactly N Reward-valid staging episodes.
-  --expected-fps N            Verify previous LeRobot metadata FPS (e.g. 10).
-  --task TEXT                 Default: ARBiM Data Wheel.
-  --rollout-repo-id ID         Default: arbim/flywheel_rollout.
-  --merged-repo-id ID          Default: arbim/flywheel_merged.
-  --batch-size N              LeRobot->Zarr decode batch size (default: 50).
-  --jpeg-quality N            RGB JPEG quality in PPO Zarr (default: 95).
-  --return-gamma FLOAT        Merged PPO return gamma (default: 0.99).
-  --python EXECUTABLE         Default: python (active arbim environment).
-  --dry-run                   Preflight and print planned outputs; write nothing.
-  -h, --help                  Show this help.
-
-Outputs:
-  NEW_DIRECTORY/rollout_lerobot
-  NEW_DIRECTORY/rollout_reward_v2.zarr
-  NEW_DIRECTORY/merged_il_lerobot
-  NEW_DIRECTORY/merged_offline_rl.zarr
-  NEW_DIRECTORY/configs/rollout_to_zarr.yaml
-  NEW_DIRECTORY/configs/merge_zarr.yaml
-
-Notes:
-  1. The previous Zarr is reused, not regenerated.
-  2. Only Reward-valid successful rollouts are used by this unified IL+RL flow.
-  3. Use a unique output-root each round; preserve the Staging NPY as archive.
-  4. Staging does not record measured FPS: verify the MuJoCo ros_rate separately.
-HELP
-}
-
+# 本轮新采集的成功 Rollout Staging 目录（或单个 *_staging.npy 文件）
 STAGING=""
+# 上一轮已经合并好的 ACT/IL LeRobot 数据集（必须包括三路 Depth）
 PREV_LEROBOT=""
+# 上一轮已经合并好的 PPO Zarr（必须与上方 LeRobot 是同一轮）
 PREV_ZARR=""
+# 本轮完整输出目录；必须不存在，切勿和上轮输出目录相同
 OUTPUT_ROOT=""
+
+# LeRobot 始终保留 3 路 Depth；只控制 PPO Zarr 是否含 Depth。
+# auto: 跟上一轮 Zarr 相同，on/off: 明确指定（不兼容时直接报错）。
 ZARR_DEPTH="auto"
+
+# Reward 无效处理：error=停止，skip=跳过该 Rollout（IL 和 RL 都跳过）
 INVALID_REWARD="error"
+# 预期本轮有效 Rollout 数量；留空代表不限制。例如：EXPECTED_ROLLOUTS="3"
 EXPECTED_ROLLOUTS=""
-EXPECTED_FPS=""
+# 只核对上一轮 LeRobot 元数据的 FPS。请另行确认 MuJoCo 的 ros_rate 一致。
+EXPECTED_FPS="10"
+
 TASK="ARBiM Data Wheel"
 ROLLOUT_REPO_ID="arbim/flywheel_rollout"
 MERGED_REPO_ID="arbim/flywheel_merged"
@@ -67,7 +34,44 @@ BATCH_SIZE="50"
 JPEG_QUALITY="95"
 RETURN_GAMMA="0.99"
 PYTHON_BIN="python"
+
+# 0=正式执行，1=只校验路径/格式，不产生任何新数据
 DRY_RUN=0
+
+# =====================================================================
+# BELOW: pipeline code. Normally do not edit.
+# =====================================================================
+
+usage() {
+  cat <<'HELP'
+ARBiM Data Wheel — one-command next-round data preparation.
+
+Edit the configuration variables at the TOP of this .sh, then run:
+  bash post_training/scripts/flywheel_next_round.sh
+
+Optional command-line overrides (not required):
+  --staging PATH --previous-lerobot PATH --previous-zarr PATH --output-root PATH
+  --zarr-depth auto|on|off --invalid-reward error|skip
+  --expected-rollouts N --expected-fps N --task TEXT
+  --rollout-repo-id ID --merged-repo-id ID
+  --batch-size N --jpeg-quality N --return-gamma FLOAT --python EXECUTABLE
+  --dry-run  (preflight only)
+  --run      (override DRY_RUN=1 to execute)
+  -h, --help
+
+Outputs under OUTPUT_ROOT:
+  rollout_lerobot/
+  rollout_reward_v2.zarr/
+  merged_il_lerobot/
+  merged_offline_rl.zarr/
+  configs/rollout_to_zarr.yaml
+  configs/merge_zarr.yaml
+
+Previous Zarr is REUSED (not recomputed). Previous LeRobot and Zarr must
+already exist and have matching Episode/Frame counts. The script will not
+rebuild earlier data if previous E2E output directories have been deleted.
+HELP
+}
 
 need_value() {
   if [[ $# -lt 2 || -z "$2" ]]; then
@@ -94,13 +98,14 @@ while [[ $# -gt 0 ]]; do
     --return-gamma) need_value "$@"; RETURN_GAMMA="$2"; shift 2 ;;
     --python) need_value "$@"; PYTHON_BIN="$2"; shift 2 ;;
     --dry-run) DRY_RUN=1; shift ;;
+    --run) DRY_RUN=0; shift ;;
     -h|--help) usage; exit 0 ;;
     *) echo "Unknown argument: $1" >&2; usage >&2; exit 2 ;;
   esac
 done
 
 for item in "$STAGING" "$PREV_LEROBOT" "$PREV_ZARR" "$OUTPUT_ROOT"; do
-  [[ -n "$item" ]] || { echo "Four required paths must be provided." >&2; usage >&2; exit 2; }
+  [[ -n "$item" ]] || { echo "Edit STAGING, PREV_LEROBOT, PREV_ZARR and OUTPUT_ROOT near the top of this script (or supply CLI overrides)." >&2; usage >&2; exit 2; }
 done
 [[ "$ZARR_DEPTH" == "auto" || "$ZARR_DEPTH" == "on" || "$ZARR_DEPTH" == "off" ]] ||
   { echo "Invalid --zarr-depth: $ZARR_DEPTH" >&2; exit 2; }
@@ -110,9 +115,9 @@ command -v "$PYTHON_BIN" >/dev/null ||
   { echo "Python executable not found: $PYTHON_BIN" >&2; exit 2; }
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "$0")" && pwd)"
-REPO_ROOT="$(cd -- "$SCRIPT_DIR/.." && pwd)"
+REPO_ROOT="$(cd -- "$SCRIPT_DIR/../.." && pwd)"
 cd "$REPO_ROOT"
-export PYTHONPATH="$REPO_ROOT:$REPO_ROOT/post_training/src:$REPO_ROOT/third_party/lerobot/src"
+export PYTHONPATH="$REPO_ROOT:$REPO_ROOT/post_training/src:$REPO_ROOT/third_party/lerobot/src${PYTHONPATH:+:$PYTHONPATH}"
 
 # Validate all inputs BEFORE creating the destination. Only trusted Staging
 # files should be supplied (np.load(..., allow_pickle=True)).
