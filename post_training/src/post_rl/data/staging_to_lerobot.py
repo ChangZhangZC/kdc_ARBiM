@@ -157,10 +157,18 @@ def convert_staging_to_lerobot(
     paths = discover_staging(staging_sources)
     accepted = []
     skipped = []
+    skipped_details = []
+    skipped_frames = 0
     for path in paths:
         payload = load_staging(path)
         if require_valid_reward and payload["reward_status"] != "valid":
             skipped.append(str(path))
+            skipped_frames += int(payload["num_steps"])
+            skipped_details.append({
+                "path": str(path),
+                "num_steps": int(payload["num_steps"]),
+                "reward_error": payload.get("reward_error"),
+            })
             continue
         if use_depth and not payload.get("use_depth"):
             raise ValueError(f"{path}: Depth requested but missing")
@@ -235,6 +243,8 @@ def convert_staging_to_lerobot(
         "format": "arbim_lerobot_staging_provenance_v1",
         "fps": fps, "task": task, "use_depth": bool(use_depth),
         "source_count": len(accepted), "skipped_invalid": skipped,
+        "skipped_invalid_frames": skipped_frames,
+        "skipped_invalid_details": skipped_details,
         "episodes": episodes,
     }
     metadata_path = output_root / "meta" / PROVENANCE_NAME
