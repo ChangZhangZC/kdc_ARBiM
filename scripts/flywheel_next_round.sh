@@ -351,6 +351,31 @@ z0, z1, zm = map(zarr_counts, (old_rl, new_rl, merged_rl))
 assert im == (i0[0] + i1[0], i0[1] + i1[1]), (i0, i1, im)
 assert zm == (z0[0] + z1[0], z0[1] + z1[1]), (z0, z1, zm)
 assert i1 == z1 and im == zm, (i1, z1, im, zm)
+# Verify preserved Reward V2 positions in the appended PPO segment.
+rollout = zarr.open_group(str(new_rl), mode="r")
+combined = zarr.open_group(str(merged_rl), mode="r")
+rollout_rewards = np.asarray(rollout["data"]["reward"][:])
+combined_rewards = np.asarray(combined["data"]["reward"][-z1[1]:])
+np.testing.assert_array_equal(combined_rewards, rollout_rewards)
+
+# LeRobot v0.4.2 shard mapping has caused silent video-boundary corruption
+# before: actually decode RGB/Depth near the newly appended dataset boundary.
+from post_rl.data.data_prepare import load_lerobot_dataset
+dataset = load_lerobot_dataset(merged_il)
+video_keys = (
+    "observation.images.head_cam_h",
+    "observation.images.wrist_cam_l",
+    "observation.images.wrist_cam_r",
+    "observation.depth_h",
+    "observation.depth_l",
+    "observation.depth_r",
+)
+for index in (0, i0[1] - 1, i0[1], im[1] - 1):
+    frame = dataset[index]
+    for key in video_keys:
+        image = np.asarray(frame[key])
+        assert image.ndim == 3 and image.shape[0] == 3
+        assert np.isfinite(image).all(), (index, key)
 print(f"DATA WHEEL NEXT ROUND PASSED: {im[0]} episodes, {im[1]} frames")
 PY
 
