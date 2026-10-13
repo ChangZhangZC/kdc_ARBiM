@@ -65,7 +65,7 @@ def load_config(path):
     cfg.setdefault("lambda_penalty", 0.05)
     cfg.setdefault("smooth_penalty", 0.01)
     cfg.setdefault("max_episode_len", 2000)
-    cfg.setdefault("reward_mode", REWARD_MODE_EPISODE_END_SHAPED)
+    cfg.setdefault("reward_mode", REWARD_MODE_LAST_GRIPPER_RELEASE_SPARSE)
     cfg.setdefault("reward_left_gripper_index", 7)
     cfg.setdefault("reward_right_gripper_index", 15)
     cfg.setdefault("reward_left_open_side", "auto")
@@ -1378,7 +1378,7 @@ def run_lerobot_to_zarr(config):
     use_depth = bool(config.get("use_depth", False))
     batch_size = int(config.get("stream_batch_size", ZARR_CHUNK_LEAD))
     jpeg_quality = int(config.get("jpeg_quality", DEFAULT_JPEG_QUALITY))
-    reward_mode = str(config.get("reward_mode", REWARD_MODE_EPISODE_END_SHAPED))
+    reward_mode = str(config.get("reward_mode", REWARD_MODE_LAST_GRIPPER_RELEASE_SPARSE))
     if reward_mode not in SUPPORTED_REWARD_MODES:
         raise ValueError(f"Unsupported reward_mode={reward_mode!r}")
     if batch_size < 1 or not 1 <= jpeg_quality <= 100:
