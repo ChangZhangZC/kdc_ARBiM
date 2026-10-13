@@ -40,11 +40,7 @@ def write_report(
     merged_lerobot: Path,
     merged_zarr: Path,
     output: Path,
-    target_valid_rollouts: int = 0,
 ) -> None:
-    if target_valid_rollouts < 0:
-        raise ValueError("target_valid_rollouts must be >= 0")
-
     staging_meta = _read_json(
         rollout_lerobot / "meta" / "arbim_staging_provenance.json"
     )
@@ -80,13 +76,6 @@ def write_report(
     if len(merged_meta["episodes"]) != combined_il[0]:
         raise ValueError("Merged LeRobot episode provenance count mismatch")
 
-    target_note = "not set"
-    if target_valid_rollouts:
-        missing = max(0, target_valid_rollouts - valid_episodes)
-        target_note = (
-            f"{target_valid_rollouts} | shortfall: {missing} | "
-            f"status: {'BELOW TARGET' if missing else 'MET'}"
-        )
     def fmt(stats: tuple[int, int]) -> str:
         return f"{stats[0]} episodes, {stats[1]} frames"
 
@@ -98,7 +87,6 @@ def write_report(
         f"Successful Staging rollouts (saved): {captured_episodes}",
         f"Reward valid / exported:           {valid_episodes}",
         f"Reward invalid / excluded:        {invalid_episodes}",
-        f"Target valid rollouts:            {target_note}",
         f"Valid action frames (T):          {valid_frames}",
         f"Invalid action frames (T):        {invalid_frames if invalid_frames is not None else 'not recorded'}",
         f"Total saved action frames (T):    {captured_frames if captured_frames is not None else 'not recorded'}",
@@ -147,7 +135,6 @@ def main() -> None:
         "rollout_zarr", "merged_lerobot", "merged_zarr", "output",
     ):
         parser.add_argument(f"--{name.replace('_', '-')}", required=True, type=Path)
-    parser.add_argument("--target-valid-rollouts", type=int, default=0)
     args = parser.parse_args()
     write_report(**vars(args))
 
