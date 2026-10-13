@@ -25,7 +25,6 @@ MERGED_REPO_ID="arbim/flywheel_merged"
 STREAM_BATCH_SIZE=50
 JPEG_QUALITY=95
 RETURN_GAMMA=0.99
-TARGET_VALID_ROLLOUTS=0  # 目标有效 Rollout 数，例如 200；0 表示不设置目标
 PYTHON_BIN=python
 
 # ====================== 3. 运行准备 ======================
@@ -106,7 +105,6 @@ echo "[5/5] Write Data Wheel round summary"
   --rollout-zarr "$ROLLOUT_ZARR" \
   --merged-lerobot "$MERGED_LEROBOT" \
   --merged-zarr "$MERGED_ZARR" \
-  --target-valid-rollouts "$TARGET_VALID_ROLLOUTS" \
   --output "$OUTPUT_ROOT/flywheel_summary.txt"
 
 echo ""
