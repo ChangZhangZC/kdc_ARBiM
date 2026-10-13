@@ -235,12 +235,10 @@ def main():
     parser.add_argument("--repo-id", required=True)
     parser.add_argument("--fallback-task", default="ARBiM")
     parser.add_argument("--batch-size", type=int, default=25, help="Legacy compatibility only")
-    parser.add_argument("--allow-rgb-only", action="store_true",
-                        help="Legacy archive only; default requires all 3 Depth cameras")
     args = parser.parse_args()
     print(merge_lerobot_datasets(
         args.sources, args.output_root, args.repo_id,
-        use_depth=not args.allow_rgb_only, batch_size=args.batch_size,
+        use_depth=True, batch_size=args.batch_size,
         fallback_task=args.fallback_task,
     ))
 
