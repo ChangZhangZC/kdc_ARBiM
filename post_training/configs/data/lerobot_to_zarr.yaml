@@ -3,7 +3,7 @@ mode: lerobot_to_zarr
 
 # Existing LeRobot dataset root (directory containing meta/).
 lerobot_root: /path/to/lerobot_dataset
-zarr_output_path: /path/to/output/teleop_reward_v2.zarr
+zarr_output_path: /path/to/output/teleop.zarr
 
 # No overwrite by default; use a fresh output path for each test/round.
 overwrite: false
@@ -11,8 +11,9 @@ use_depth: false
 stream_batch_size: 50
 jpeg_quality: 95
 
-# Reward is computed from LeRobot actions before writing transitions.
+# Current Reward V2: recorded for Data Wheel provenance, computed for Teleop.
 reward_mode: last_gripper_release_sparse
+reward_source: auto
 reward_left_gripper_index: 7
 reward_right_gripper_index: 15
 reward_left_open_side: auto
