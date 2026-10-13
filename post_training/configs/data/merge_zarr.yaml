@@ -11,7 +11,7 @@ return_gamma: 0.99
 # At least two sources. All sources must share the same Reward semantics,
 # RGB/Depth contract and core Zarr schema.
 zarr_sources:
-  - name: teleop_reward_v2
-    path: /path/to/teleop_reward_v2.zarr
+  - name: teleop
+    path: /path/to/teleop.zarr
   - name: flywheel_round_01
     path: /path/to/flywheel_round_01.zarr
