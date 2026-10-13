@@ -15,6 +15,7 @@ import yaml
 from pathlib import Path
 from time import sleep
 import select, time, threading, queue
+import re
 # 全局变量 Global Variables
 current_proc = None
 LOG_DIR = None
@@ -64,6 +65,49 @@ def ensure_log_dir(script_dir):
 
 
 # ========== 交互控制 ==========
+WHEEL_PROGRESS_PATTERN = re.compile(
+    r"Success Count:\s*(\d+)\s*/\s*Already eval episodes:\s*(\d+)"
+)
+
+
+def data_wheel_log_path(config):
+    inference = config["inference"]
+    return Path(
+        f"outputs/eval/{inference['task']}/{inference['method']}/"
+        f"{inference['timestamp']}/epoch{inference['epoch']}_flywheel/evaluation_autotest.log"
+    )
+
+
+def read_data_wheel_progress(log_path, started_ns):
+    try:
+        if log_path.stat().st_mtime_ns < started_ns:
+            return None  # A previous run may have left a log with the same path.
+        matches = WHEEL_PROGRESS_PATTERN.findall(log_path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return None
+    if not matches:
+        return None
+    return tuple(map(int, matches[-1]))  # (successful, attempted)
+
+
+def format_data_wheel_progress(successful, attempted, target):
+    filled = round(20 * min(successful, target) / target)
+    bar = "█" * filled + "░" * (20 - filled)
+    return (
+        f"📊 Data Wheel [{bar}] {successful}/{target} "
+        f"({successful / target:.1%}) | Attempts: {attempted}"
+    )
+
+
+def redraw_data_wheel_progress(message):
+    if sys.stdout.isatty():
+        # Update the line above the input prompt without moving its cursor.
+        sys.stdout.write("\0337\033[1A\r\033[2K" + message + "\0338")
+        sys.stdout.flush()
+    else:
+        print(message)
+
+
 def input_listener(input_queue, stop_event):
     """后台线程：持续监听用户输入"""
     """Background thread: Continuously monitors user input"""
@@ -77,7 +121,7 @@ def input_listener(input_queue, stop_event):
             # print("line: ", line)  # 换行
             input_queue.put(line.strip().lower())
 
-def interactive_controller():
+def interactive_controller(progress_log=None, progress_target=None, started_ns=0):
     global current_proc, LOG_DIR
 
     print("🎮 Interactive Control has Started")
@@ -90,6 +134,9 @@ def interactive_controller():
 
     input_queue = queue.Queue()
     stop_event = threading.Event()
+    progress = (0, 0)
+    if progress_log is not None:
+        print(format_data_wheel_progress(*progress, progress_target))
 
     # 启动输入监听线程
     # Starts input monitoring thread
@@ -98,6 +145,13 @@ def interactive_controller():
     ).start()
 
     while True:
+        if progress_log is not None:
+            new_progress = read_data_wheel_progress(progress_log, started_ns)
+            if new_progress is not None and new_progress != progress:
+                progress = new_progress
+                redraw_data_wheel_progress(
+                    format_data_wheel_progress(*progress, progress_target)
+                )
         # 检查子进程状态
         # Check subprocess status
         if current_proc.poll() is not None:
@@ -153,6 +207,13 @@ def interactive_controller():
 
         else:
             print(f"❌ Unknown Command: {cmd}")
+
+        if progress_log is not None and current_proc.poll() is None:
+            print(format_data_wheel_progress(*progress, progress_target))
+            sys.stdout.write(
+                "🟢 The task is running. Enter command to pause/stop/etc. (p/s/l/h): >"
+            )
+            sys.stdout.flush()
 
 
 # ========== YAML 解析 ==========
@@ -278,16 +339,17 @@ def main():
         if not Path(selected_path).is_file():
             print(f"❌ Configuration file not found: {selected_path}")
             continue
-        parse_config(selected_path)
+        selected_config = parse_config(selected_path)
         config_path = selected_path
 
-        def start_task(cmd, env=None):
+        def start_task(cmd, env=None, progress_log=None, progress_target=None):
             global current_proc
             log_path = LOG_DIR / "kuavo_deploy.log"
+            started_ns = time.time_ns()
             with open(log_path, "w") as f:
                 current_proc = subprocess.Popen(cmd, stdout=f, stderr=subprocess.STDOUT, env=env)
             print(f"Task started, PID: {current_proc.pid}")
-            interactive_controller()
+            interactive_controller(progress_log, progress_target, started_ns)
 
         if sub_choice == "1":
             subprocess.run(["python3", str(script), "--task", "go", "--dry_run", "--config", config_path])
@@ -328,6 +390,8 @@ def main():
             start_task(
                 ["python3", str(auto_test), "--task", "auto_test", "--config", config_path],
                 env=data_wheel_env,
+                progress_log=data_wheel_log_path(selected_config),
+                progress_target=target,
             )
 
 
