@@ -264,14 +264,12 @@ def main():
     parser.add_argument("--output-root", required=True)
     parser.add_argument("--repo-id", required=True)
     parser.add_argument("--task", default="ARBiM Data Wheel")
-    parser.add_argument("--rgb-only-legacy", action="store_true",
-                        help="Allow legacy Staging without Depth; archival default preserves Depth")
     parser.add_argument("--require-valid-reward", action="store_true")
     args = parser.parse_args()
     print(convert_staging_to_lerobot(
         args.staging, args.template_lerobot_root, args.output_root,
         args.repo_id, args.task,
-        use_depth=not args.rgb_only_legacy,
+        use_depth=True,
         require_valid_reward=args.require_valid_reward,
     ))
 
