@@ -25,16 +25,8 @@ MERGED_REPO_ID="arbim/flywheel_merged"
 STREAM_BATCH_SIZE=50
 JPEG_QUALITY=95
 RETURN_GAMMA=0.99
+TARGET_VALID_ROLLOUTS=0  # 目标有效 Rollout 数，例如 200；0 表示不设置目标
 PYTHON_BIN=python
-
-# 其他备选项（按需在下方 Python 命令处修改）：
-# staging_to_lerobot.py：默认保留全部 3 路 Depth；
-#   --require-valid-reward 仅导出 Reward V2 有效的成功 Rollout；
-#   --rgb-only-legacy 用于历史 RGB-only Staging，不建议新 Data Wheel 使用。
-# lerobot_merge.py：默认要求完整 RGB + 3 路 Depth Schema；
-#   --allow-rgb-only 仅供旧数据兼容使用。
-# data_prepare.py：reward_source=recorded 表示保留本轮 Staging 的 Reward V2；
-#   reward_source=auto 可以按来源自动选择。当前流程建议使用 recorded。
 
 # ====================== 3. 运行准备 ======================
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -56,7 +48,7 @@ MERGED_ZARR="$OUTPUT_ROOT/$MERGED_ZARR_NAME"
 mkdir -p "$OUTPUT_ROOT"
 
 # ====================== 4. 按顺序转换 ======================
-echo "[1/4] Staging NPY -> Rollout LeRobot"
+echo "[1/5] Staging NPY -> Rollout LeRobot"
 "$PYTHON_BIN" post_training/src/post_rl/data/staging_to_lerobot.py \
   "$STAGING" \
   --template-lerobot-root "$PREV_LEROBOT" \
@@ -65,14 +57,14 @@ echo "[1/4] Staging NPY -> Rollout LeRobot"
   --task "$TASK" \
   --require-valid-reward
 
-echo "[2/4] Previous LeRobot + Rollout LeRobot -> Merged LeRobot"
+echo "[2/5] Previous LeRobot + Rollout LeRobot -> Merged LeRobot"
 "$PYTHON_BIN" post_training/src/post_rl/data/lerobot_merge.py \
   "$PREV_LEROBOT" "$ROLLOUT_LEROBOT" \
   --output-root "$MERGED_LEROBOT" \
   --repo-id "$MERGED_REPO_ID" \
   --fallback-task "$TASK"
 
-echo "[3/4] Rollout LeRobot -> Rollout Zarr"
+echo "[3/5] Rollout LeRobot -> Rollout Zarr"
 # data_prepare.py 通过 --config 指定模式和参数，因此这里生成一份本轮配置。
 cat > "$OUTPUT_ROOT/rollout_to_zarr.yaml" <<EOF
 mode: lerobot_to_zarr
@@ -89,7 +81,7 @@ EOF
 "$PYTHON_BIN" post_training/src/post_rl/data/data_prepare.py \
   --config "$OUTPUT_ROOT/rollout_to_zarr.yaml"
 
-echo "[4/4] Previous Zarr + Rollout Zarr -> Merged Zarr"
+echo "[4/5] Previous Zarr + Rollout Zarr -> Merged Zarr"
 cat > "$OUTPUT_ROOT/merge_zarr.yaml" <<EOF
 mode: merge_zarr
 overwrite: false
@@ -105,9 +97,22 @@ EOF
 "$PYTHON_BIN" post_training/src/post_rl/data/data_prepare.py \
   --config "$OUTPUT_ROOT/merge_zarr.yaml"
 
+echo "[5/5] Write Data Wheel round summary"
+"$PYTHON_BIN" post_training/src/post_rl/data/flywheel_report.py \
+  --staging "$STAGING" \
+  --prev-lerobot "$PREV_LEROBOT" \
+  --prev-zarr "$PREV_ZARR" \
+  --rollout-lerobot "$ROLLOUT_LEROBOT" \
+  --rollout-zarr "$ROLLOUT_ZARR" \
+  --merged-lerobot "$MERGED_LEROBOT" \
+  --merged-zarr "$MERGED_ZARR" \
+  --target-valid-rollouts "$TARGET_VALID_ROLLOUTS" \
+  --output "$OUTPUT_ROOT/flywheel_summary.txt"
+
 echo ""
 echo "DATA WHEEL DATA PREPARATION FINISHED"
 echo "新增 LeRobot: $ROLLOUT_LEROBOT"
 echo "新增 Zarr:    $ROLLOUT_ZARR"
 echo "合并 LeRobot: $MERGED_LEROBOT"
 echo "合并 Zarr:    $MERGED_ZARR"
+echo "本轮汇总:     $OUTPUT_ROOT/flywheel_summary.txt"
