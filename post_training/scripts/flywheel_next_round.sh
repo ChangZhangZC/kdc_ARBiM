@@ -6,7 +6,11 @@ set -euo pipefail
 # 相对路径均以 kdc_ARBiM 仓库根目录为基准。
 
 # ====================== 1. 每轮必改：输入/输出路径 ======================
-STAGING=""          # 本轮 *_staging.npy 文件，或存放它们的 staging 目录
+# 本轮支持多个 Staging 目录或单个 *_staging.npy 文件；至少填写一个
+STAGING_DIRS=(
+  # "outputs/eval/collection_01/data_wheel/staging"
+  # "outputs/eval/collection_02/data_wheel/staging"
+)
 PREV_LEROBOT=""     # 上一轮已合并的 LeRobot（保留 RGB + 三路 Depth）
 PREV_ZARR=""        # 上一轮已合并的 Offline PPO Zarr
 OUTPUT_ROOT=""      # 本轮新的输出目录，例如 outputs/flywheel_round_02
@@ -31,10 +35,16 @@ PYTHON_BIN=python
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$REPO_ROOT"
 
-for value in "$STAGING" "$PREV_LEROBOT" "$PREV_ZARR" "$OUTPUT_ROOT"; do
-  [[ -n "$value" ]] || { echo "[ERROR] 请先填写顶部四个输入/输出路径。" >&2; exit 1; }
+if (("${#STAGING_DIRS[@]}" == 0)); then
+  echo "[ERROR] 请在 STAGING_DIRS 中至少填写一个 Staging 路径。" >&2
+  exit 1
+fi
+for staging in "${STAGING_DIRS[@]}"; do
+  [[ -n "$staging" && -e "$staging" ]] || { echo "[ERROR] Staging 不存在或为空: $staging" >&2; exit 1; }
 done
-[[ -e "$STAGING" ]] || { echo "[ERROR] Staging 不存在: $STAGING" >&2; exit 1; }
+for value in "$PREV_LEROBOT" "$PREV_ZARR" "$OUTPUT_ROOT"; do
+  [[ -n "$value" ]] || { echo "[ERROR] 请先填写上一轮 LeRobot、Zarr 和本轮输出路径。" >&2; exit 1; }
+done
 [[ -f "$PREV_LEROBOT/meta/info.json" ]] || { echo "[ERROR] 上一轮 LeRobot 无效: $PREV_LEROBOT" >&2; exit 1; }
 [[ -d "$PREV_ZARR" ]] || { echo "[ERROR] 上一轮 Zarr 不存在: $PREV_ZARR" >&2; exit 1; }
 [[ ! -e "$OUTPUT_ROOT" ]] || { echo "[ERROR] 输出目录已存在，拒绝覆盖: $OUTPUT_ROOT" >&2; exit 1; }
@@ -49,7 +59,7 @@ mkdir -p "$OUTPUT_ROOT"
 # ====================== 4. 按顺序转换 ======================
 echo "[1/5] Staging NPY -> Rollout LeRobot"
 "$PYTHON_BIN" post_training/src/post_rl/data/staging_to_lerobot.py \
-  "$STAGING" \
+  "${STAGING_DIRS[@]}" \
   --template-lerobot-root "$PREV_LEROBOT" \
   --output-root "$ROLLOUT_LEROBOT" \
   --repo-id "$ROLLOUT_REPO_ID" \
@@ -98,7 +108,7 @@ EOF
 
 echo "[5/5] Write Data Wheel round summary"
 "$PYTHON_BIN" post_training/src/post_rl/data/flywheel_report.py \
-  --staging "$STAGING" \
+  --staging "${STAGING_DIRS[@]}" \
   --prev-lerobot "$PREV_LEROBOT" \
   --prev-zarr "$PREV_ZARR" \
   --rollout-lerobot "$ROLLOUT_LEROBOT" \
