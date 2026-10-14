@@ -32,7 +32,7 @@ def _check(actual: tuple[int, int], expected: tuple[int, int], label: str) -> No
 
 
 def write_report(
-    staging: Path,
+    staging: list[Path],
     prev_lerobot: Path,
     prev_zarr: Path,
     rollout_lerobot: Path,
@@ -105,7 +105,8 @@ def write_report(
         "Note: one Zarr transition row corresponds to one action-aligned frame.",
         "",
         "[Paths]",
-        f"Staging:         {staging}",
+        f"Staging sources ({len(staging)}):",
+        *(f"  - {source}" for source in staging),
         f"Rollout LeRobot: {rollout_lerobot}",
         f"Rollout Zarr:    {rollout_zarr}",
         f"Merged LeRobot:  {merged_lerobot}",
@@ -130,8 +131,9 @@ def write_report(
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--staging", nargs="+", required=True, type=Path)
     for name in (
-        "staging", "prev_lerobot", "prev_zarr", "rollout_lerobot",
+        "prev_lerobot", "prev_zarr", "rollout_lerobot",
         "rollout_zarr", "merged_lerobot", "merged_zarr", "output",
     ):
         parser.add_argument(f"--{name.replace('_', '-')}", required=True, type=Path)
