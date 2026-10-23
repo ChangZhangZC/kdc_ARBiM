@@ -131,3 +131,75 @@ an Advantage as ground truth.
   decoder-output-action error is deferred because matching the frozen ACT
   decoder's positional embedding contract needs an additional equivalence
   test with actual Base ACT inference.
+
+## Second pass: exact PPO stochastic Dynamics diagnostics
+
+The first-pass `evaluate.py` used only the deterministic **mean over Elite
+means**. PPO actually calls `EnsembleDynamics_batch.step()`, which **randomly
+chooses one Elite** and adds a Gaussian noise sample at **each environment
+step**. To measure this extra stochastic model error, run the new script:
+
+```bash
+cd /home/kuavo/changzhang/kdc_ARBiM
+git fetch origin
+git switch test/flywheel01-dynamics-diagnostics
+conda activate arbim
+
+# CPU-only synthetic tests; no checkpoints required
+python post_training/tests/analysis/test_flywheel01_dynamics/test_smoke.py
+python post_training/tests/analysis/test_flywheel01_dynamics/test_stochastic_smoke.py
+
+# Same Flywheel01 validation source; 8 stochastic replicas/window
+WINDOWS=64 REPEATS=8 DEVICE=cuda:0 \
+  bash post_training/tests/analysis/test_flywheel01_dynamics/run_stochastic_flywheel01.sh
+```
+
+Default output is
+`post_training/outputs/dynamics_diagnostics/flywheel01_stochastic/`:
+
+- `stochastic_vs_elite_mean.png`: deterministic/stochastic rollout, one-step
+  errors, and stationary baseline. Shaded 10th–90th percentiles describe the
+  spread across windows and replicas; they are **not confidence intervals**.
+- `stochastic_advantage_sign.png`: sign disagreement for all samples and
+  for `|A_real| >= 1e-4`. Advantage is always evaluated **before** applying
+  the action being scored.
+- `advantage_margin_sensitivity.png`: sensitivity to thresholds
+  `0, 5e-5, 1e-4, 2e-4, 3e-4` and the number of samples retained.
+- `stochastic_by_step.csv`: aggregated means, percentiles, filtered flip
+  rates, and exact eligible counts at each step.
+- `stochastic_per_replica.csv`: window x replica x step records with individual
+  Q, V, Advantage and latent MSE.
+- `deterministic_per_window.csv`: corresponding Elite-mean baseline.
+- `stochastic_metadata.json`: seed, number of windows and replicas, alignment.
+
+Direct invocation with explicit overrides:
+
+```bash
+python post_training/tests/analysis/test_flywheel01_dynamics/evaluate_stochastic.py \
+  --run-dir "$RUN" --dataset /path/to/flywheel01.zarr \
+  --source zarr --split val --windows 64 --repeats 8 \
+  --horizon 32 --stride 32 --seed 20261023 \
+  --output-dir "$REPO/post_training/outputs/dynamics_diagnostics/flywheel01_stochastic"
+```
+
+To compare recorded Base ACT MuJoCo trajectories, replace
+`--source zarr --split val` with
+`--source staging --staging-dir /path/to/trusted/data_wheel/staging`.
+Do not pass unknown/untrusted NPY files (`allow_pickle=True`).
+
+**Scope and interpretation:**
+
+- Using `dynamics.step()` duplicates the PPO model's stochastic transition
+  mechanism. We still feed **recorded actions** from offline/MuJoCo data,
+  **not actions resampled from PPO's old Gaussian ACT**, so this remains a
+  Dynamics diagnostic, not a full replay of PPO's sampling distribution.
+- `adv_horizon=0` (step=1) should show zero sign disagreement because both
+  methods use the same observed pre-action latent. At `step=32`,
+  `adv_horizon=31`, while the plotted state MSE is after the 32nd transition.
+- Filtering out small `|A_real|` reduces the effect of near-zero signs, but
+  this `A_real=Q(z,a)-V(z)` is **still a learned Critic estimate**, not
+  true/ground-truth Advantage.
+- Replicas of the same recorded window share observations and actions; do
+  not interpret `windows*repeats` as the number of independent episodes.
+- No original analysis script, model weight, training code or reward data is
+  modified.
