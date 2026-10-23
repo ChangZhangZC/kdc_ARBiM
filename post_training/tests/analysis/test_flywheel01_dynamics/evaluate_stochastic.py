@@ -132,6 +132,15 @@ def summarize(stochastic, deterministic, thresholds=THRESHOLDS):
             "stochastic_adv_sign_flip":_safe_mean([r["adv_sign_flip"] for r in stochastic_rows]),
             "deterministic_adv_sign_flip":_safe_mean([r["adv_sign_flip"] for r in mean_rows]),
             "median_abs_real_advantage":float(np.median(np.abs([r["adv_real"] for r in mean_rows]))),
+            "stochastic_norm_sign_flip":_safe_mean([r["adv_norm_sign_flip"] for r in stochastic_rows]),
+            "deterministic_norm_sign_flip":_safe_mean([r["adv_norm_sign_flip"] for r in mean_rows]),
+            "stochastic_norm_sign_flip_large":_safe_mean([
+                r["adv_norm_sign_flip"] for r in stochastic_rows if r["adv_norm_large_margin"]
+            ]),
+            "deterministic_norm_sign_flip_large":_safe_mean([
+                r["adv_norm_sign_flip"] for r in mean_rows if r["adv_norm_large_margin"]
+            ]),
+            "normalized_large_margin_windows":sum(r["adv_norm_large_margin"] for r in mean_rows),
         }
         for i, threshold in enumerate(thresholds):
             d=[r for r in mean_rows if abs(r["adv_real"])>=threshold]
@@ -143,6 +152,53 @@ def summarize(stochastic, deterministic, thresholds=THRESHOLDS):
             entry[f"sto_flip_margin_{i}"]=_safe_mean([r["adv_sign_flip"] for r in s])
         out.append(entry)
     return out
+
+
+def annotate_batch_normalized_signs(stochastic, deterministic):
+    """Approximate the BPPO per-step advantage normalization on recorded windows.
+
+    Each stochastic replica is treated as one independent W-window batch.
+    It is a proxy: PPO has a different batch and uses old-policy sampled actions.
+    """
+    from collections import defaultdict
+    by_step_det=defaultdict(list)
+    by_step_sto=defaultdict(list)
+    for row in deterministic:
+        by_step_det[row["step"]].append(row)
+    for row in stochastic:
+        by_step_sto[(row["step"],row["replica"])].append(row)
+    replicas=sorted(set(row["replica"] for row in stochastic))
+    for step, det in by_step_det.items():
+        labels=[(r["trajectory"],r["anchor"]) for r in det]
+        if len(set(labels))!=len(labels):
+            raise ValueError(f"Repeated window key at step {step}")
+        real=np.asarray([r["adv_real"] for r in det],dtype=np.float64)
+        pred_det=np.asarray([r["adv_pred"] for r in det],dtype=np.float64)
+        std_r=float(real.std(ddof=1)) if len(real)>1 else 0.0
+        std_d=float(pred_det.std(ddof=1)) if len(pred_det)>1 else 0.0
+        z_real=(real-real.mean())/(std_r+1e-8)
+        z_det=(pred_det-pred_det.mean())/(std_d+1e-8)
+        for i,row in enumerate(det):
+            row["adv_norm_real"]=float(z_real[i])
+            row["adv_norm_pred"]=float(z_det[i])
+            row["adv_norm_sign_flip"]=int(z_real[i]*z_det[i]<0)
+            row["adv_norm_large_margin"]=int(abs(z_real[i])>=0.5)
+        for replica in replicas:
+            rows=by_step_sto[(step,replica)]
+            if len(rows)!=len(det):
+                raise ValueError(f"Replica {replica} step {step}: expected {len(det)} rows, got {len(rows)}")
+            by_label={(r["trajectory"],r["anchor"]):r for r in rows}
+            if len(by_label)!=len(rows):
+                raise ValueError(f"Repeated stochastic window key at step {step}")
+            values=np.asarray([by_label[label]["adv_pred"] for label in labels],dtype=np.float64)
+            std=float(values.std(ddof=1)) if len(values)>1 else 0.0
+            z_pred=(values-values.mean())/(std+1e-8)
+            for i,label in enumerate(labels):
+                row=by_label[label]
+                row["adv_norm_real"]=float(z_real[i])
+                row["adv_norm_pred"]=float(z_pred[i])
+                row["adv_norm_sign_flip"]=int(z_real[i]*z_pred[i]<0)
+                row["adv_norm_large_margin"]=int(abs(z_real[i])>=0.5)
 
 
 def main():
@@ -189,6 +245,7 @@ def main():
         count+=1
     if count==0:
         raise RuntimeError("No usable 32-step windows")
+    annotate_batch_normalized_signs(stochastic,deterministic)
     summary=summarize(stochastic,deterministic)
     write_csv(out/"stochastic_per_replica.csv",stochastic)
     write_csv(out/"deterministic_per_window.csv",deterministic)
@@ -202,6 +259,9 @@ def main():
         "deterministic_transition":"mean across ensemble elite predicted means",
         "advantage_alignment":"At row step=j+1, uses true/predicted pre-action state at j",
         "margin_thresholds":list(THRESHOLDS),
+        "normalized_advantage":"Per-step batch center/scale across same recorded W windows, separately for each stochastic replica",
+        "normalized_large_margin":"abs(zscore_of_real_advantage)>=0.5",
+        "normalization_limit":"approximate W-window batch from recorded actions, not actual PPO minibatch",
         "note":"Observed-vs-predicted Advantage only tests critic sensitivity, not correct RL advantage",
     }
     (out/"stochastic_metadata.json").write_text(json.dumps(meta,indent=2))
