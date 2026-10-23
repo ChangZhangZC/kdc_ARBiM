@@ -11,7 +11,7 @@ import torch
 from common import Window
 from test_smoke import FakeWorkspace, FakeDynamics
 from evaluate import evaluate_window, write_csv
-from evaluate_stochastic import evaluate_stochastic_window, summarize
+from evaluate_stochastic import evaluate_stochastic_window, summarize, annotate_batch_normalized_signs
 from plot_stochastic import plot_stochastic
 
 
@@ -46,6 +46,7 @@ def main():
     assert len(stochastic)==n*8
     assert all(row["adv_horizon"]==row["step"]-1 for row in stochastic)
     assert all(row["adv_sign_flip"]==0 for row in stochastic)
+    annotate_batch_normalized_signs(stochastic,deterministic)
     by_step=summarize(stochastic,deterministic)
     assert by_step[0]["stochastic_rollout_mse"]>0
     assert by_step[0]["deterministic_rollout_mse"]<1e-10
