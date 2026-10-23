@@ -78,6 +78,29 @@ def plot_stochastic(output):
     fig.savefig(output/"stochastic_advantage_sign.png",dpi=180)
     plt.close(fig)
 
+    # More relevant to actual BPPO: normalization occurs separately at each
+    # action position over the batch, before PPO uses the advantage sign.
+    fig,axes=plt.subplots(1,2,figsize=(14,5))
+    axes[0].plot(x_adv,[100*r["deterministic_norm_sign_flip"] for r in data],
+                 label="Elite mean")
+    axes[0].plot(x_adv,[100*r["stochastic_norm_sign_flip"] for r in data],
+                 label="PPO stochastic")
+    axes[0].set(title="Per-step batch-normalized Advantage (all windows)",
+                xlabel="Predicted pre-action steps",ylabel="Sign disagreement (%)",ylim=(0,100))
+    axes[1].plot(x_adv,[100*r["deterministic_norm_sign_flip_large"] for r in data],
+                 label="Elite mean, |A_real_norm| >= 0.5")
+    axes[1].plot(x_adv,[100*r["stochastic_norm_sign_flip_large"] for r in data],
+                 label="PPO stochastic, |A_real_norm| >= 0.5")
+    axes[1].set(title="Normalized Advantage with larger margin",
+                xlabel="Predicted pre-action steps",ylabel="Sign disagreement (%)",ylim=(0,100))
+    for ax in axes:
+        ax.grid(alpha=.22)
+        ax.legend(fontsize=9)
+    fig.suptitle("Approximate actual BPPO update-direction sensitivity to Dynamics drift")
+    fig.tight_layout()
+    fig.savefig(output/"normalized_advantage_direction.png",dpi=180)
+    plt.close(fig)
+
     # Illustrate how raw sign-disagreement can be caused by near-zero margins.
     fig,axes=plt.subplots(1,2,figsize=(14,5))
     for step in [min(8,int(x[-1])),min(16,int(x[-1])),int(x[-1])]:
