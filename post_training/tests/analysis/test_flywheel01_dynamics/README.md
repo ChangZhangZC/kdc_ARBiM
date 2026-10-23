@@ -163,6 +163,7 @@ Default output is
 - `stochastic_advantage_sign.png`: sign disagreement for all samples and
   for `|A_real| >= 1e-4`. Advantage is always evaluated **before** applying
   the action being scored.
+- `normalized_advantage_direction.png`: per-step **batch-normalized** Advantage sign disagreement (all actions and larger-magnitude `|A_real_normalized|>=0.5`). The recorded W windows form a surrogate PPO batch, not the actual PPO minibatch.
 - `advantage_margin_sensitivity.png`: sensitivity to thresholds
   `0, 5e-5, 1e-4, 2e-4, 3e-4` and the number of samples retained.
 - `stochastic_by_step.csv`: aggregated means, percentiles, filtered flip
@@ -203,3 +204,22 @@ Do not pass unknown/untrusted NPY files (`allow_pickle=True`).
   not interpret `windows*repeats` as the number of independent episodes.
 - No original analysis script, model weight, training code or reward data is
   modified.
+
+## Why normalized Advantage is reported separately
+
+BPPO's `_normalize_advantage_by_step()` subtracts the mini-batch mean
+**separately at every action position**, then divides by the position-wise
+standard deviation. A raw Q−V sign flip does **not** necessarily mean an
+opposite PPO gradient direction after this centering.
+
+The new comparison constructs, for each position, a W-window batch of real
+and predicted Q−V, centers/scales them separately, then compares their signs.
+For a random Dynamics rollout it does this separately for every stochastic
+replica. It reports both unrestricted sign disagreement and the subset where
+the real batch-normalized advantage magnitude is at least 0.5. Eligible
+window counts appear in `stochastic_by_step.csv`. If no samples pass a
+threshold, the rate is NaN; it is not zero.
+
+Because our input actions are from recorded data rather than Old ACT samples
+and W=64 rather than the actual PPO mini-batch, these are **sensitivity
+diagnostics**, not an exact reproduction of the optimizer's update directions.
