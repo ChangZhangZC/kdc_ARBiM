@@ -57,12 +57,11 @@ def evaluate_window(workspace, dynamics, window, mode):
         }
         if workspace.critic is not None:
             critic = workspace.critic
-            # The PPO trainer uses mean pooling of the ACT tokens.
+            # Correct temporal alignment: Q(z_i,a_i), not Q(z_(i+1),a_i).
+            # Record at the pre-transition state for the same executed action.
             action_q = action
-            real_z = dynamics._critic_readout(truth)
-            pred_z = dynamics._critic_readout(next_pred)
-            # Same action on both states: this probes the effect of state error,
-            # not ground-truth validity of Q or Advantage.
+            real_z = dynamics._critic_readout(true_states[i:i+1])
+            pred_z = dynamics._critic_readout(predicted)
             real_q = critic.minQ(real_z, action_q)
             pred_q = critic.minQ(pred_z, action_q)
             real_v = critic.value(real_z)
