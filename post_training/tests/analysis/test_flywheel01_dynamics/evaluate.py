@@ -86,7 +86,7 @@ def summarize(rows):
     out = []
     for step in sorted(set(r["step"] for r in rows)):
         srows = [r for r in rows if r["step"] == step]
-        item = {"step":step,"windows":len(srows)}
+        item = {"step":step,"adv_horizon":step-1,"windows":len(srows)}
         for field in fields:
             data = np.array([r[field] for r in srows if field in r],dtype=np.float64)
             if len(data):
