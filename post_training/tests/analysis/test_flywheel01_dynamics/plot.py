@@ -30,11 +30,12 @@ def create_figures(directory):
     fig.tight_layout();fig.savefig(directory/"latent_error_vs_horizon.png",dpi=180);plt.close(fig)
 
     if "adv_abs_error" in data[0]:
+        x_adv=np.array([int(r.get("adv_horizon",r["step"]-1)) for r in data])
         fig,axes=plt.subplots(1,2,figsize=(12,4.5))
-        axes[0].plot(x,[r["adv_abs_error"] for r in data])
+        axes[0].plot(x_adv,[r["adv_abs_error"] for r in data])
         axes[0].set(xlabel="Prediction horizon",ylabel="Mean absolute advantage difference",
                     title="Critic sensitivity to predicted states")
-        axes[1].plot(x,[r["adv_sign_flip"]*100 for r in data])
+        axes[1].plot(x_adv,[r["adv_sign_flip"]*100 for r in data])
         axes[1].set(xlabel="Prediction horizon",ylabel="Sign disagreement (%)",
                     title="Advantage sign disagreement")
         for ax in axes: ax.grid(alpha=.25)
