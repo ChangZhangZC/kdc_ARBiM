@@ -58,6 +58,7 @@ def main():
         write_csv(out/"stochastic_per_replica.csv",stochastic)
         plot_stochastic(out)
         for name in ("stochastic_vs_elite_mean.png","stochastic_advantage_sign.png",
+                     "normalized_advantage_direction.png",
                      "advantage_margin_sensitivity.png"):
             assert (out/name).is_file(), name
     print("PASS: T+1 alignment, 8 stochastic replicas, critic consistency, plots")
