@@ -16,6 +16,7 @@ from tqdm import tqdm
 
 from common import load_context, tensor_obs, zarr_windows, staging_windows
 from evaluate import evaluate_window, write_csv
+from post_rl.utils.common import CONST_EPS
 
 THRESHOLDS = (0.0, 0.00005, 0.0001, 0.0002, 0.0003)
 
@@ -176,8 +177,8 @@ def annotate_batch_normalized_signs(stochastic, deterministic):
         pred_det=np.asarray([r["adv_pred"] for r in det],dtype=np.float64)
         std_r=float(real.std(ddof=1)) if len(real)>1 else 0.0
         std_d=float(pred_det.std(ddof=1)) if len(pred_det)>1 else 0.0
-        z_real=(real-real.mean())/(std_r+1e-8)
-        z_det=(pred_det-pred_det.mean())/(std_d+1e-8)
+        z_real=(real-real.mean())/(std_r+CONST_EPS)
+        z_det=(pred_det-pred_det.mean())/(std_d+CONST_EPS)
         for i,row in enumerate(det):
             row["adv_norm_real"]=float(z_real[i])
             row["adv_norm_pred"]=float(z_det[i])
@@ -192,7 +193,7 @@ def annotate_batch_normalized_signs(stochastic, deterministic):
                 raise ValueError(f"Repeated stochastic window key at step {step}")
             values=np.asarray([by_label[label]["adv_pred"] for label in labels],dtype=np.float64)
             std=float(values.std(ddof=1)) if len(values)>1 else 0.0
-            z_pred=(values-values.mean())/(std+1e-8)
+            z_pred=(values-values.mean())/(std+CONST_EPS)
             for i,label in enumerate(labels):
                 row=by_label[label]
                 row["adv_norm_real"]=float(z_real[i])
