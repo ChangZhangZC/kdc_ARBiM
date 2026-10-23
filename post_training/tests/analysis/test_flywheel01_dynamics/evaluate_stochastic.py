@@ -169,11 +169,13 @@ def main():
         parser.error("--staging-dir is required for staging source")
     out=Path(args.output_dir).expanduser().resolve()
     out.mkdir(parents=True,exist_ok=True)
+    ws,dynamics,cfg=load_context(args.run_dir,out,args.device,args.checkpoint,args.dataset)
+    # Workspace initialization sets its own training seed. Apply diagnostic
+    # seed AFTER loading so stochastic repeats are reproducible.
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(args.seed)
-    ws,dynamics,cfg=load_context(args.run_dir,out,args.device,args.checkpoint,args.dataset)
     if args.source=="zarr":
         windows=zarr_windows(ws,args.horizon,args.stride,args.windows,args.split)
     else:
