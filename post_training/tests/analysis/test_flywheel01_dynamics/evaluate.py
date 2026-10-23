@@ -49,7 +49,7 @@ def evaluate_window(workspace, dynamics, window, mode):
         step_zero_mse = err(true_states[i:i+1], truth)
         row = {
             "source":mode, "trajectory":window.name, "anchor":window.start,
-            "step": i+1, "rollout_mse": rollout_mse,
+            "step": i+1, "adv_horizon": i, "rollout_mse": rollout_mse,
             "teacher_mse": teacher_mse, "zero_from_start_mse": zero_mse,
             "zero_one_step_mse": step_zero_mse,
             "rollout_over_zero": rollout_mse/max(zero_mse,1e-12),
