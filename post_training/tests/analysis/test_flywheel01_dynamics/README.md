@@ -223,3 +223,62 @@ threshold, the rate is NaN; it is not zero.
 Because our input actions are from recorded data rather than Old ACT samples
 and W=64 rather than the actual PPO mini-batch, these are **sensitivity
 diagnostics**, not an exact reproduction of the optimizer's update directions.
+
+## Third pass: split random Elite selection from Gaussian noise (P0 + P1)
+
+The older stochastic run reported 32-step MSE of 3.892, while Elite-mean
+rollout had MSE 0.301. This result alone **cannot** identify the source of the
+extra squared error.
+
+New independent scripts (do not overwrite the original run output):
+
+```bash
+cd /home/kuavo/changzhang/kdc_ARBiM
+git fetch origin
+git switch test/flywheel01-dynamics-diagnostics
+git pull --ff-only
+conda activate arbim
+
+# P0: read previous already-computed normalized Advantage metrics; no GPU
+python post_training/tests/analysis/test_flywheel01_dynamics/report_existing_advantage.py
+
+# P1: no-checkpoint CPU smoke (including plot creation)
+python post_training/tests/analysis/test_flywheel01_dynamics/test_components_smoke.py
+
+# P1: trained models + same Flywheel01 validation windows; no MuJoCo
+WINDOWS=64 REPEATS=8 DEVICE=cuda:0 \
+  bash post_training/tests/analysis/test_flywheel01_dynamics/run_components_flywheel01.sh
+```
+
+New output directory:
+`post_training/outputs/dynamics_diagnostics/flywheel01_components/`.
+
+- `three_mode_rollout_mse.png`: **A** = average of Elite model
+  predictions (no sampling), **B** = random Elite model mean, **C** = random
+  Elite plus sampled Gaussian noise (the PPO state rollout).
+- `teacher_one_step_components.png`: analogous one-step measurements always
+  starting from the **true observation**.
+- `variance_calibration.png`: mean epistemic (between Elite), aleatoric
+  (within-model Gaussian), empirical error, plus moment-matched ±1σ and ±2σ
+  coverage of the true latent. Reference 68% and 95% coverage assume a
+  Gaussian; an Elite mixture is not necessarily Gaussian, so these are
+  approximate calibration diagnostics.
+- `component_advantage_direction.png`: raw Q−V and separately per-step
+  batch-normalized Q−V sign differences, plus a larger-normalized-margin subset.
+- `component_per_replica.csv`: exact per-window/per-seed trajectory errors,
+  assigned Elite ID, and raw/normalized Advantages.
+- `component_calibration.csv`: one-step predicted variance vs actual errors.
+- `component_by_step.csv`: aggregated step 1–32 diagnostics.
+- `component_metadata.json`: run provenance.
+
+**Comparison protocol:** B and C start from the same observed state and
+execute the same recorded action sequence. Both use the same random Elite
+IDs at every step, but B uses the model's predicted mean while C calls the
+actual `dynamics.step()` with Gaussian noise. After the first step B and C
+enter different predicted states; their 32-step MSE difference is therefore
+the **cumulative effect of adding noise**, not a per-step additive variance
+term. The teacher-forced comparison isolates local conditional error more
+directly.
+
+This is still offline dataset evaluation, **not** a MuJoCo rollout or direct
+sampling from BPPO's old Gaussian ACT. Model weight files are not changed.
